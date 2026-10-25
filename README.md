@@ -156,6 +156,14 @@ column, `cursor_column` (a PK is required — increments are MERGEd by it):
 
 - **Seed:** capture the column's high watermark `hi` *before* the full copy (partitioned when
   `load_partitioned`), then checkpoint `hi`. Rows written during the seed are re-read next run.
+  For a temporal cursor the checkpoint is `hi` minus the seed duration, so rows that committed
+  during a long seed with an older timestamp are inside the first increment window.
+- **Temporal overlap:** a timestamp is assigned when a row is written, not when it commits, so a
+  row can commit after a read whose `hi` is above it. For temporal cursors every increment starts
+  `LAKEFED_CURSOR_OVERLAP_S` seconds (cluster env, default 600) below the checkpoint, and runs even
+  when `hi` did not move. The MERGE makes the re-read harmless. Numeric and `rowversion` cursors
+  read exact bounds. Runs on SQL Server and PostgreSQL (`information_schema` type lookup; a
+  `timestamp with time zone` watermark is rendered in UTC).
 - **Each run:** one small query reads the current `hi`. Equal to the checkpoint → unchanged (no
   read, no MERGE). Otherwise read `cursor_column > checkpoint AND cursor_column <= hi` once, upsert
   it by PK, then advance the checkpoint to `hi`.

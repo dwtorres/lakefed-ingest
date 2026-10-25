@@ -127,13 +127,13 @@ class CdcStrategy(LoadStrategy):
 _STRATEGIES = {s.name: s for s in (CtStrategy(), FullStrategy(), CursorStrategy(), CdcStrategy())}
 
 # (src_type, load_type) pairs that run today. CT is SQL Server-only by definition; FULL works for
-# every adapter; CURSOR is SQL Server-only for now. PLACEHOLDER pairs are planned (clear "not
+# every adapter; CURSOR runs on SQL Server and PostgreSQL. PLACEHOLDER pairs are planned (clear "not
 # implemented yet" error); anything else is "not supported". CDC is a placeholder everywhere.
 SUPPORT = {
     (sa.SQLSERVER, CT), (sa.SQLSERVER, FULL), (sa.SQLSERVER, CURSOR),
-    (sa.ORACLE, FULL), (sa.POSTGRESQL, FULL), (sa.MYSQL, FULL),
+    (sa.ORACLE, FULL), (sa.POSTGRESQL, FULL), (sa.POSTGRESQL, CURSOR), (sa.MYSQL, FULL),
 }
-PLACEHOLDER = {(sa.ORACLE, CURSOR), (sa.POSTGRESQL, CURSOR), (sa.MYSQL, CURSOR)} | {
+PLACEHOLDER = {(sa.ORACLE, CURSOR), (sa.MYSQL, CURSOR)} | {
     (st, CDC) for st in sa.SRC_TYPES}
 
 

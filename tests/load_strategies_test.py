@@ -17,7 +17,7 @@ def test_support_matrix():
     assert ls.support_matrix() == {
         "sqlserver":  {"ct": "yes", "cdc": "placeholder", "cursor": "yes",         "full": "yes"},
         "oracle":     {"ct": "no",  "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
-        "postgresql": {"ct": "no",  "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
+        "postgresql": {"ct": "no",  "cdc": "placeholder", "cursor": "yes", "full": "yes"},
         "mysql":      {"ct": "no",  "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
     }
 
@@ -53,9 +53,10 @@ def test_placeholders_raise_not_implemented():
         s.load(None, {}, "c.s.t")
 
 
-def test_cursor_is_sqlserver_only_with_placeholders_elsewhere():
+def test_cursor_runs_on_sqlserver_and_postgres_with_placeholders_elsewhere():
     assert ls.supported("sqlserver", "cursor") and ls.get_strategy("cursor").implemented
-    for st in ("oracle", "postgresql", "mysql"):
+    assert ls.supported("postgresql", "cursor")
+    for st in ("oracle", "mysql"):
         assert ls.unsupported_reason(st, "cursor") == \
             f"load_type 'cursor' is not implemented yet (src_type '{st}')"
 

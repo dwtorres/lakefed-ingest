@@ -44,8 +44,11 @@ from typing import Optional, Tuple
 import ct_engine
 import source_adapters
 
-NUMERIC_TYPES = {"tinyint", "smallint", "int", "bigint", "decimal", "numeric"}
-TEMPORAL_TYPES = {"date", "smalldatetime", "datetime", "datetime2", "datetimeoffset"}
+# SQL Server names (TYPE_NAME) and PostgreSQL names (information_schema.columns.data_type, which
+# never reports a bare 'timestamp' — that name stays SQL Server's rowversion alias).
+NUMERIC_TYPES = {"tinyint", "smallint", "int", "integer", "bigint", "decimal", "numeric"}
+TEMPORAL_TYPES = {"date", "smalldatetime", "datetime", "datetime2", "datetimeoffset",
+                  "timestamp without time zone", "timestamp with time zone"}
 ROWVERSION_TYPES = {"timestamp", "rowversion"}  # TYPE_NAME(system_type_id) reports 'timestamp'
 SUPPORTED_TYPES = NUMERIC_TYPES | TEMPORAL_TYPES | ROWVERSION_TYPES
 
@@ -91,8 +94,26 @@ def _obj(cfg: dict) -> str:
     return ct_engine.quote_nstr(f"{ct_engine.quote_ident(cfg['src_schema'])}.{ct_engine.quote_ident(cfg['src_table'])}")
 
 
+def _is_pg(cfg: dict) -> bool:
+    return source_adapters.for_cfg(cfg).src_type == source_adapters.POSTGRESQL
+
+
+def _col(cfg: dict) -> str:
+    """``cursor_column`` quoted for the source dialect."""
+    a = source_adapters.for_cfg(cfg)
+    return a.quote_ident(cfg["cursor_column"]) if _is_pg(cfg) else ct_engine.quote_ident(cfg["cursor_column"])
+
+
+def _pg_column_where(cfg: dict) -> str:
+    q = source_adapters.for_cfg(cfg).quote_str
+    return (f"FROM information_schema.columns WHERE table_schema = {q(cfg['src_schema'])} "
+            f"AND table_name = {q(cfg['src_table'])} AND column_name = {q(cfg['cursor_column'])}")
+
+
 def column_type_sql(cfg: dict) -> str:
     """System type name and nullability of ``cursor_column`` (no row when the column doesn't exist)."""
+    if _is_pg(cfg):
+        return f"SELECT data_type AS typ, (is_nullable = 'YES') AS nullable {_pg_column_where(cfg)}"
     return ("SELECT TYPE_NAME(c.system_type_id) AS typ, c.is_nullable AS nullable FROM sys.columns c "
             f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])}")
 
@@ -100,16 +121,32 @@ def column_type_sql(cfg: dict) -> str:
 def nullable_sql(cfg: dict) -> str:
     """Scalar subquery: 1 if ``cursor_column`` is nullable (checked on every run, not just at seed —
     a column can be altered to NULL after the table was seeded)."""
+    if _is_pg(cfg):
+        return f"(SELECT CASE WHEN is_nullable = 'YES' THEN 1 ELSE 0 END {_pg_column_where(cfg)})"
     return ("(SELECT CAST(c.is_nullable AS INT) FROM sys.columns c "
             f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])})")
 
 
+_PG_ISO = "'YYYY-MM-DD\"T\"HH24:MI:SS.US'"
+
+
 def high_watermark_sql(cfg: dict, typ: str) -> str:
-    """One row ``hi``, ``nullable``: the cursor column's high watermark as SQL Server text (NULL on an
+    """One row ``hi``, ``nullable``: the cursor column's high watermark as source text (NULL on an
     empty table) and its nullability (one query per run for both). rowversion is capped below
-    MIN_ACTIVE_ROWVERSION() so open transactions are never skipped."""
-    col = ct_engine.quote_ident(cfg["cursor_column"])
+    MIN_ACTIVE_ROWVERSION() so open transactions are never skipped. PostgreSQL emits ISO 8601 via
+    to_char; a timestamptz is rendered in UTC with an explicit offset so the literal round-trips
+    whatever the session time zone is."""
+    col = _col(cfg)
     kind = _kind(typ)
+    if _is_pg(cfg):
+        a = source_adapters.for_cfg(cfg)
+        if kind == "numeric":
+            expr = f"MAX({col})::text"
+        elif "with time zone" in typ.lower():
+            expr = f"to_char(MAX({col}) AT TIME ZONE 'UTC', {_PG_ISO}) || '+00:00'"
+        else:
+            expr = f"to_char(MAX({col}), {_PG_ISO})"
+        return f"SELECT {expr} AS hi, {nullable_sql(cfg)} AS nullable FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}"
     if kind == "numeric":
         expr = f"CONVERT(VARCHAR(64), MAX({col}))"
     elif kind == "temporal":
@@ -121,9 +158,9 @@ def high_watermark_sql(cfg: dict, typ: str) -> str:
     return f"SELECT {expr} AS hi, {nullable_sql(cfg)} AS nullable FROM {table}"
 
 
-def literal(value: str, typ: str) -> str:
-    """A typed SQL Server literal for a position value (validated — values come from our own
-    checkpoint, but are never spliced unchecked)."""
+def literal(value: str, typ: str, pg: bool = False) -> str:
+    """A typed source literal for a position value (validated — values come from our own
+    checkpoint, but are never spliced unchecked). ``pg``: PostgreSQL CAST form."""
     kind = _kind(typ)
     v = str(value).strip()
     if kind == "numeric":
@@ -133,6 +170,8 @@ def literal(value: str, typ: str) -> str:
     if kind == "temporal":
         if not _TEMPORAL_VALUE.match(v):
             raise ValueError(f"invalid temporal cursor position {value!r}")
+        if pg:
+            return f"CAST('{v}' AS {typ.strip().lower()})"
         return f"CONVERT({typ.strip().lower()}, {ct_engine.quote_nstr(v)}, 126)"
     if not _INTEGER_VALUE.match(v):
         raise ValueError(f"invalid rowversion cursor position {value!r}")
@@ -146,13 +185,13 @@ def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str) -> str:
     A temporal cursor is assigned when the row is written, not when it commits, so a row can commit
     after a read whose ``hi`` is above it. The lower bound is pulled back by ``CURSOR_OVERLAP_S`` for
     temporal kinds (the MERGE makes the re-read harmless); rowversion and numeric stay exact."""
-    col = ct_engine.quote_ident(cfg["cursor_column"])
-    upper = f"{col} <= {literal(hi, typ)}"
+    col, pg = _col(cfg), _is_pg(cfg)
+    upper = f"{col} <= {literal(hi, typ, pg)}"
     if lo is None:
         return upper
     if _kind(typ) == "temporal":
         lo = _minus_seconds(lo, CURSOR_OVERLAP_S)
-    return f"{col} > {literal(lo, typ)} AND {upper}"
+    return f"{col} > {literal(lo, typ, pg)} AND {upper}"
 
 
 CURSOR_OVERLAP_S = int(os.environ.get("LAKEFED_CURSOR_OVERLAP_S") or "600")
@@ -171,7 +210,8 @@ def seed_position(typ: str, hi: Optional[str], seed_seconds: float) -> Optional[
 def _minus_seconds(value: str, seconds: int) -> str:
     """``value`` (ISO 8601, as the source returned it) minus ``seconds``, in the same ISO form.
     SQL Server emits up to 7 fractional digits; ``fromisoformat`` takes at most 6, so the fraction
-    is truncated (a 100 ns loss on a bound that is already pulled back by minutes)."""
+    is truncated (a 100 ns loss on a bound that is already pulled back by minutes). A ``date``
+    column gains at most one day from this (a date carries no commit order anyway)."""
     v = str(value).strip()
     if not _TEMPORAL_VALUE.match(v):
         raise ValueError(f"invalid temporal cursor position {value!r}")
@@ -247,8 +287,13 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
 
 
 def plan_increment(position: dict, hi: Optional[str]) -> Tuple[str, Optional[str]]:
-    """('unchanged' | 'read', new position value). An empty source (hi NULL) or hi equal to the
-    checkpoint means nothing to read; the position is kept (never moved to NULL)."""
-    if hi is None or hi == position.get("value"):
+    """('unchanged' | 'read', new position value). An empty source (hi NULL) means nothing to read;
+    the position is kept (never moved to NULL). hi equal to the checkpoint is unchanged for numeric
+    and rowversion kinds; a temporal cursor still reads its overlap window, because a row can commit
+    late BELOW the high watermark without moving it (a quiet table would otherwise hold that row
+    until its next change)."""
+    if hi is None:
+        return "unchanged", position.get("value")
+    if hi == position.get("value") and _kind(position.get("type")) != "temporal":
         return "unchanged", position.get("value")
     return "read", hi

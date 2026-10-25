@@ -79,6 +79,35 @@ def test_seed_position_pulls_a_temporal_cursor_back_by_the_seed_duration():
     assert cur.seed_position("datetime2", None, 7200) is None   # empty at seed
 
 
+PG = {**CFG, "src_type": "postgresql", "src_schema": "public"}
+
+
+def test_postgres_cursor_sql():
+    assert cur.column_type_sql(PG) == ("SELECT data_type AS typ, (is_nullable = 'YES') AS nullable FROM "
+                                       "information_schema.columns WHERE table_schema = 'public' AND "
+                                       "table_name = 'orders' AND column_name = 'updated_at'")
+    hw = cur.high_watermark_sql(PG, "timestamp with time zone")
+    assert hw.startswith("SELECT to_char(MAX(\"updated_at\") AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS hi")
+    assert hw.endswith('FROM "public"."orders"')
+    assert cur.high_watermark_sql(PG, "bigint").startswith('SELECT MAX("updated_at")::text AS hi')
+    assert cur.high_watermark_sql(PG, "timestamp without time zone").startswith(
+        "SELECT to_char(MAX(\"updated_at\"), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS hi")
+    where = cur.read_where(PG, "timestamp without time zone", "2026-01-01T10:00:00", "2026-01-01T11:00:00")
+    assert where == ('"updated_at" > CAST(\'2026-01-01T09:50:00\' AS timestamp without time zone) AND '
+                     '"updated_at" <= CAST(\'2026-01-01T11:00:00\' AS timestamp without time zone)')
+    assert cur.read_where(PG, "integer", "10", "20") == '"updated_at" > 10 AND "updated_at" <= 20'
+    with pytest.raises(ValueError):
+        cur.literal("2026-01-01'; drop table x--", "timestamp without time zone", pg=True)
+
+
+def test_temporal_cursor_still_reads_its_overlap_when_hi_is_unchanged():
+    pos = {"col": "updated_at", "type": "datetime2", "value": "2026-01-01T10:00:00"}
+    assert cur.plan_increment(pos, "2026-01-01T10:00:00") == ("read", "2026-01-01T10:00:00")
+    assert cur.plan_increment(pos, None) == ("unchanged", "2026-01-01T10:00:00")
+    assert cur.plan_increment({**pos, "type": "int", "value": "5"}, "5") == ("unchanged", "5")
+    assert cur.plan_increment({**pos, "type": "rowversion", "value": "5"}, "5") == ("unchanged", "5")
+
+
 def test_minus_seconds_keeps_offset_and_rejects_garbage():
     assert cur._minus_seconds("2026-01-01T00:00:30Z", 60) == "2025-12-31T23:59:30+00:00"
     assert cur._minus_seconds("2026-01-01", 1) == "2025-12-31T23:59:59"
