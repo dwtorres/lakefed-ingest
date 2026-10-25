@@ -35,8 +35,10 @@ JDBC helpers (one slot per query unit, lazy Spark imports).
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 import ct_engine
@@ -139,10 +141,42 @@ def literal(value: str, typ: str) -> str:
 
 def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str) -> str:
     """``cursor_column > lo AND cursor_column <= hi`` (no lower bound when ``lo`` is None — a table
-    that was empty at seed time). Sargable: the literal is cast to the column's type, not vice versa."""
+    that was empty at seed time). Sargable: the literal is cast to the column's type, not vice versa.
+
+    A temporal cursor is assigned when the row is written, not when it commits, so a row can commit
+    after a read whose ``hi`` is above it. The lower bound is pulled back by ``CURSOR_OVERLAP_S`` for
+    temporal kinds (the MERGE makes the re-read harmless); rowversion and numeric stay exact."""
     col = ct_engine.quote_ident(cfg["cursor_column"])
     upper = f"{col} <= {literal(hi, typ)}"
-    return upper if lo is None else f"{col} > {literal(lo, typ)} AND {upper}"
+    if lo is None:
+        return upper
+    if _kind(typ) == "temporal":
+        lo = _minus_seconds(lo, CURSOR_OVERLAP_S)
+    return f"{col} > {literal(lo, typ)} AND {upper}"
+
+
+CURSOR_OVERLAP_S = int(os.environ.get("LAKEFED_CURSOR_OVERLAP_S") or "600")
+
+
+def seed_position(typ: str, hi: Optional[str], seed_seconds: float) -> Optional[str]:
+    """The position to record after a seed. ``hi`` was captured before the copy; a temporal cursor
+    can still gain rows BELOW ``hi`` that commit while the copy runs (their timestamp predates the
+    capture), so the recorded position is pulled back by the seed's duration and the first increment
+    re-reads that span. Numeric and rowversion keep ``hi``."""
+    if hi is None or _kind(typ) != "temporal":
+        return hi
+    return _minus_seconds(hi, int(seed_seconds) + 1)
+
+
+def _minus_seconds(value: str, seconds: int) -> str:
+    """``value`` (ISO 8601, as the source returned it) minus ``seconds``, in the same ISO form.
+    SQL Server emits up to 7 fractional digits; ``fromisoformat`` takes at most 6, so the fraction
+    is truncated (a 100 ns loss on a bound that is already pulled back by minutes)."""
+    v = str(value).strip()
+    if not _TEMPORAL_VALUE.match(v):
+        raise ValueError(f"invalid temporal cursor position {value!r}")
+    v = re.sub(r"(\.\d{6})\d+", r"\1", v).replace("Z", "+00:00")
+    return (datetime.fromisoformat(v) - timedelta(seconds=seconds)).isoformat()
 
 
 def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:

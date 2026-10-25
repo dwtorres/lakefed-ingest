@@ -61,6 +61,31 @@ def test_read_where_bounds():
     assert cur.read_where(CFG, "int", None, "20") == "[updated_at] <= 20"   # empty at seed
 
 
+def test_temporal_lower_bound_is_pulled_back_by_the_overlap(monkeypatch):
+    monkeypatch.setattr(cur, "CURSOR_OVERLAP_S", 600)
+    where = cur.read_where(CFG, "datetime2", "2026-01-01T10:00:00.1234567", "2026-01-01T11:00:00")
+    assert "N'2026-01-01T09:50:00.123456'" in where            # 10 min back, 7th digit dropped
+    assert where.endswith("<= CONVERT(datetime2, N'2026-01-01T11:00:00', 126)")
+    # exact bounds for the other kinds
+    assert cur.read_where(CFG, "int", "10", "20").startswith("[updated_at] > 10 ")
+    assert cur.read_where(CFG, "rowversion", "10", "20").startswith("[updated_at] > CAST(CAST(10")
+    assert cur.read_where(CFG, "datetime2", None, "2026-01-01T11:00:00") .startswith("[updated_at] <=")
+
+
+def test_seed_position_pulls_a_temporal_cursor_back_by_the_seed_duration():
+    assert cur.seed_position("datetime2", "2026-01-01T12:00:00", 7200.4) == "2026-01-01T09:59:59"
+    assert cur.seed_position("int", "500", 7200) == "500"
+    assert cur.seed_position("rowversion", "500", 7200) == "500"
+    assert cur.seed_position("datetime2", None, 7200) is None   # empty at seed
+
+
+def test_minus_seconds_keeps_offset_and_rejects_garbage():
+    assert cur._minus_seconds("2026-01-01T00:00:30Z", 60) == "2025-12-31T23:59:30+00:00"
+    assert cur._minus_seconds("2026-01-01", 1) == "2025-12-31T23:59:59"
+    with pytest.raises(ValueError):
+        cur._minus_seconds("1 OR 1=1", 1)
+
+
 def test_upsert_merge_has_no_delete_branch():
     sql = cur.upsert_merge_sql(CFG, "c.s.orders", "v")
     assert sql.startswith("MERGE WITH SCHEMA EVOLUTION INTO c.s.orders AS tgt USING v AS s ON tgt.`id` = s.`id`")
