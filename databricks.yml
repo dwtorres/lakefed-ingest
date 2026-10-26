@@ -61,6 +61,12 @@ variables:
   detection_chunk:
     description: Tables per batched change-detection query.
     default: "200"
+  cursor_lookback_s:
+    description: Seconds a temporal cursor increment starts below the checkpoint (a control row's cursor_lookback_s overrides it).
+    default: "3600"
+  cursor_skew_s:
+    description: Seconds the temporal high watermark may exceed the source clock before it is capped.
+    default: "300"
   table_retries:
     description: Extra attempts per table after a transient source error, in the same run ("0" = off).
     default: "0"

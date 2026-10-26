@@ -50,14 +50,15 @@ def calls():
 @pytest.fixture
 def deps(calls):
     return SimpleNamespace(spark=object(), store=FakeStore(calls), slots=FakeSlots(), executor=None,
-                           log=lambda *a: None, params={"table_retries": 0}, guard=lambda: None,
+                           log=lambda *a: None, guard=lambda: None,
+                           params={"table_retries": 0, "cursor_lookback_s": 3600, "cursor_skew_s": 300},
                            retry_policy=table_retry.RetryPolicy(retries=0, budget=0))
 
 
 @pytest.fixture
 def fakes(monkeypatch, calls):
     """Fake the source/sink modules the worker calls; ``fail`` makes every write raise."""
-    state = {"fail": False}
+    state = {"fail": False, "alert": False}
 
     def write(name):
         def _w(*a, **kw):
@@ -67,16 +68,17 @@ def fakes(monkeypatch, calls):
             return 3
         return _w
 
-    def high_watermark(cfg, typ, slots=None):
-        calls.append(("high_watermark",))
-        return "42"
+    def high_watermark(cfg, typ, skew_s, slots=None):
+        calls.append(("high_watermark", skew_s))
+        return "42", state["alert"]
 
     monkeypatch.setattr(worker, "sink_writer", SimpleNamespace(
         sink_fqn=lambda cfg: "c.s.t", ensure_sink_table=lambda *a, **kw: None, seed=write("seed")))
     monkeypatch.setattr(worker, "cursor_engine", SimpleNamespace(
         column_type=lambda cfg, slots=None: "int", high_watermark=high_watermark,
         seed_position=worker.cursor_engine.seed_position, encode_position=worker.cursor_engine.encode_position,
-        plan_increment=worker.cursor_engine.plan_increment, read_and_merge=write("merge")))
+        plan_increment=worker.cursor_engine.plan_increment, lookback_seconds=worker.cursor_engine.lookback_seconds,
+        read_and_merge=write("merge")))
     monkeypatch.setattr(worker, "load_strategies", SimpleNamespace(
         get_strategy=lambda lt: SimpleNamespace(load=write("full_load"))))
     return state
@@ -125,7 +127,7 @@ def test_schema_reseed_enqueues_reseed(deps, fakes, calls):
 def test_failure_before_any_write_records_failed_event_and_no_position(deps, fakes, calls, monkeypatch):
     # Nothing can fail at stage "plan" inside the worker's try (the position is read before the event
     # starts), so the earliest failure is the high-watermark read: failed event, no position, no advance.
-    def boom(cfg, typ, slots=None):
+    def boom(cfg, typ, *a, **kw):
         raise RuntimeError("source unreachable")
     monkeypatch.setattr(worker.cursor_engine, "high_watermark", boom)
     plan, _ = PLANS["cursor"]
@@ -163,3 +165,36 @@ def test_cursor_route_plans_merges_then_advances_to_hi(deps, fakes, calls, monke
     assert names.index("high_watermark") < names.index("merge") < names.index("advance")
     advance = [c for c in calls if c[0] == "advance"][0]
     assert advance[1] == worker.cursor_engine.encode_position("mod", "int", "42")
+
+
+def test_max_timeout_fails_table_and_keeps_position(deps, fakes, calls, monkeypatch):
+    def timeout(cfg, typ, *a, **kw):
+        raise RuntimeError("The query has timed out")
+    monkeypatch.setattr(worker.cursor_engine, "high_watermark", timeout)
+    plan, _ = PLANS["cursor"]
+    with pytest.raises(RuntimeError, match="timed out"):
+        worker.ingest_one(plan, run_id=1, deps=deps)
+    assert "advance" not in _names(calls) and ("set_status", "failed") in calls
+    finish = [c for c in calls if c[0] == "event_finish"]
+    assert len(finish) == 1 and finish[0][1] == "failed"
+    assert finish[0][2]["position_from"] == "10" and finish[0][2]["position_to"] is None
+
+
+def test_capped_watermark_logs_the_alert_and_records_it_on_the_checkpoint(deps, fakes, calls):
+    logged = []
+    deps.log = logged.append
+    fakes["alert"] = True
+    plan, _ = PLANS["cursor"]
+    worker.ingest_one(plan, run_id=1, deps=deps)
+    assert ("high_watermark", 300) in calls
+    assert any(worker.ALERT_MAX_ABOVE_CLOCK in line for line in logged)
+    assert [c for c in calls if c[0] == "advance"][0][2]["detail"] == worker.ALERT_MAX_ABOVE_CLOCK
+
+
+def test_identity_cursor_logs_inserts_only_once_per_run(deps, fakes, calls):
+    logged = []
+    deps.log = logged.append
+    plan, _ = PLANS["cursor"]
+    worker.ingest_one(plan, run_id=1, deps=deps)
+    worker.ingest_one(plan, run_id=1, deps=deps, attempt=1)      # a retry does not repeat it
+    assert sum("[inserts_only]" in line for line in logged) == 1

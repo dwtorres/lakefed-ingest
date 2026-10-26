@@ -72,7 +72,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
   shared advisory locks; `parallel.SourceLimiter`), `table_retries` (extra attempts per table after a
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
-  `db_instance`, `db_name`.
+  `cursor_lookback_s` (temporal cursor: seconds `lo` is pulled back; row `cursor_lookback_s` overrides),
+  `cursor_skew_s` (temporal cursor: `hi` is capped at the source clock plus this), `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,

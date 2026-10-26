@@ -1,4 +1,7 @@
 """Cursor (high-watermark) strategy, SQL Server: position encoding, typed SQL, increment decision."""
+import re
+from datetime import datetime
+
 import pytest
 
 import cursor_engine as cur
@@ -21,12 +24,13 @@ def test_type_lookup_sql_quotes_names():
     assert "OBJECT_ID(N'[dbo].[odd]]name]')" in sql and "c.name = N'it''s'" in sql
 
 
-@pytest.mark.parametrize("typ,expr", [
-    ("bigint", "CONVERT(VARCHAR(64), MAX([updated_at]))"),
-    ("datetime2", "CONVERT(VARCHAR(64), MAX([updated_at]), 126)"),
+@pytest.mark.parametrize("typ,expr,clock", [
+    ("bigint", "CONVERT(VARCHAR(64), MAX([updated_at]))", ""),
+    ("datetime2", "CONVERT(VARCHAR(64), MAX([updated_at]), 126)", ", CONVERT(VARCHAR(64), SYSDATETIME(), 126) AS src_now"),
+    ("datetimeoffset", "CONVERT(VARCHAR(64), MAX([updated_at]), 126)", ", CONVERT(VARCHAR(64), SYSDATETIMEOFFSET(), 126) AS src_now"),
 ])
-def test_high_watermark_sql(typ, expr):
-    assert cur.high_watermark_sql(CFG, typ) == f"SELECT {expr} AS hi, {cur.nullable_sql(CFG)} AS nullable FROM [dbo].[orders]"
+def test_high_watermark_sql(typ, expr, clock):
+    assert cur.high_watermark_sql(CFG, typ) == f"SELECT {expr} AS hi, {cur.nullable_sql(CFG)} AS nullable{clock} FROM [dbo].[orders]"
 
 
 @pytest.mark.parametrize("typ", ["timestamp", "rowversion"])
@@ -57,19 +61,18 @@ def test_typed_literals_are_validated_and_sargable():
 
 
 def test_read_where_bounds():
-    assert cur.read_where(CFG, "int", "10", "20") == "[updated_at] > 10 AND [updated_at] <= 20"
-    assert cur.read_where(CFG, "int", None, "20") == "[updated_at] <= 20"   # empty at seed
+    assert cur.read_where(CFG, "int", "10", "20", 600) == "[updated_at] > 10 AND [updated_at] <= 20"
+    assert cur.read_where(CFG, "int", None, "20", 600) == "[updated_at] <= 20"   # empty at seed
 
 
-def test_temporal_lower_bound_is_pulled_back_by_the_overlap(monkeypatch):
-    monkeypatch.setattr(cur, "CURSOR_OVERLAP_S", 600)
-    where = cur.read_where(CFG, "datetime2", "2026-01-01T10:00:00.1234567", "2026-01-01T11:00:00")
+def test_temporal_lower_bound_is_pulled_back_by_the_lookback():
+    where = cur.read_where(CFG, "datetime2", "2026-01-01T10:00:00.1234567", "2026-01-01T11:00:00", 600)
     assert "N'2026-01-01T09:50:00.123456'" in where            # 10 min back, 7th digit dropped
     assert where.endswith("<= CONVERT(datetime2, N'2026-01-01T11:00:00', 126)")
     # exact bounds for the other kinds
-    assert cur.read_where(CFG, "int", "10", "20").startswith("[updated_at] > 10 ")
-    assert cur.read_where(CFG, "rowversion", "10", "20").startswith("[updated_at] > CAST(CAST(10")
-    assert cur.read_where(CFG, "datetime2", None, "2026-01-01T11:00:00") .startswith("[updated_at] <=")
+    assert cur.read_where(CFG, "int", "10", "20", 600).startswith("[updated_at] > 10 ")
+    assert cur.read_where(CFG, "rowversion", "10", "20", 600).startswith("[updated_at] > CAST(CAST(10")
+    assert cur.read_where(CFG, "datetime2", None, "2026-01-01T11:00:00", 600).startswith("[updated_at] <=")
 
 
 def test_seed_position_pulls_a_temporal_cursor_back_by_the_seed_duration():
@@ -88,24 +91,26 @@ def test_postgres_cursor_sql():
                                        "table_name = 'orders' AND column_name = 'updated_at'")
     hw = cur.high_watermark_sql(PG, "timestamp with time zone")
     assert hw.startswith("SELECT to_char(MAX(\"updated_at\") AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS hi")
-    assert hw.endswith('FROM "public"."orders"')
-    assert cur.high_watermark_sql(PG, "bigint").startswith('SELECT MAX("updated_at")::text AS hi')
+    assert hw.endswith(", to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS src_now "
+                       'FROM "public"."orders"')
+    assert cur.high_watermark_sql(PG, "bigint") == f'SELECT MAX("updated_at")::text AS hi, {cur.nullable_sql(PG)} AS nullable FROM "public"."orders"'
     assert cur.high_watermark_sql(PG, "timestamp without time zone").startswith(
         "SELECT to_char(MAX(\"updated_at\"), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS hi")
-    where = cur.read_where(PG, "timestamp without time zone", "2026-01-01T10:00:00", "2026-01-01T11:00:00")
+    assert ", to_char(LOCALTIMESTAMP, 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS src_now" in cur.high_watermark_sql(PG, "timestamp without time zone")
+    where = cur.read_where(PG, "timestamp without time zone", "2026-01-01T10:00:00", "2026-01-01T11:00:00", 600)
     assert where == ('"updated_at" > CAST(\'2026-01-01T09:50:00\' AS timestamp without time zone) AND '
                      '"updated_at" <= CAST(\'2026-01-01T11:00:00\' AS timestamp without time zone)')
-    assert cur.read_where(PG, "integer", "10", "20") == '"updated_at" > 10 AND "updated_at" <= 20'
+    assert cur.read_where(PG, "integer", "10", "20", 600) == '"updated_at" > 10 AND "updated_at" <= 20'
     with pytest.raises(ValueError):
         cur.literal("2026-01-01'; drop table x--", "timestamp without time zone", pg=True)
 
 
-def test_temporal_cursor_still_reads_its_overlap_when_hi_is_unchanged():
+def test_temporal_cursor_still_reads_its_lookback_when_hi_is_unchanged():
     pos = {"col": "updated_at", "type": "datetime2", "value": "2026-01-01T10:00:00"}
-    assert cur.plan_increment(pos, "2026-01-01T10:00:00") == ("read", "2026-01-01T10:00:00")
-    assert cur.plan_increment(pos, None) == ("unchanged", "2026-01-01T10:00:00")
-    assert cur.plan_increment({**pos, "type": "int", "value": "5"}, "5") == ("unchanged", "5")
-    assert cur.plan_increment({**pos, "type": "rowversion", "value": "5"}, "5") == ("unchanged", "5")
+    assert cur.plan_increment(pos, "2026-01-01T10:00:00") == ("read", "2026-01-01T10:00:00", None)
+    assert cur.plan_increment(pos, None) == ("unchanged", "2026-01-01T10:00:00", None)
+    assert cur.plan_increment({**pos, "type": "int", "value": "5"}, "5") == ("unchanged", "5", "inserts_only")
+    assert cur.plan_increment({**pos, "type": "rowversion", "value": "5"}, "5") == ("unchanged", "5", None)
 
 
 def test_minus_seconds_keeps_offset_and_rejects_garbage():
@@ -125,10 +130,10 @@ def test_upsert_merge_has_no_delete_branch():
 
 def test_plan_increment():
     pos = {"col": "c", "type": "int", "value": "20"}
-    assert cur.plan_increment(pos, "20") == ("unchanged", "20")
-    assert cur.plan_increment(pos, None) == ("unchanged", "20")          # source emptied: keep position
-    assert cur.plan_increment(pos, "25") == ("read", "25")
-    assert cur.plan_increment(dict(pos, value=None), "5") == ("read", "5")
+    assert cur.plan_increment(pos, "20")[:2] == ("unchanged", "20")
+    assert cur.plan_increment(pos, None)[:2] == ("unchanged", "20")          # source emptied: keep position
+    assert cur.plan_increment(pos, "25")[:2] == ("read", "25")
+    assert cur.plan_increment(dict(pos, value=None), "5")[:2] == ("read", "5")
 
 
 class _Rows:
@@ -206,7 +211,7 @@ def _merge(monkeypatch, spark, lo="10", hi="20", cfg=CFG):
     monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: (queries.append(q), _DF(sp, q))[1])
     monkeypatch.setattr(sink_writer, "_lit", lambda v: type("L", (), {"alias": lambda s_, n: f"lit({v}) AS {n}"})())
     monkeypatch.setattr(sink_writer, "WRITE_RETRY_BASE_S", 0.0)
-    return cur.read_and_merge(spark, cfg, "c.s.t", "int", lo, hi), queries
+    return cur.read_and_merge(spark, cfg, "c.s.t", "int", lo, hi, 600), queries
 
 
 def test_read_and_merge_reads_window_once_and_drops_view(monkeypatch):
@@ -271,8 +276,119 @@ def test_every_run_rechecks_nullability(monkeypatch):
     import source_io
     monkeypatch.setattr(source_io, "_spark", lambda: None)
     monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 0}]))
-    assert cur.high_watermark(CFG, "int") == "20"
+    assert cur.high_watermark(CFG, "int", 300) == ("20", False)
     monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 1}]))
     with pytest.raises(ValueError, match="is nullable"):
-        cur.high_watermark(CFG, "int")
+        cur.high_watermark(CFG, "int", 300)
     assert "c.is_nullable" in cur.nullable_sql(CFG) and "N'updated_at'" in cur.nullable_sql(CFG)
+
+
+# ---- safe window bounds (analysis 3.4 gaps 2, 3, 4, 5, 7, 8) ---------------------------------------
+# Phase 5 adds the oracle adapter here.
+DIALECTS = [pytest.param(CFG, "datetime2", id="sqlserver"),
+            pytest.param(PG, "timestamp without time zone", id="postgresql")]
+_ISO = re.compile(r"'(\d{4}-\d{2}-\d{2}T[^']+)'")
+
+
+def _source_rows(monkeypatch, rows):
+    import source_io
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows(rows))
+
+
+def _in_window(rows, where):
+    """The row keys a ``(lo, hi]`` WHERE selects, by its two temporal literals."""
+    lo, hi = (datetime.fromisoformat(v) for v in _ISO.findall(where))
+    return {k for k, v in rows.items() if lo < datetime.fromisoformat(v) <= hi}
+
+
+@pytest.mark.parametrize("typ", ["datetime", "smalldatetime"])
+def test_gap_5_datetime_literal_three_digits(typ):
+    assert cur.literal("2026-01-01T10:00:00.1234567", typ) == f"CONVERT({typ}, N'2026-01-01T10:00:00.123', 126)"
+    assert cur._minus_seconds("2026-01-01T10:00:00.1234567", 600, typ) == "2026-01-01T09:50:00.123"
+    assert cur._minus_seconds("2026-01-01T10:00:00.1234567", 600, "datetime2") == "2026-01-01T09:50:00.123456"
+    where = cur.read_where(CFG, typ, "2026-01-01T10:00:00.1234567", "2026-01-01T11:00:00.9999999", lookback_s=600)
+    assert re.findall(r"\.\d+", where) == [".123", ".999"]
+
+
+def test_gap_2_lookback_argument_replaces_env():
+    assert not hasattr(cur, "CURSOR_OVERLAP_S") and not hasattr(cur, "os")
+    where = cur.read_where(CFG, "datetime2", "2026-01-01T10:00:00", "2026-01-01T11:00:00", lookback_s=3600)
+    assert "N'2026-01-01T09:00:00'" in where
+    assert cur.lookback_seconds(CFG, 3600) == 3600                                   # job default
+    assert cur.lookback_seconds(dict(CFG, cursor_lookback_s=120), 3600) == 120        # the row wins
+    assert cur.lookback_seconds(dict(CFG, cursor_lookback_s=None), 3600) == 3600
+
+
+@pytest.mark.parametrize("cfg,typ", DIALECTS)
+def test_gap_4_hi_capped_at_source_clock_plus_skew(monkeypatch, cfg, typ):
+    assert " AS src_now FROM" in cur.high_watermark_sql(cfg, typ)
+    _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
+    assert cur.high_watermark(cfg, typ, skew_s=300) == ("2026-10-26T10:05:00", True)
+    _source_rows(monkeypatch, [{"hi": "2026-10-26T09:59:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
+    assert cur.high_watermark(cfg, typ, skew_s=300) == ("2026-10-26T09:59:00", False)
+    _source_rows(monkeypatch, [{"hi": None, "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
+    assert cur.high_watermark(cfg, typ, skew_s=300) == (None, False)
+
+
+@pytest.mark.parametrize("cfg", [pytest.param(CFG, id="sqlserver"), pytest.param(PG, id="postgresql")])
+def test_gap_3_identity_reads_without_lookback(cfg):
+    assert cur._kind("bigint") == "identity"
+    col = cur._col(cfg)
+    assert cur.read_where(cfg, "bigint", "10", "20", lookback_s=3600) == f"{col} > 10 AND {col} <= 20"
+    assert cur.plan_increment({"col": "id", "type": "bigint", "value": "10"}, "20") == ("read", "20", "inserts_only")
+    assert cur.plan_increment({"col": "id", "type": "bigint", "value": "10"}, "10") == ("unchanged", "10", "inserts_only")
+    temporal = {"col": "updated_at", "type": "datetime2", "value": "2026-01-01T00:00:00"}
+    assert cur.plan_increment(temporal, "2026-01-01T00:00:00")[2] is None
+
+
+@pytest.mark.parametrize("typ,pos,hi", [("int", "20", "19"), ("rowversion", "20", "19"),
+                                        ("datetime2", "2026-01-02T00:00:00", "2026-01-01T00:00:00")])
+def test_gap_8_hi_below_position_raises(typ, pos, hi):
+    position = {"col": "c", "type": typ, "value": pos}
+    with pytest.raises(ValueError, match="truncate or reload"):
+        cur.plan_increment(position, hi)
+    assert position["value"] == pos
+    assert cur.plan_increment({"col": "c", "type": "int", "value": "9"}, "10")[:2] == ("read", "10")   # not text order
+
+
+@pytest.mark.parametrize("cfg,typ", DIALECTS)
+def test_gap_7_tie_rows_land_in_later_window(cfg, typ):
+    rows = {"a": "2026-01-01T10:00:00", "b": "2026-01-01T10:00:00", "old": "2026-01-01T08:00:00"}
+    first = cur.read_where(cfg, typ, "2026-01-01T09:00:00", "2026-01-01T10:00:00", lookback_s=600)
+    assert _in_window(rows, first) == {"a", "b"}
+    second = cur.read_where(cfg, typ, "2026-01-01T10:00:00", "2026-01-01T10:30:00", lookback_s=600)
+    assert _in_window(rows, second) == {"a", "b"}
+    sql = cur.upsert_merge_sql(cfg, "c.s.orders", "v")
+    assert "ON tgt.`id` = s.`id` WHEN MATCHED THEN UPDATE SET" in sql and "DELETE" not in sql
+    sink = {}
+    for _ in (first, second):           # the MERGE keys on the PK: the second pass changes nothing
+        sink.update({k: rows[k] for k in _in_window(rows, first)})
+    assert sink == {"a": rows["a"], "b": rows["b"]}
+
+
+@pytest.mark.parametrize("cfg,typ", DIALECTS)
+def test_rows_below_cap_read_after_capped_hi(monkeypatch, cfg, typ):
+    rows = {"late": "2099-01-01T00:00:00", "r1": "2026-10-26T10:03:00", "r2": "2026-10-26T10:08:00"}
+    pos = {"col": "updated_at", "type": typ, "value": "2026-10-26T10:00:00"}
+    _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
+    hi, alert = cur.high_watermark(cfg, typ, skew_s=300)
+    assert (hi, alert) == ("2026-10-26T10:05:00", True)
+    assert _in_window(rows, cur.read_where(cfg, typ, pos["value"], hi, lookback_s=0)) == {"r1"}
+    pos["value"] = hi
+    _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2026-10-26T10:10:00"}])
+    hi, _ = cur.high_watermark(cfg, typ, skew_s=300)
+    assert cur.plan_increment(pos, hi) == ("read", "2026-10-26T10:15:00", None)
+    assert _in_window(rows, cur.read_where(cfg, typ, pos["value"], hi, lookback_s=0)) == {"r2"}
+    _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2099-01-01T00:00:00"}])
+    hi, alert = cur.high_watermark(cfg, typ, skew_s=300)
+    assert (hi, alert) == ("2099-01-01T00:00:00", False)
+    assert "late" in _in_window(rows, cur.read_where(cfg, typ, "2026-10-26T10:15:00", hi, lookback_s=0))
+
+
+@pytest.mark.parametrize("cfg", [pytest.param(dict(CFG, src_type="sqlserver"), id="sqlserver")])   # rowversion is SQL Server only
+def test_rowversion_hi_stays_below_min_active_rowversion_and_reads_exact(cfg):
+    sql = cur.high_watermark_sql(cfg, "rowversion")
+    assert "ELSE CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) - 1 END" in sql and "src_now" not in sql
+    assert cur.read_where(cfg, "rowversion", "10", "20", lookback_s=3600) == (
+        "[updated_at] > CAST(CAST(10 AS BIGINT) AS BINARY(8)) AND [updated_at] <= CAST(CAST(20 AS BIGINT) AS BINARY(8))")

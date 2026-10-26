@@ -10,19 +10,24 @@ Per cycle, for a seeded table (checkpoint phase ``incremental``):
 The seed captures ``hi`` BEFORE the full copy, so rows written during the seed are re-read by the
 first increment (no gap).
 
-Supported column types (SQL Server system type of ``cursor_column``):
-  * integers / exact numerics: tinyint, smallint, int, bigint, decimal, numeric (identity keys);
-  * temporal: date, smalldatetime, datetime, datetime2, datetimeoffset (an application-maintained
-    ``updated_at``);
+Supported column types (SQL Server system type of ``cursor_column``), by kind:
+  * ``identity``: tinyint, smallint, int, bigint, decimal, numeric (identity keys / sequences). A
+    value is taken at insert, not at commit, so a late commit below a read ``hi`` is lost: the kind
+    is inserts-only (``plan_increment`` says so) and reads exact bounds;
+  * ``temporal``: date, smalldatetime, datetime, datetime2, datetimeoffset (an application-maintained
+    ``updated_at``). ``lo`` is pulled back by ``lookback_s`` (job parameter ``cursor_lookback_s``,
+    the row's ``cursor_lookback_s`` overrides it) for late commits; ``hi`` is capped at the source
+    clock plus ``skew_s`` so one row stamped in 2099 cannot pin the window (``max_above_clock``
+    alert); ``datetime`` / ``smalldatetime`` literals carry at most three fractional digits;
   * ``rowversion`` (``timestamp``): recommended — SQL Server bumps it on every insert AND update,
     and ``hi`` is capped below ``MIN_ACTIVE_ROWVERSION()`` so rows from still-open transactions are
-    never skipped.
+    never skipped. Exact bounds.
 Float / real / string columns are rejected (lossy or not reliably ordered).
 
 Limits (by design of a watermark): deletes are not captured (use a periodic ``full``);
 updates are captured only if they move the cursor column (``rowversion`` always does, an identity
-never does); for non-rowversion columns, a transaction that commits a value BELOW an already-read
-``hi`` after the read is missed — the reason ``rowversion`` is recommended.
+never does). A ``hi`` below the position (a source truncate or reload) fails the table; the position
+never moves backwards.
 
 Position (``checkpoint.position``, text) is JSON ``{"col", "type", "value"}``: the column and its
 type are recorded so a changed ``cursor_column`` re-seeds and every later cycle needs no type
@@ -35,10 +40,10 @@ Pure builders are unit-tested in tests/cursor_engine_test.py; source access reus
 from __future__ import annotations
 
 import json
-import os
 import re
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Optional, Tuple
 
 import sink_writer
@@ -47,11 +52,12 @@ import source_io
 
 # SQL Server names (TYPE_NAME) and PostgreSQL names (information_schema.columns.data_type, which
 # never reports a bare 'timestamp' — that name stays SQL Server's rowversion alias).
-NUMERIC_TYPES = {"tinyint", "smallint", "int", "integer", "bigint", "decimal", "numeric"}
+IDENTITY_TYPES = {"tinyint", "smallint", "int", "integer", "bigint", "decimal", "numeric"}
 TEMPORAL_TYPES = {"date", "smalldatetime", "datetime", "datetime2", "datetimeoffset",
                   "timestamp without time zone", "timestamp with time zone"}
 ROWVERSION_TYPES = {"timestamp", "rowversion"}  # TYPE_NAME(system_type_id) reports 'timestamp'
-SUPPORTED_TYPES = NUMERIC_TYPES | TEMPORAL_TYPES | ROWVERSION_TYPES
+SUPPORTED_TYPES = IDENTITY_TYPES | TEMPORAL_TYPES | ROWVERSION_TYPES
+MILLISECOND_TYPES = {"datetime", "smalldatetime"}   # CONVERT(..., 126) takes at most 3 fractional digits
 
 _NUMERIC_VALUE = re.compile(r"^-?\d+(\.\d+)?$")
 _TEMPORAL_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,7})?)?)?([+-]\d{2}:\d{2}|Z)?$")
@@ -60,8 +66,8 @@ _INTEGER_VALUE = re.compile(r"^-?\d+$")
 
 def _kind(typ: str) -> str:
     t = (typ or "").strip().lower()
-    if t in NUMERIC_TYPES:
-        return "numeric"
+    if t in IDENTITY_TYPES:
+        return "identity"
     if t in TEMPORAL_TYPES:
         return "temporal"
     if t in ROWVERSION_TYPES:
@@ -132,31 +138,37 @@ _PG_ISO = "'YYYY-MM-DD\"T\"HH24:MI:SS.US'"
 
 
 def high_watermark_sql(cfg: dict, typ: str) -> str:
-    """One row ``hi``, ``nullable``: the cursor column's high watermark as source text (NULL on an
-    empty table) and its nullability (one query per run for both). rowversion is capped below
+    """One row ``hi``, ``nullable`` (and ``src_now`` for a temporal kind): the cursor column's high
+    watermark as source text (NULL on an empty table), its nullability, and the source clock in the
+    same rendering as ``hi`` (one query per run for all). rowversion is capped below
     MIN_ACTIVE_ROWVERSION() so open transactions are never skipped. PostgreSQL emits ISO 8601 via
     to_char; a timestamptz is rendered in UTC with an explicit offset so the literal round-trips
     whatever the session time zone is."""
     col = _col(cfg)
     kind = _kind(typ)
+    mx = f"MAX({col})"
     if _is_pg(cfg):
         a = source_adapters.for_cfg(cfg)
-        if kind == "numeric":
-            expr = f"MAX({col})::text"
+        table = a.table_ref(cfg['src_schema'], cfg['src_table'])
+        if kind == "identity":
+            render, clock = (lambda e: f"{e}::text"), None
         elif "with time zone" in typ.lower():
-            expr = f"to_char(MAX({col}) AT TIME ZONE 'UTC', {_PG_ISO}) || '+00:00'"
+            render, clock = (lambda e: f"to_char({e} AT TIME ZONE 'UTC', {_PG_ISO}) || '+00:00'"), "now()"
         else:
-            expr = f"to_char(MAX({col}), {_PG_ISO})"
-        return f"SELECT {expr} AS hi, {nullable_sql(cfg)} AS nullable FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}"
-    if kind == "numeric":
-        expr = f"CONVERT(VARCHAR(64), MAX({col}))"
-    elif kind == "temporal":
-        expr = f"CONVERT(VARCHAR(64), MAX({col}), 126)"
+            render, clock = (lambda e: f"to_char({e}, {_PG_ISO})"), "LOCALTIMESTAMP"
     else:
-        mx, mar = f"CAST(MAX({col}) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
-        expr = f"CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END)"
-    table = source_io.quote_ident(cfg["src_schema"]) + "." + source_io.quote_ident(cfg["src_table"])
-    return f"SELECT {expr} AS hi, {nullable_sql(cfg)} AS nullable FROM {table}"
+        table = source_io.quote_ident(cfg["src_schema"]) + "." + source_io.quote_ident(cfg["src_table"])
+        if kind == "identity":
+            render, clock = (lambda e: f"CONVERT(VARCHAR(64), {e})"), None
+        elif kind == "temporal":
+            render = lambda e: f"CONVERT(VARCHAR(64), {e}, 126)"
+            clock = "SYSDATETIMEOFFSET()" if typ.strip().lower() == "datetimeoffset" else "SYSDATETIME()"
+        else:
+            mar = "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
+            render, clock = (lambda e: f"CONVERT(VARCHAR(20), CASE WHEN CAST({e} AS BIGINT) < {mar} "
+                                       f"THEN CAST({e} AS BIGINT) ELSE {mar} - 1 END)"), None
+    src_now = f", {render(clock)} AS src_now" if kind == "temporal" else ""
+    return f"SELECT {render(mx)} AS hi, {nullable_sql(cfg)} AS nullable{src_now} FROM {table}"
 
 
 def literal(value: str, typ: str, pg: bool = False) -> str:
@@ -164,13 +176,14 @@ def literal(value: str, typ: str, pg: bool = False) -> str:
     checkpoint, but are never spliced unchecked). ``pg``: PostgreSQL CAST form."""
     kind = _kind(typ)
     v = str(value).strip()
-    if kind == "numeric":
+    if kind == "identity":
         if not _NUMERIC_VALUE.match(v):
             raise ValueError(f"invalid numeric cursor position {value!r}")
         return v
     if kind == "temporal":
         if not _TEMPORAL_VALUE.match(v):
             raise ValueError(f"invalid temporal cursor position {value!r}")
+        v = _trim_fraction(v, typ)
         if pg:
             return f"CAST('{v}' AS {typ.strip().lower()})"
         return f"CONVERT({typ.strip().lower()}, {source_io.quote_nstr(v)}, 126)"
@@ -179,23 +192,27 @@ def literal(value: str, typ: str, pg: bool = False) -> str:
     return f"CAST(CAST({v} AS BIGINT) AS BINARY(8))"
 
 
-def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str) -> str:
+def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str, lookback_s: int) -> str:
     """``cursor_column > lo AND cursor_column <= hi`` (no lower bound when ``lo`` is None — a table
     that was empty at seed time). Sargable: the literal is cast to the column's type, not vice versa.
 
     A temporal cursor is assigned when the row is written, not when it commits, so a row can commit
-    after a read whose ``hi`` is above it. The lower bound is pulled back by ``CURSOR_OVERLAP_S`` for
-    temporal kinds (the MERGE makes the re-read harmless); rowversion and numeric stay exact."""
+    after a read whose ``hi`` is above it. The lower bound is pulled back by ``lookback_s`` for
+    temporal kinds (the MERGE makes the re-read harmless); rowversion and identity stay exact (an
+    identity is inserts-only: a late commit below ``hi`` is lost whatever the lookback)."""
     col, pg = _col(cfg), _is_pg(cfg)
     upper = f"{col} <= {literal(hi, typ, pg)}"
     if lo is None:
         return upper
     if _kind(typ) == "temporal":
-        lo = _minus_seconds(lo, CURSOR_OVERLAP_S)
+        lo = _minus_seconds(lo, lookback_s, typ)
     return f"{col} > {literal(lo, typ, pg)} AND {upper}"
 
 
-CURSOR_OVERLAP_S = int(os.environ.get("LAKEFED_CURSOR_OVERLAP_S") or "600")
+def lookback_seconds(cfg: dict, default_s: int) -> int:
+    """The row's ``cursor_lookback_s`` when set, else the job parameter."""
+    row = cfg.get("cursor_lookback_s")
+    return default_s if row is None else int(row)
 
 
 def seed_position(typ: str, hi: Optional[str], seed_seconds: float) -> Optional[str]:
@@ -205,19 +222,32 @@ def seed_position(typ: str, hi: Optional[str], seed_seconds: float) -> Optional[
     re-reads that span. Numeric and rowversion keep ``hi``."""
     if hi is None or _kind(typ) != "temporal":
         return hi
-    return _minus_seconds(hi, int(seed_seconds) + 1)
+    return _minus_seconds(hi, int(seed_seconds) + 1, typ)
 
 
-def _minus_seconds(value: str, seconds: int) -> str:
-    """``value`` (ISO 8601, as the source returned it) minus ``seconds``, in the same ISO form.
-    SQL Server emits up to 7 fractional digits; ``fromisoformat`` takes at most 6, so the fraction
-    is truncated (a 100 ns loss on a bound that is already pulled back by minutes). A ``date``
-    column gains at most one day from this (a date carries no commit order anyway)."""
+def _trim_fraction(value: str, typ: str) -> str:
+    """At most 3 fractional digits for datetime / smalldatetime, else 6 (``fromisoformat`` and
+    PostgreSQL take at most 6; a 100 ns loss on a bound that is already pulled back by minutes)."""
+    digits = 3 if (typ or "").strip().lower() in MILLISECOND_TYPES else 6
+    return re.sub(r"(\.\d{%d})\d+" % digits, r"\1", value)
+
+
+def _minus_seconds(value: str, seconds: int, typ: str = "") -> str:
+    """``value`` (ISO 8601, as the source returned it) minus ``seconds`` (negative: plus), in the same
+    ISO form, with the fraction trimmed for ``typ`` (``_trim_fraction``). A ``date`` column gains at
+    most one day from this (a date carries no commit order anyway)."""
     v = str(value).strip()
     if not _TEMPORAL_VALUE.match(v):
         raise ValueError(f"invalid temporal cursor position {value!r}")
-    v = re.sub(r"(\.\d{6})\d+", r"\1", v).replace("Z", "+00:00")
-    return (datetime.fromisoformat(v) - timedelta(seconds=seconds)).isoformat()
+    v = _trim_fraction(v, "").replace("Z", "+00:00")
+    return _trim_fraction((datetime.fromisoformat(v) - timedelta(seconds=seconds)).isoformat(), typ)
+
+
+def _parse(kind: str, value: str):
+    """A comparable Python value for a position / watermark text of ``kind``."""
+    if kind == "temporal":
+        return datetime.fromisoformat(_trim_fraction(str(value).strip(), "").replace("Z", "+00:00"))
+    return Decimal(str(value).strip())
 
 
 def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
@@ -259,19 +289,30 @@ def _refuse_nullable(cfg: dict, nullable) -> None:
                          "column (rowversion recommended), or load_type ct or full")
 
 
-def high_watermark(cfg: dict, typ: str, slots=None) -> Optional[str]:
+def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Optional[str], bool]:
+    """``(hi, alert)``: the high watermark as source text (None on an empty table). A temporal ``hi``
+    is capped at the source clock plus ``skew_s`` — a row stamped in the future would otherwise pin
+    the window above every later row — and ``alert`` (``max_above_clock``) says the cap applied; the
+    capped rows are read once the clock passes them."""
     with source_io._unit(slots, cfg):
         row = source_io._read(source_io._spark(), cfg, high_watermark_sql(cfg, typ)).first()
-    if row is not None:
-        _refuse_nullable(cfg, row["nullable"])
-    return None if row is None or row["hi"] is None else str(row["hi"])
+    if row is None or row["hi"] is None:
+        return None, False
+    _refuse_nullable(cfg, row["nullable"])
+    hi = str(row["hi"])
+    if _kind(typ) != "temporal":
+        return hi, False
+    cap = _minus_seconds(str(row["src_now"]), -int(skew_s), typ)
+    if _parse("temporal", hi) > _parse("temporal", cap):
+        return cap, True
+    return hi, False
 
 
 def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str], hi: str,
-                   slots=None) -> Optional[int]:
+                   lookback_s: int, slots=None) -> Optional[int]:
     """Read (lo, hi] and upsert-MERGE it into the sink — ONE source read feeding the MERGE (no
     ``.cache()``/``count()``). Returns rows affected from the MERGE metrics (None if unavailable)."""
-    query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi))
+    query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi, lookback_s))
     def once():
         with source_io._unit(slots, cfg):
             df = sink_writer._tag(source_io._read(spark, cfg, query), cfg)
@@ -287,14 +328,23 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
     return None
 
 
-def plan_increment(position: dict, hi: Optional[str]) -> Tuple[str, Optional[str]]:
-    """('unchanged' | 'read', new position value). An empty source (hi NULL) means nothing to read;
-    the position is kept (never moved to NULL). hi equal to the checkpoint is unchanged for numeric
-    and rowversion kinds; a temporal cursor still reads its overlap window, because a row can commit
-    late BELOW the high watermark without moving it (a quiet table would otherwise hold that row
-    until its next change)."""
+def plan_increment(position: dict, hi: Optional[str]) -> Tuple[str, Optional[str], Optional[str]]:
+    """('unchanged' | 'read', new position value, note). An empty source (hi NULL) means nothing to
+    read; the position is kept (never moved to NULL). hi equal to the checkpoint is unchanged for
+    identity and rowversion kinds; a temporal cursor still reads its lookback window, because a row
+    can commit late BELOW the high watermark without moving it (a quiet table would otherwise hold
+    that row until its next change). The note is ``inserts_only`` for an identity cursor (the worker
+    logs it once per run per table). A ``hi`` below the position is a source truncate or reload:
+    the table fails and the position stays."""
+    kind = _kind(position.get("type"))
+    note = "inserts_only" if kind == "identity" else None
+    value = position.get("value")
     if hi is None:
-        return "unchanged", position.get("value")
-    if hi == position.get("value") and _kind(position.get("type")) != "temporal":
-        return "unchanged", position.get("value")
-    return "read", hi
+        return "unchanged", value, note
+    if value is not None and _parse(kind, hi) < _parse(kind, value):
+        raise ValueError(f"high watermark {hi} of cursor_column '{position.get('col')}' is below the checkpoint "
+                         f"position {value}: a source truncate or reload? The position stays; reseed the "
+                         "table to start over (enqueue a reseed)")
+    if hi == value and kind != "temporal":
+        return "unchanged", value, note
+    return "read", hi, note

@@ -7,8 +7,10 @@ decided by the planner:
                      swap when partitioned), checkpoint {strategy full, phase loaded, no position}
   cursor_seed      - load_type 'cursor', no usable checkpoint: capture the high watermark `hi`,
                      seed, checkpoint {cursor position hi, incremental}
-  cursor           - load_type 'cursor': read `hi`; unchanged if equal to the checkpoint, else read
-                     (position, hi] + upsert MERGE by PK, advance to `hi`
+  cursor           - load_type 'cursor': read `hi` (a temporal `hi` is capped at the source clock plus
+                     cursor_skew_s; logged as alert=max_above_clock); unchanged if equal to the
+                     checkpoint, else read (position - lookback, hi] + upsert MERGE by PK, advance
+                     to `hi`. An identity cursor logs `inserts_only` once per run per table
   schema_reseed    - control.select_list gained columns vs the recorded one: enqueue a reseed
   (retry)          - table_retries: the same route again on the fresh checkpoint
 The `stage` variable records how far a table got, so a failure pinpoints read vs merge vs
@@ -17,7 +19,7 @@ every commit point — seed, each partition + the swap, MERGE, reseed enqueue, c
 so a run that lost its lock stops writing; skipped work is redone by the next sweep (at-least-once).
 
 ``deps`` (research R-03): ``spark``, ``store``, ``slots``, ``executor``, ``log``, ``params``
-(``table_retries``), plus ``guard`` (the lock check) and ``retry_policy`` (table_retry.RetryPolicy).
+(``table_retries``, ``cursor_lookback_s``, ``cursor_skew_s``), plus ``guard`` (the lock check) and ``retry_policy`` (table_retry.RetryPolicy).
 The checkpoint advances only after the sink write commits (tests/worker_test.py).
 """
 import time
@@ -64,7 +66,8 @@ def ingest_one(plan, run_id, deps, attempt=0):
             sink_writer.ensure_sink_table(spark, cfg, sink, slots=slots)
             stage = "read"
             typ = cursor_engine.column_type(cfg, slots=slots)
-            hi = cursor_engine.high_watermark(cfg, typ, slots=slots)  # capture BEFORE the seed
+            hi, alert = cursor_engine.high_watermark(cfg, typ, deps.params["cursor_skew_s"], slots=slots)  # BEFORE the seed
+            _log_alert(log, alert, db, schema, table)
             seed_started = time.monotonic()
             stage = "seed"
             assert_lock_held()
@@ -75,21 +78,26 @@ def ingest_one(plan, run_id, deps, attempt=0):
             assert_lock_held()
             hi = cursor_engine.seed_position(typ, hi, time.monotonic() - seed_started)  # temporal: pulled back by the seed duration
             store.advance_checkpoint(cfg, position=cursor_engine.encode_position(cfg["cursor_column"], typ, hi),
-                                     phase=ss.INCREMENTAL, detail="seed complete", select_list=cfg["select_list"])
+                                     phase=ss.INCREMENTAL, detail=_detail("seed complete", alert),
+                                     select_list=cfg["select_list"])
             v_to = hi
             outcome = "seeded"
         elif route == "cursor":
             pos = plan["position"]
             stage = "read"
-            hi = cursor_engine.high_watermark(cfg, pos["type"], slots=slots)  # upper bound BEFORE the read
-            decision, new_value = cursor_engine.plan_increment(pos, hi)
+            hi, alert = cursor_engine.high_watermark(cfg, pos["type"], deps.params["cursor_skew_s"], slots=slots)  # BEFORE the read
+            _log_alert(log, alert, db, schema, table)
+            decision, new_value, note = cursor_engine.plan_increment(pos, hi)
+            if note and attempt == 0:
+                log(f"[{note}] {db}.{schema}.{table}: an identity cursor captures inserts only")
             if decision == "read":
                 stage = "ensure_sink"
                 sink_writer.ensure_sink_table(spark, cfg, sink, slots=slots)  # no-op when the sink exists
                 stage = "merge"
                 assert_lock_held()
+                lookback_s = cursor_engine.lookback_seconds(cfg, deps.params["cursor_lookback_s"])
                 merged = cursor_engine.read_and_merge(spark, cfg, sink, pos["type"], pos["value"], hi,
-                                                      slots=slots)
+                                                      lookback_s, slots=slots)
                 rows_merged = merged if isinstance(merged, int) else None
                 outcome = "incremented"
             else:
@@ -97,7 +105,7 @@ def ingest_one(plan, run_id, deps, attempt=0):
             stage = "checkpoint"
             assert_lock_held()
             store.advance_checkpoint(cfg, position=cursor_engine.encode_position(pos["col"], pos["type"], new_value),
-                                     select_list=cfg["select_list"])
+                                     detail=_detail(None, alert), select_list=cfg["select_list"])
             v_to = new_value
         else:  # schema_reseed
             stage = "checkpoint"
@@ -141,6 +149,20 @@ def ingest_one(plan, run_id, deps, attempt=0):
         log(f"[telemetry] {db}.{schema}.{table}: record_event_finish failed (ingest unaffected): {str(te)[:200]}")
     log(f"[ok:{outcome}] {db}.{schema}.{table} pool={pool}")
     return outcome
+
+
+ALERT_MAX_ABOVE_CLOCK = "alert=max_above_clock"
+
+
+def _detail(base, alert):
+    """Checkpoint detail: ``base`` plus the max_above_clock alert when the watermark was capped."""
+    return " ".join(x for x in (base, ALERT_MAX_ABOVE_CLOCK if alert else None) if x) or None
+
+
+def _log_alert(log, alert, db, schema, table):
+    if alert:
+        log(f"[{ALERT_MAX_ABOVE_CLOCK}] {db}.{schema}.{table}: the cursor MAX is above the source clock; "
+            "hi capped at clock + cursor_skew_s")
 
 
 def _pools_label(cfg, action, slots):

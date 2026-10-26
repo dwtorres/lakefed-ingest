@@ -136,9 +136,13 @@ column, `cursor_column` (a PK is required — increments are MERGEd by it):
   during a long seed with an older timestamp are inside the first increment window.
 - **Temporal overlap:** a timestamp is assigned when a row is written, not when it commits, so a
   row can commit after a read whose `hi` is above it. For temporal cursors every increment starts
-  `LAKEFED_CURSOR_OVERLAP_S` seconds (cluster env, default 600) below the checkpoint, and runs even
-  when `hi` did not move. The MERGE makes the re-read harmless. Numeric and `rowversion` cursors
-  read exact bounds. Runs on SQL Server and PostgreSQL (`information_schema` type lookup; a
+  `cursor_lookback_s` seconds (job parameter, default 3600; a control row's `cursor_lookback_s`
+  overrides it) below the checkpoint, and runs even when `hi` did not move. `hi` is capped at the
+  source clock plus `cursor_skew_s` (default 300), so a row stamped in the future cannot pin the
+  window; the run logs `alert=max_above_clock`. The MERGE makes the re-read harmless. Identity and
+  `rowversion` cursors read exact bounds; an identity cursor is inserts-only (logged once per run).
+  A `hi` below the checkpoint (source truncate or reload) fails the table; the position never moves
+  backwards. Runs on SQL Server and PostgreSQL (`information_schema` type lookup; a
   `timestamp with time zone` watermark is rendered in UTC).
 - **Each run:** one small query reads the current `hi`. Equal to the checkpoint → unchanged (no
   read, no MERGE). Otherwise read `cursor_column > checkpoint AND cursor_column <= hi` once, upsert
