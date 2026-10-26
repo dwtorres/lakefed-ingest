@@ -14,4 +14,4 @@ Driver: one subagent per phase, sequential. Gate per phase: `pytest tests` green
 - [ ] Phase 10 Polish + docs (devtest run tasks blocked)
 
 ## Checkpoints
-- Phase 1 done (sha below): CT, CDC, append, pending paths deleted; ct_engine split into source_io + sink_writer; 324 tests, 0 skips; src 4381 -> 3106 lines
+- Phase 1 done c3a4ca9: CT, CDC, append, pending paths deleted; ct_engine split into source_io + sink_writer; 324 tests, 0 skips; src 4381 -> 3106 lines
