@@ -38,14 +38,16 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     before any work: an invalid client_id, a consolidated row whose select_list already has a
     __client_id__ column, or a sink shared by a dedicated row and consolidated rows. Also a missing
     primary key for a strategy that MERGEs by it (the database CHECK constraints enforce this too;
-    this gives a clear per-table error if a row ever gets past them), an invalid write_mode or
+    this gives a clear per-table error if a row ever gets past them), a load_type other than
+    cursor or full, an invalid write_mode or
     client_attrs, client_attrs column names clashing with select_list, and a read through a
     connection without one."""
     try:
-        if ls.get_strategy(cfg.get("load_type")).requires_pk and not source_io._split(cfg.get("primary_key")):
-            return f"load_type {cfg.get('load_type') or ls.CURSOR} needs a primary_key (it MERGEs by it)"
-    except ValueError:
-        pass   # an unknown load_type is reported by unsupported_reason
+        strategy = ls.get_strategy(cfg.get("load_type"))
+    except ValueError as e:
+        return str(e)   # names the valid values: cursor, full
+    if strategy.requires_pk and not source_io._split(cfg.get("primary_key")):
+        return f"load_type {cfg.get('load_type') or ls.CURSOR} needs a primary_key (it MERGEs by it)"
     if source_io.uses_remote_query(cfg) and not cfg.get("src_connection"):
         return "use_remote_query reads through the Unity Catalog connection in src_connection, which is not set"
     try:

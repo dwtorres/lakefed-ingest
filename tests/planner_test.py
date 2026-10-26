@@ -125,6 +125,20 @@ def test_missing_primary_key_fails_at_plan_for_merge_strategies_only():
     assert {p["cfg"]["id"]: p["route"] for p in plans} == {2: "unsupported", 3: "full"}
 
 
+def test_config_error_rejects_any_load_type_but_cursor_and_full():
+    for bad in ("ct", "cdc", "bogus"):
+        reason = planner.config_error(dict(_cfg(1, "d1", "a"), load_type=bad))
+        assert f"unsupported load_type '{bad}'" in reason and "cursor" in reason and "full" in reason
+    assert "needs a primary_key" in planner.config_error(dict(_cfg(2, "d1", "b"), primary_key=None))
+
+
+def test_sqlserver_cursor_row_routes_by_its_checkpoint():
+    cfg = dict(_cur_cfg(), src_type="sqlserver")
+    assert planner.route_tables([cfg], {})[0]["route"] == "cursor_seed"
+    plan = planner.route_tables([cfg], {1: _cur_cp(value="2026-05-01T00:00:00")})[0]
+    assert plan["route"] == "cursor" and plan["position"]["value"] == "2026-05-01T00:00:00"
+
+
 def test_write_mode_and_client_attrs_config_errors():
     ok = dict(_cfg(1, "d1", "a"), client_attrs='{"tenant_name": "x"}')
     assert planner.config_error(ok) is None and planner.config_error(dict(ok, load_type="full")) is None

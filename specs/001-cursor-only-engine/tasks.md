@@ -89,11 +89,11 @@ Single project. Package `src/lakefed_ingest/`, tests `tests/`, bundle `databrick
 
 **Independent Test**: `pytest tests/planner_test.py tests/cursor_engine_test.py tests/worker_test.py -k "cursor or full or load_type"` is green. Live proof is Phase 10.
 
-- [ ] T017 [P] [US1] Add tests in `tests/planner_test.py` that `config_error` rejects `load_type` values `ct`, `cdc`, and `bogus` with a reason that names the two valid values, and that a `cursor` row with no `primary_key` fails at plan time
-- [ ] T018 [P] [US1] Add a test in `tests/planner_test.py` that `route_tables` on a seeded SQL Server cursor row with a position returns route `cursor`, and on no checkpoint returns `cursor_seed`
-- [ ] T019 [US1] Make T017 and T018 pass in `src/lakefed_ingest/planner.py` `config_error` and `route_tables`. The reason text for a bad `load_type` lists `cursor` and `full`
-- [ ] T020 [US1] Add a test in `tests/worker_test.py` that the `cursor` route calls `cursor_engine.plan_increment`, then the sink merge, then `store.advance`, with the position equal to the captured `hi`. Make it pass in `src/lakefed_ingest/worker.py`
-- [ ] T021 [US1] Run `pytest tests`. Commit `test(planner): pin cursor routes and load_type validation`
+- [X] T017 [P] [US1] Add tests in `tests/planner_test.py` that `config_error` rejects `load_type` values `ct`, `cdc`, and `bogus` with a reason that names the two valid values, and that a `cursor` row with no `primary_key` fails at plan time
+- [X] T018 [P] [US1] Add a test in `tests/planner_test.py` that `route_tables` on a seeded SQL Server cursor row with a position returns route `cursor`, and on no checkpoint returns `cursor_seed`
+- [X] T019 [US1] Make T017 and T018 pass in `src/lakefed_ingest/planner.py` `config_error` and `route_tables`. The reason text for a bad `load_type` lists `cursor` and `full`
+- [X] T020 [US1] Add a test in `tests/worker_test.py` that the `cursor` route calls `cursor_engine.plan_increment`, then the sink merge, then `store.advance`, with the position equal to the captured `hi`. Make it pass in `src/lakefed_ingest/worker.py`
+- [X] T021 [US1] Run `pytest tests`. Commit `test(planner): pin cursor routes and load_type validation`
 
 **Checkpoint**: A SQL Server cursor row plans, seeds, and increments through the worker with fakes.
 

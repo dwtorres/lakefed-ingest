@@ -146,3 +146,20 @@ def test_cursor_seed_captures_hi_before_seed_and_advances_to_it(deps, fakes, cal
     advance = [c for c in calls if c[0] == "advance"][0]
     assert advance[1] == worker.cursor_engine.encode_position("mod", "int", "42")
     assert advance[2]["phase"] == "incremental"
+
+
+def test_cursor_route_plans_merges_then_advances_to_hi(deps, fakes, calls, monkeypatch):
+    seen = []
+    real = worker.cursor_engine.plan_increment
+
+    def plan_increment(pos, hi, *a, **kw):
+        seen.append(("plan_increment", pos["value"], hi))
+        return real(pos, hi, *a, **kw)
+    monkeypatch.setattr(worker.cursor_engine, "plan_increment", plan_increment)
+    plan, _ = PLANS["cursor"]
+    assert worker.ingest_one(plan, run_id=1, deps=deps) == "incremented"
+    names = _names(calls)
+    assert seen == [("plan_increment", "10", "42")]
+    assert names.index("high_watermark") < names.index("merge") < names.index("advance")
+    advance = [c for c in calls if c[0] == "advance"][0]
+    assert advance[1] == worker.cursor_engine.encode_position("mod", "int", "42")
