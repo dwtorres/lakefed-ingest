@@ -159,11 +159,12 @@ class SourceAdapter:
         return self.cursor_text_sql(f"MAX({expr})", type_name)
 
     def max_batch_sql(self, tables, now_type: str) -> str:
-        """One SELECT: a scalar ``MAX`` subquery per ``(alias, schema, table, expression)`` plus the
-        source clock, all as canonical text in the cursor type ``now_type``."""
+        """One SELECT: a scalar ``MAX`` subquery per ``(alias, schema, table, expression)`` plus, for a
+        temporal type, the source clock, all as canonical text in the cursor type ``now_type``."""
         cols = [f"(SELECT {self.max_text_sql(expr, now_type)} FROM {self.table_ref(schema, table)}) AS "
                 f"{self.quote_ident(alias)}" for alias, schema, table, expr in tables]
-        cols.append(f"{self.cursor_text_sql(self.source_now_sql(now_type), now_type)} AS src_now")
+        if self.type_class_of(now_type) == "temporal":
+            cols.append(f"{self.cursor_text_sql(self.source_now_sql(now_type), now_type)} AS src_now")
         return f"SELECT {', '.join(cols)}{self.scalar_from}"
 
     def greatest_expr(self, inputs, type_name: str, server_version) -> str:

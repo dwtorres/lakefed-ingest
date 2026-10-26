@@ -189,14 +189,14 @@ Single project. Package `src/lakefed_ingest/`, tests `tests/`, bundle `databrick
 
 **Independent Test**: `pytest tests/cursor_engine_test.py tests/planner_test.py tests/sink_writer_test.py -k "gap_10 or batch or quiet or bulk"` passes under both dialects.
 
-- [ ] T058 [P] [US6] Write `test_gap_10_merge_updates_only_changed_cursor` in `tests/sink_writer_test.py` and `tests/cursor_engine_test.py`: `upsert_merge_sql` contains `WHEN MATCHED AND <sink_expr over s> <> <sink_expr over t> THEN UPDATE`, with the expression rendered once per alias. A `client_id` row keeps the client predicate in the `ON` clause
-- [ ] T059 [P] [US6] Write failing tests in `tests/cursor_engine_test.py`, parametrized over both dialects: `capture_batch(tables, adapter, read, chunk)` issues one query per `detection_chunk` tables using `SourceAdapter.max_batch_sql`, decodes one `hi` per alias and one clock from the single result row, and on a failed chunk falls back to one `high_watermark` query per table of that chunk
-- [ ] T060 [P] [US6] Write failing tests in `tests/planner_test.py`: tables whose captured `hi` equals the position go to the `unchanged` list and `bulk_rows_to_write` advances their `last_success_at` in one write, skipping rows fresher than `freshness_interval_s`. Tables whose `hi` moved go to the `cursor` route with `hi` already set
-- [ ] T061 [US6] Make T058 pass in `src/lakefed_ingest/cursor_engine.py` `upsert_merge_sql` using `sink_writer.sink_expr`
-- [ ] T062 [US6] Add `capture_batch` to `src/lakefed_ingest/cursor_engine.py`. Make T059 pass (research R-06)
-- [ ] T063 [US6] Make T060 pass in `src/lakefed_ingest/planner.py` `route_tables` and `bulk_rows_to_write`. The plan carries `hi` so the worker does not query `MAX` again
-- [ ] T064 [US6] In `src/lakefed_ingest/ingest.ipynb`, group cursor candidates by source database, call `cursor_engine.capture_batch` once per group with `detection_chunk`, record one `ingest_event` with stage `capture` per source database, then call `store.bulk_advance` with `planner.bulk_rows_to_write` for the unchanged tables. Add a test in `tests/worker_test.py` that a plan with `hi` set performs no `MAX` read
-- [ ] T065 [US6] Run `pytest tests`. Commit `perf(cursor): batched hi capture, bulk advance, conditional merge update`
+- [X] T058 [P] [US6] Write `test_gap_10_merge_updates_only_changed_cursor` in `tests/sink_writer_test.py` and `tests/cursor_engine_test.py`: `upsert_merge_sql` contains `WHEN MATCHED AND <sink_expr over s> <> <sink_expr over t> THEN UPDATE`, with the expression rendered once per alias. A `client_id` row keeps the client predicate in the `ON` clause
+- [X] T059 [P] [US6] Write failing tests in `tests/cursor_engine_test.py`, parametrized over both dialects: `capture_batch(tables, adapter, read, chunk)` issues one query per `detection_chunk` tables using `SourceAdapter.max_batch_sql`, decodes one `hi` per alias and one clock from the single result row, and on a failed chunk falls back to one `high_watermark` query per table of that chunk
+- [X] T060 [P] [US6] Write failing tests in `tests/planner_test.py`: tables whose captured `hi` equals the position go to the `unchanged` list and `bulk_rows_to_write` advances their `last_success_at` in one write, skipping rows fresher than `freshness_interval_s`. Tables whose `hi` moved go to the `cursor` route with `hi` already set
+- [X] T061 [US6] Make T058 pass in `src/lakefed_ingest/cursor_engine.py` `upsert_merge_sql` using `sink_writer.sink_expr`
+- [X] T062 [US6] Add `capture_batch` to `src/lakefed_ingest/cursor_engine.py`. Make T059 pass (research R-06)
+- [X] T063 [US6] Make T060 pass in `src/lakefed_ingest/planner.py` `route_tables` and `bulk_rows_to_write`. The plan carries `hi` so the worker does not query `MAX` again
+- [X] T064 [US6] In `src/lakefed_ingest/ingest.ipynb`, group cursor candidates by source database, call `cursor_engine.capture_batch` once per group with `detection_chunk`, record one `ingest_event` with stage `capture` per source database, then call `store.bulk_advance` with `planner.bulk_rows_to_write` for the unchanged tables. Add a test in `tests/worker_test.py` that a plan with `hi` set performs no `MAX` read
+- [X] T065 [US6] Run `pytest tests`. Commit `perf(cursor): batched hi capture, bulk advance, conditional merge update`
 
 **Checkpoint**: A source with N cursor tables sees one `MAX` query. A quiet table writes zero sink versions.
 

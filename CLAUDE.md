@@ -86,12 +86,16 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 ### Run flow (`ingest.ipynb`)
 1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`).
 2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
-   `plan`); `full` → reload; `cursor` → `cursor_seed` / `schema_reseed` / `cursor` (per-table high
-   watermark, `cursor_engine`). Seeds are capped at `max_seeds_per_run`.
+   `plan`); `full` → reload; `cursor` → `cursor_seed` / `schema_reseed` / `cursor`. One batched `MAX`
+   query per source database and cursor type (`cursor_engine.capture_batch`, `detection_chunk` tables
+   per query, per-table fallback; one `ingest_event` with action `capture` per source database)
+   captures `hi`; `planner.apply_captured` sends quiet tables to one bulk Lakebase stamp
+   (`bulk_rows_to_write`, `freshness_interval_s`) and puts `hi` on the other plans. Seeds are capped
+   at `max_seeds_per_run`.
 3. Per-table worker: full reload (`load_strategies.FullStrategy` → `sink_writer.seed`), cursor seed
    (capture the high watermark before the seed; partitioned seed via staging + atomic swap), reseed
-   enqueue, or cursor window read `(position, hi]` + idempotent PK MERGE (schema evolution) then
-   checkpoint advance.
+   enqueue, or cursor window read `(position, hi]` + idempotent PK MERGE (schema evolution; a matched
+   row is updated only when its cursor expression differs) then checkpoint advance.
    With `table_retries` > 0, a transient source failure is retried in the run (`table_retry.with_retries`;
    the next attempt from `planner.retry_plan` on the fresh checkpoint).
 
@@ -104,8 +108,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL, cursor methods (type lookup and class, source clock, text rendering, typed literals, lookback, batched MAX, GREATEST form; MySQL raises) |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
-| `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy for every adapter with cursor methods (no `src_type` branch): type lookup, high watermark capped at the clock + skew, typed literals, (lo, hi] read + upsert MERGE |
-| `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
+| `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy for every adapter with cursor methods (no `src_type` branch): type lookup, high watermark capped at the clock + skew (per table, or batched per source database: `capture_batch`), typed literals, (lo, hi] read + upsert MERGE with a cursor change predicate |
+| `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (`apply_captured`, `bulk_rows_to_write`; no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |

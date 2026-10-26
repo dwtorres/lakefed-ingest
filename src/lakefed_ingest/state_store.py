@@ -228,14 +228,13 @@ def upsert_checkpoint_sql() -> str:
 
 
 def bulk_advance_unchanged_sql() -> str:
-    """Bookkeeping for ONE unchanged table (run via executemany over all of them): advance the
-    checkpoint to the position captured before the check, never backwards (greatest, compared as
-    numbers — positions are text), only in the incremental phase, and stamp freshness.
-    Params: position (captured), select_list (or NULL to keep), control_id.
+    """Bookkeeping for ONE unchanged table (run via executemany over all of them): its captured ``hi``
+    equals its position, so the position stays; clear the status, record a grown select_list and
+    stamp freshness, only in the incremental phase.
+    Params: select_list (or NULL to keep), control_id.
     """
     return (
         f"update {CHECKPOINT_TABLE} set "
-        "position = greatest(coalesce(position, '0')::bigint, %s::bigint)::text, "
         "status = 'ok', detail = null, "
         "select_list = coalesce(%s, select_list), "
         "last_success_at = now(), updated_at = now() "
@@ -657,9 +656,9 @@ class StateStore:
                 cur.execute(touch_last_success_many_sql(), (ok,))
 
     def bulk_advance_unchanged(self, rows) -> int:
-        """Advance many unchanged tables in one executemany: rows = [(control_id, position,
-        select_list_or_None), ...]. Returns the number of rows submitted."""
-        params = [(int(r[1]), r[2], int(r[0])) for r in rows]
+        """Stamp many unchanged tables in one executemany: rows = [(control_id, position,
+        select_list_or_None), ...] (the position is the checkpoint's own). Returns the number of rows submitted."""
+        params = [(r[2], int(r[0])) for r in rows]
         if not params:
             return 0
         with self._cursor() as cur:

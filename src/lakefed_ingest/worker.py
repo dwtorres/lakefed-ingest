@@ -7,7 +7,8 @@ decided by the planner:
                      swap when partitioned), checkpoint {strategy full, phase loaded, no position}
   cursor_seed      - load_type 'cursor', no usable checkpoint: capture the high watermark `hi`,
                      seed, checkpoint {cursor position hi, incremental}
-  cursor           - load_type 'cursor': read `hi` (a temporal `hi` is capped at the source clock plus
+  cursor           - load_type 'cursor': read `hi` unless the plan carries it from the batched capture
+                     (a temporal `hi` is capped at the source clock plus
                      cursor_skew_s; logged as alert=max_above_clock); unchanged if equal to the
                      checkpoint, else read (position - lookback, hi] + upsert MERGE by PK, advance
                      to `hi`. An identity cursor logs `inserts_only` once per run per table
@@ -88,7 +89,10 @@ def ingest_one(plan, run_id, deps, attempt=0):
             pos = plan["position"]
             cursor_engine.validate_expression(cfg)
             stage = "read"
-            hi, alert = cursor_engine.high_watermark(cfg, pos["type"], deps.params["cursor_skew_s"], slots=slots)  # BEFORE the read
+            if "hi" in plan:   # captured for the whole source database (planner.apply_captured)
+                hi, alert = plan["hi"]
+            else:
+                hi, alert = cursor_engine.high_watermark(cfg, pos["type"], deps.params["cursor_skew_s"], slots=slots)  # BEFORE the read
             _log_alert(log, alert, db, schema, table)
             decision, new_value, note = cursor_engine.plan_increment(cfg, pos, hi)
             if note and attempt == 0:

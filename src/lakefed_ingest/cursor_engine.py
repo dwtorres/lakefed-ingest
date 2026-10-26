@@ -104,9 +104,7 @@ def decode_position(text: Optional[str]) -> Optional[dict]:
 
 # ---- the expression (pure) -------------------------------------------------------------------------
 
-# One pass over literals (skipped), quoted identifiers, and bare words; a bare word followed by '(' is a call.
-_TOKEN = re.compile(r"N?'(?:[^']|'')*'|\[([^\]]+)\]|\"([^\"]+)\"|\b([A-Za-z_][\w$#]*)\b")
-_KEYWORDS = {"DATE", "TIMESTAMP", "NULL", "AS"}   # literal prefixes that are not columns
+_TOKEN, _KEYWORDS = sink_writer.EXPRESSION_TOKEN, sink_writer.EXPRESSION_KEYWORDS
 
 
 def expression_columns(expression: str) -> List[str]:
@@ -291,12 +289,15 @@ def _parse(kind: str, value: str):
 
 def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     """Idempotent upsert MERGE by PK — (__client_id__, PK) for a consolidated sink — with schema
-    evolution. A watermark read carries no deletes."""
+    evolution. A matched row is updated only when its cursor value moved (FR-026: a lookback re-read
+    rewrites nothing). A watermark read carries no deletes."""
     sl, keys = ", ".join(sink_writer.write_columns(cfg)), ", ".join(sink_writer.merge_keys(cfg))
+    expr = cfg["cursor_expression"]
     return (
         f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s "
         f"ON {sink_writer.merge_on_cfg(cfg)} "
-        f"WHEN MATCHED THEN UPDATE SET {sink_writer.merge_set(sl, keys)} "
+        f"WHEN MATCHED AND {sink_writer.sink_expr(expr, 's')} <> {sink_writer.sink_expr(expr, 'tgt')} "
+        f"THEN UPDATE SET {sink_writer.merge_set(sl, keys)} "
         f"WHEN NOT MATCHED THEN INSERT ({sink_writer.merge_insert_cols(sl)}) "
         f"VALUES ({sink_writer.merge_insert_vals(sl)})"
     )
@@ -335,13 +336,56 @@ def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Option
     if row is None or row["hi"] is None:
         return None, False
     _refuse_nullable(cfg, row["nullable"])
-    hi = str(row["hi"])
+    return _capped(cfg, typ, str(row["hi"]), row.get("src_now") if hasattr(row, "get") else row["src_now"], skew_s)
+
+
+def _capped(cfg: dict, typ: str, hi: str, src_now, skew_s: int) -> Tuple[str, bool]:
+    """``(hi, alert)``: a temporal ``hi`` capped at ``src_now`` plus ``skew_s``."""
     if _kind(cfg, typ) != "temporal":
         return hi, False
-    cap = _minus_seconds(str(row["src_now"]), -int(skew_s))
+    cap = _minus_seconds(str(src_now), -int(skew_s))
     if _parse("temporal", hi) > _parse("temporal", cap):
         return cap, True
     return hi, False
+
+
+def capture_batch(tables, skew_s: int, chunk: int, slots=None, log=print) -> Dict[int, Tuple[Optional[str], bool]]:
+    """``{control id: (hi, alert)}`` for the cursor tables of ONE source database (FR-023, research
+    R-06): one ``max_batch_sql`` query per ``chunk`` tables that share a cursor type, with the source
+    clock from the same row. A failed chunk falls back to ``high_watermark`` per table; a table whose
+    fallback fails is left out, logged, and read again by its worker, which reports the failure.
+    ``tables`` = [(cfg, type name)]. The batch skips the per-table nullable check; the fallback and
+    the seed keep it."""
+    out: Dict[int, Tuple[Optional[str], bool]] = {}
+    by_type: Dict[str, list] = {}
+    for cfg, typ in tables:
+        by_type.setdefault(str(typ).lower(), []).append((cfg, typ))
+    for group in by_type.values():
+        for start in range(0, len(group), max(int(chunk), 1)):
+            part = group[start:start + max(int(chunk), 1)]
+            cfg0, typ0 = part[0]
+            temporal = _kind(cfg0, typ0) == "temporal"
+            version = source_io.server_version(cfg0, slots)
+            a = source_adapters.for_cfg(cfg0)
+            sql = a.max_batch_sql([(f"c{i}", c["src_schema"], c["src_table"], _expr(c, t, version))
+                                   for i, (c, t) in enumerate(part)], typ0)
+            try:
+                with source_io._unit(slots, cfg0):
+                    row = source_io._read(source_io._spark(), cfg0, sql).first()
+                src_now = row["src_now"] if temporal else None
+                for i, (c, t) in enumerate(part):
+                    hi = row[f"c{i}"]
+                    out[c["id"]] = (None, False) if hi is None else _capped(c, t, str(hi), src_now, skew_s)
+            except Exception as e:
+                log(f"[capture] {cfg0.get('src_database')}: batch of {len(part)} tables failed ({str(e)[:200]}); "
+                    "reading each table's MAX on its own")
+                for c, t in part:
+                    try:
+                        out[c["id"]] = high_watermark(c, t, skew_s, slots)
+                    except Exception as te:
+                        log(f"[capture] {c.get('src_database')}.{c['src_schema']}.{c['src_table']}: MAX read failed, "
+                            f"the worker reads it again: {str(te)[:200]}")
+    return out
 
 
 def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str], hi: str,

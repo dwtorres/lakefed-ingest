@@ -527,3 +527,12 @@ def test_sink_expr_maps_greatest_and_coalesce_and_refuses_other_functions():
     assert sw.expression_functions("coalesce(a, N'x(', greatest(b, c))") == ["COALESCE", "GREATEST"]
     with pytest.raises(ValueError, match="CAST.*only GREATEST and COALESCE"):
         sw.sink_expr("GREATEST(CAST(a AS DATE), b)")
+
+
+def test_gap_10_merge_updates_only_changed_cursor():
+    # The sink-side expression, rendered once per MERGE alias: every column reference is qualified.
+    expr = "GREATEST(COALESCE([updated_at], DATE '1900-01-01'), [created_at])"
+    assert sw.sink_expr(expr, alias="s") == "GREATEST(COALESCE(s.`updated_at`, DATE '1900-01-01'), s.`created_at`)"
+    assert sw.sink_expr('"Updated At"', alias="tgt") == "tgt.`Updated At`"
+    assert sw.sink_expr(" updated_at ", alias="s") == "s.`updated_at`"
+    assert sw.sink_expr("COALESCE(a, N'DATE (x')", alias="s") == "COALESCE(s.`a`, N'DATE (x')"

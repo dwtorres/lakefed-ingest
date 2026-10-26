@@ -466,6 +466,9 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
 SINK_FUNCTIONS = frozenset({"GREATEST", "COALESCE"})   # the same text runs on the source and in Spark SQL
 _LITERAL = re.compile(r"N?'(?:[^']|'')*'")
 _CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+# One pass over literals (skipped), quoted identifiers, and bare words; a bare word followed by '(' is a call.
+EXPRESSION_TOKEN = re.compile(r"N?'(?:[^']|'')*'|\[([^\]]+)\]|\"([^\"]+)\"|\b([A-Za-z_][\w$#]*)\b")
+EXPRESSION_KEYWORDS = {"DATE", "TIMESTAMP", "NULL", "AS"}   # literal prefixes that are not columns
 
 
 def strip_literals(text: str) -> str:
@@ -478,14 +481,25 @@ def expression_functions(expression: str) -> List[str]:
     return [m.group(1).upper() for m in _CALL.finditer(strip_literals(expression or ""))]
 
 
-def sink_expr(expression: str) -> str:
+def sink_expr(expression: str, alias: Optional[str] = None) -> str:
     """The cursor expression for Spark SQL on the sink: GREATEST and COALESCE map one to one, so the
-    text passes through; any other function raises (it has no sink counterpart)."""
+    text passes through; any other function raises (it has no sink counterpart). With ``alias``, every
+    column reference becomes ``alias.`column``` (the MERGE change predicate, research R-07)."""
     bad = sorted(set(expression_functions(expression)) - SINK_FUNCTIONS)
     if bad:
         raise ValueError(f"cursor_expression uses {', '.join(bad)}, which Spark SQL cannot run on the sink: "
                          "only GREATEST and COALESCE are allowed")
-    return expression.strip()
+    text = expression.strip()
+    if alias is None:
+        return text
+
+    def qualify(m):
+        name = next((g for g in m.groups() if g is not None), None)
+        if name is None or (m.group(3) and (name.upper() in EXPRESSION_KEYWORDS
+                                            or text[m.end():].lstrip().startswith("("))):
+            return m.group(0)
+        return f"{alias}.`{name.replace('`', '``')}`"
+    return EXPRESSION_TOKEN.sub(qualify, text)
 
 
 def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:

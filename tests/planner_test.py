@@ -206,3 +206,44 @@ def test_config_error_rejects_unimplemented_delete_modes_and_unknown_kinds():
     assert "cursor_kind" in planner.config_error(dict(ok, cursor_kind=None))
     assert "cursor_expression" in planner.config_error(dict(ok, cursor_expression=None))
     assert planner.config_error(dict(ok, load_type="full", cursor_expression=None, cursor_kind=None)) is None
+
+
+# ---- quiet tables (US6, gap 10) ---------------------------------------------------------------------
+
+def _id_pos(v):
+    import cursor_engine
+    return cursor_engine.encode_position("id_seq", "identity", "int", v)
+
+
+def _id_cps(ids, value="100", **cp):
+    return {i: dict(_cp(None, strategy="cursor"), position=_id_pos(value), **cp) for i in ids}
+
+
+def test_gap_10_captured_hi_routes_unchanged_to_bulk_and_moved_to_cursor():
+    cfgs = [_cfg(i, "d1", f"t{i}", col="id_seq", kind="identity") for i in (1, 2, 3, 4)]
+    cps = _id_cps((1, 2, 3, 4))
+    plans = planner.route_tables(cfgs, cps)
+    captured = {1: ("100", False), 2: ("120", False), 4: ("90", False)}   # 3: not captured, the worker reads MAX
+    plans, unchanged = planner.apply_captured(plans, cps, captured)
+    assert unchanged == [(1, _id_pos("100"), None)]
+    by_id = {p["cfg"]["id"]: p for p in plans}
+    assert sorted(by_id) == [2, 3, 4]
+    assert by_id[2]["hi"] == ("120", False) and "hi" not in by_id[3]
+    assert "hi" not in by_id[4]                     # hi below the position: the worker reports the failure
+
+
+def test_gap_10_unchanged_row_records_a_grown_select_list():
+    cfg = _cfg(1, "d1", "t", col="id_seq", kind="identity", sl="id, v, w")
+    cps = _id_cps((1,))
+    plans = planner.route_tables([cfg], cps, reseed_on_new_columns=False)
+    plans, unchanged = planner.apply_captured(plans, cps, {1: ("100", False)})
+    assert plans == [] and unchanged == [(1, _id_pos("100"), "id, v, w")]
+
+
+def test_gap_10_bulk_rows_to_write_skips_fresh_quiet_tables():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+    cps = _id_cps((1, 2), last_success_at=now - timedelta(minutes=10))
+    cps[2]["last_success_at"] = now - timedelta(hours=2)
+    rows = [(1, _id_pos("100"), None), (2, _id_pos("100"), None)]
+    assert planner.bulk_rows_to_write(rows, cps, 3600, now=now) == [rows[1]]

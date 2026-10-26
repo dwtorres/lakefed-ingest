@@ -199,3 +199,11 @@ def test_identity_cursor_logs_inserts_only_once_per_run(deps, fakes, calls):
     worker.ingest_one(plan, run_id=1, deps=deps)
     worker.ingest_one(plan, run_id=1, deps=deps, attempt=1)      # a retry does not repeat it
     assert sum("[inserts_only]" in line for line in logged) == 1
+
+
+def test_plan_with_captured_hi_performs_no_max_read(deps, fakes, calls):
+    plan = dict(PLANS["cursor"][0], hi=("42", False))
+    assert worker.ingest_one(plan, run_id=1, deps=deps) == "incremented"
+    names = _names(calls)
+    assert "high_watermark" not in names and names.index("merge") < names.index("advance")
+    assert [c for c in calls if c[0] == "advance"][0][1] == worker.cursor_engine.encode_position("mod", "identity", "int", "42")

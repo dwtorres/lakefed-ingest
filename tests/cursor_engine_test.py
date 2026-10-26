@@ -397,7 +397,8 @@ def test_gap_7_tie_rows_land_in_later_window(cfg, typ):
     second = cur.read_where(cfg, typ, "2026-01-01T10:00:00", "2026-01-01T10:30:00", lookback_s=600)
     assert _in_window(rows, second) == {"a", "b"}
     sql = cur.upsert_merge_sql(cfg, "c.s.orders", "v")
-    assert "ON tgt.`id` = s.`id` WHEN MATCHED THEN UPDATE SET" in sql and "DELETE" not in sql
+    assert "ON tgt.`id` = s.`id` WHEN MATCHED AND s.`updated_at` <> tgt.`updated_at` THEN UPDATE SET" in sql
+    assert "DELETE" not in sql
     sink = {}
     for _ in (first, second):           # the MERGE keys on the PK: the second pass changes nothing
         sink.update({k: rows[k] for k in _in_window(rows, first)})
@@ -519,3 +520,86 @@ def test_column_type_validates_the_whole_expression(monkeypatch, dialect):
     with pytest.raises(ValueError, match="'closed_at' .* is nullable"):
         cur.column_type(row)
     assert cur.column_type(dict(row, null_cursor_policy="seed_only")) == typ.lower()
+
+
+# ---- US6: quiet tables cost little (gap 10, FR-023, FR-026) ----------------------------------------
+
+def test_gap_10_merge_updates_only_changed_cursor(dialect):
+    cfg, typ = dialect
+    sql = cur.upsert_merge_sql(cfg, "c.s.orders", "v")
+    assert "WHEN MATCHED AND s.`updated_at` <> tgt.`updated_at` THEN UPDATE SET `amount` = s.`amount`" in sql
+    folded = dict(cfg, cursor_expression="GREATEST(COALESCE(updated_at, DATE '1900-01-01'), created_at)")
+    sql = cur.upsert_merge_sql(folded, "c.s.orders", "v")
+    assert ("WHEN MATCHED AND GREATEST(COALESCE(s.`updated_at`, DATE '1900-01-01'), s.`created_at`) <> "
+            "GREATEST(COALESCE(tgt.`updated_at`, DATE '1900-01-01'), tgt.`created_at`) THEN UPDATE") in sql
+    sql = cur.upsert_merge_sql(dict(cfg, client_id="t1"), "c.s.orders", "v")
+    assert ("ON tgt.`__client_id__` = s.`__client_id__` AND tgt.`id` = s.`id` AND tgt.`__client_id__` = 't1' "
+            "WHEN MATCHED AND s.`updated_at` <> tgt.`updated_at` THEN UPDATE") in sql
+
+
+def _batch_reads(monkeypatch, rows_by_query):
+    """Fake the batched read: ``rows_by_query(sql)`` returns the single result row (a dict) or raises."""
+    import source_io
+    queries = []
+
+    def read(sp, cfg, q, **kw):
+        queries.append(q)
+        return _Rows([rows_by_query(q)])
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    monkeypatch.setattr(source_io, "_read", read)
+    return queries
+
+
+def test_capture_batch_one_query_per_chunk_decodes_hi_and_clock(monkeypatch, dialect):
+    cfg, typ = dialect
+    a = sa.for_cfg(cfg)
+    tables = [(dict(cfg, id=i, src_table=f"t{i}"), typ) for i in range(3)]
+    def row(q):   # aliases c0, c1, ... count from the start of each chunk
+        if "t2" in q:
+            return {"c0": "2099-01-01T00:00:00", "src_now": "2026-01-01T12:00:00"}   # stamped in the future
+        return {"c0": "2026-01-01T10:00:00", "c1": None, "src_now": "2026-01-01T12:00:00"}
+    queries = _batch_reads(monkeypatch, row)
+    out = cur.capture_batch(tables, skew_s=60, chunk=2)
+    assert len(queries) == 2 and queries[0].count("(SELECT ") == 2 and queries[1].count("(SELECT ") == 1
+    assert queries[0].startswith("SELECT (SELECT ") and a.table_ref(cfg["src_schema"], "t0") in queries[0]
+    assert a.table_ref(cfg["src_schema"], "t2") in queries[1] and "AS src_now" in queries[1]
+    assert out[0] == ("2026-01-01T10:00:00", False) and out[1] == (None, False)
+    # the third table is capped at the clock plus skew_s and flagged (gap 4), as high_watermark does
+    assert out[2] == ("2026-01-01T12:01:00", True)
+
+
+def test_capture_batch_groups_tables_by_cursor_type(monkeypatch, dialect):
+    cfg, typ = dialect
+    tables = [(dict(cfg, id=1), typ), (dict(cfg, id=2, cursor_expression=cfg["cursor_expression"].replace("updated_at", "seq")), _num(cfg)),
+              (dict(cfg, id=3, src_table="o2"), typ)]
+    def row(q):
+        if "seq" in q:
+            return {"c0": "7", "src_now": "7"}
+        return {"c0": "2026-01-01T10:00:00", "c1": "2026-01-01T11:00:00", "src_now": "2026-01-01T12:00:00"}
+    queries = _batch_reads(monkeypatch, row)
+    out = cur.capture_batch(tables, skew_s=60, chunk=10)
+    assert len(queries) == 2 and sorted(out) == [1, 2, 3]
+    assert out[2] == ("7", False) and out[3] == ("2026-01-01T11:00:00", False)   # a numeric hi is never capped
+
+
+def test_capture_batch_failed_chunk_falls_back_to_one_query_per_table(monkeypatch, dialect):
+    cfg, typ = dialect
+    tables = [(dict(cfg, id=i, src_table=f"t{i}"), typ) for i in range(3)]
+
+    def row(q):
+        if q.count("(SELECT ") == 2:
+            raise RuntimeError("batch too wide")
+        return {"c0": "2026-01-01T10:00:00", "src_now": "2026-01-01T12:00:00"}
+    queries = _batch_reads(monkeypatch, row)
+    seen, logged = [], []
+
+    def high_watermark(c, t, skew_s, slots=None):
+        seen.append((c["id"], t, skew_s))
+        if c["id"] == 1:
+            raise RuntimeError("table t1 is locked")
+        return "2026-01-01T09:00:00", False
+    monkeypatch.setattr(cur, "high_watermark", high_watermark)
+    out = cur.capture_batch(tables, skew_s=60, chunk=2, log=logged.append)
+    assert seen == [(0, typ, 60), (1, typ, 60)]                       # the failed chunk, table by table
+    assert out == {0: ("2026-01-01T09:00:00", False), 2: ("2026-01-01T10:00:00", False)}   # 1: the worker reads it
+    assert len(queries) == 2 and any("t1" in line and "locked" in line for line in logged)

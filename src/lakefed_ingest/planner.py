@@ -6,6 +6,8 @@
   ``cursor`` routes to ``cursor_seed``, ``schema_reseed`` or ``cursor`` (per-table high-watermark
   increment).
 * ``retry_plan``: the next attempt of a table after a transient failure, from its fresh checkpoint.
+* ``apply_captured``: the batched ``hi`` (``cursor_engine.capture_batch``) splits cursor plans into
+  unchanged rows (one bulk checkpoint write, no source read) and reads that carry ``hi``.
 * ``apply_seed_budget`` and ``bulk_rows_to_write``: scale controls.
 """
 
@@ -125,6 +127,34 @@ def retry_plan(plan: dict, cp: Optional[dict]) -> dict:
     checkpoint ``cp``. Every write is idempotent (MERGE by key, replace) and the checkpoint advances
     only after the commit, so doing it again is harmless."""
     return dict(plan, cp=cp)
+
+
+# ---- batched hi (US6) ---------------------------------------------------------------------------------
+def apply_captured(plans: List[dict], checkpoints: Dict[int, dict], captured: Dict[int, tuple]) -> Tuple[List[dict], list]:
+    """(plans, unchanged): a cursor plan whose captured ``hi`` leaves the position where it is (FR-024)
+    becomes an unchanged row ``(control_id, position text, select_list to record | None)`` for
+    ``StateStore.bulk_advance_unchanged``; one whose ``hi`` moved carries ``hi`` so its worker reads no
+    MAX. A plan without a capture, or whose ``hi`` the increment rejects, stays as it is: the worker
+    reads MAX itself and reports."""
+    kept, unchanged = [], []
+    for plan in plans:
+        cid = plan["cfg"]["id"]
+        if plan["route"] != "cursor" or cid not in captured:
+            kept.append(plan)
+            continue
+        hi, alert = captured[cid]
+        try:
+            decision = cursor_engine.plan_increment(plan["cfg"], plan["position"], hi)[0]
+        except ValueError:
+            kept.append(plan)
+            continue
+        if decision == "read" or alert:
+            kept.append(dict(plan, hi=(hi, alert)))
+            continue
+        cp = checkpoints[cid]
+        grown = ss.select_list_added_columns(plan["cfg"]["select_list"], cp.get("select_list"))
+        unchanged.append((cid, cp["position"], plan["cfg"]["select_list"] if grown else None))
+    return kept, unchanged
 
 
 # ---- scale controls -----------------------------------------------------------------------------------

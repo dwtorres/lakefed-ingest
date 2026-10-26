@@ -175,6 +175,8 @@ def test_max_batch_sql_one_scalar_subquery_per_table_plus_the_clock(src_type, ty
     assert f"FROM {a.table_ref('hr', 'emp')})" in sql and "AS src_now" in sql
     assert sql.endswith(" FROM DUAL") == (src_type == "oracle")
     assert a.source_now_sql(typ) in sql
+    numeric = a.max_batch_sql([("c1", "hr", "emp", a.quote_ident("seq"))], {"sqlserver": "int", "oracle": "NUMBER"}[src_type])
+    assert "src_now" not in numeric and numeric.count("(SELECT ") == 1     # a numeric hi needs no clock
 
 
 def test_cursor_literals_per_dialect():
