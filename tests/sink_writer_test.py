@@ -519,3 +519,11 @@ def test_write_columns_are_select_list_then_identity_columns():
     assert sw.write_mode(_CONS) == "merge" and sw.write_mode(dict(_CONS, write_mode=" Merge ")) == "merge"
     with pytest.raises(ValueError, match="invalid write_mode 'append'"):
         sw.write_mode(dict(_CONS, write_mode="append"))
+
+
+def test_sink_expr_maps_greatest_and_coalesce_and_refuses_other_functions():
+    expr = "GREATEST(COALESCE(updated_at, DATE '1900-01-01'), COALESCE(created_at, DATE '1900-01-01'))"
+    assert sw.sink_expr(expr) == expr and sw.sink_expr(" updated_at ") == "updated_at"
+    assert sw.expression_functions("coalesce(a, N'x(', greatest(b, c))") == ["COALESCE", "GREATEST"]
+    with pytest.raises(ValueError, match="CAST.*only GREATEST and COALESCE"):
+        sw.sink_expr("GREATEST(CAST(a AS DATE), b)")

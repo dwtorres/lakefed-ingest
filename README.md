@@ -6,7 +6,7 @@ cluster, with no SQL warehouse. State (control, checkpoints, telemetry) lives in
 (Postgres). Source reads use Spark JDBC with per-database credentials from a secret scope, or
 `remote_query` through a UC connection per row. Load types: watermark `cursor` (SQL Server,
 PostgreSQL; full or partitioned seed) and `full` reload (partitioned or not) for SQL Server, Oracle,
-PostgreSQL and MySQL. `cursor` on Oracle and MySQL is a placeholder. Bundle: `lakefed_ingest_v2`.
+PostgreSQL and MySQL. `cursor` on Oracle and MySQL is a placeholder. Bundle: `lakefed_cursor`.
 
 ## Why one task per collection
 
@@ -24,10 +24,10 @@ as `skipped`.
 ## Layout
 
 ```
-databricks.yml                     # bundle lakefed_ingest_v2
+databricks.yml                     # bundle lakefed_cursor
 resources/
-  lakefed_ingest.yml               # ingestion job: one run ingests a task_collection
-  lakefed_ingest_setup.yml         # Lakebase instance + UC catalog, secret scope, schema job
+  lakefed_cursor.yml               # ingestion job: one run ingests a task_collection
+  lakefed_cursor_setup.yml         # Lakebase instance + UC catalog, secret scope, schema job
 src/lakefed_ingest/
   ingest.ipynb                     # the ingestion notebook: plan, then fan out per table
   planner.py                       # strategy routing + skip-no-change planning (pure, unit-tested)
@@ -49,7 +49,7 @@ tests/                             # unit tests (no cluster), synthetic DB gener
 
 ## How a run works
 
-Each run of the `lakefed_ingest` job ingests one `task_collection`:
+Each run of the `lakefed_cursor` job ingests one `task_collection`:
 
 1. **Plan.** Load the collection's control rows and checkpoints from Lakebase (one query each) and
    route every table by its load strategy: `full` tables reload; `ct` tables seed, reseed (schema
@@ -84,7 +84,7 @@ literals, and the SELECT / size / bounds queries) and `control.load_type` a **lo
   `loaded`, and no position.
 - **Drivers.** The SQL Server and PostgreSQL JDBC drivers ship with Databricks Runtime. Oracle and
   MySQL need a cluster library — see the commented `libraries` entries in
-  `resources/lakefed_ingest.yml`.
+  `resources/lakefed_cursor.yml`.
 - **Per-engine notes.** Oracle: `src_database` is the service name, `src_schema` the owner, and
   identifiers are quoted, so use the stored (usually upper-case) names; the partitioned seed's size
   comes from `ALL_TABLES` statistics (no extra privileges). MySQL: `src_schema` is the database.
@@ -194,7 +194,7 @@ database, so detection is grouped by source database:
     first enabled), the toggle leaves no trace in SQL Server metadata. Checkpoints created before
     `ct_begin_version` existed record it the first time they're seen, so a toggle before that
     upgrade isn't detected either. After CT maintenance like this, force a reseed:
-    `update lakefed_ingest.checkpoint set phase = 'seeding' where control_id in (...);`
+    `update lakefed_cursor.checkpoint set phase = 'seeding' where control_id in (...);`
 
 ### Partitioned seed (large tables)
 
@@ -370,7 +370,7 @@ Upgrading from an earlier deploy: pull and deploy. The database records its sche
 (`schema_version`); the first ingestion run whose code needs a newer one migrates the schema before it
 starts, in one transaction, while runs of other collections wait for it. If the migration fails (for
 example, existing rows break a new constraint), nothing changes and the run fails with the cause; fix
-it and re-run. Running `lakefed_ingest_setup` after deploying migrates ahead of the first run instead,
+it and re-run. Running `lakefed_cursor_setup` after deploying migrates ahead of the first run instead,
 and the migration needs the schema's owner (the deployer, unless the jobs run as someone else). From an
 early deploy, the migration renames `ct_checkpoint` → `checkpoint` (`ct_version` → `position`),
 `sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and `ingest_event.ct_version_from/to` →
@@ -389,11 +389,11 @@ consolidate), and re-run:
 
 ```sql
 select lower(sink_catalog), lower(sink_schema), lower(sink_table), array_agg(id order by id)
-from lakefed_ingest.control group by 1, 2, 3
+from lakefed_cursor.control group by 1, 2, 3
 having count(*) filter (where client_id is null) > 1;
 ```
 
-The Lakebase database is registered in Unity Catalog (default catalog `lakefed_ingest_lakebase`),
+The Lakebase database is registered in Unity Catalog (default catalog `lakefed_cursor_lakebase`),
 so control and telemetry tables can be queried from DBSQL. See [docs/monitoring.md](docs/monitoring.md).
 
 ### Control rows
@@ -422,18 +422,18 @@ snapshot of every table that gained the column). New sinks get
 
 | Prerequisite | How |
 |---|---|
-| Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
-| Schema + migrations | `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
+| Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_cursor_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
+| Schema + migrations | `lakefed_cursor_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
 | Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
 | Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE` |
 | Cluster → source network path (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Customer networking |
 | `ct` source tables: CT enabled + primary key, `CHANGE_RETENTION` longer than the seed time (snapshot isolation is not required) | Source-side configuration |
-| Oracle / MySQL sources: JDBC driver library on the job cluster | Uncomment it in `resources/lakefed_ingest.yml` |
+| Oracle / MySQL sources: JDBC driver library on the job cluster | Uncomment it in `resources/lakefed_cursor.yml` |
 
 No SQL warehouse is needed, and UC connections only for rows that read through one.
 
-> Deploying `lakefed_ingest_setup.yml` **creates a billable Lakebase instance** unless you bind an
+> Deploying `lakefed_cursor_setup.yml` **creates a billable Lakebase instance** unless you bind an
 > existing one.
 
 ## Deploy and run
@@ -441,11 +441,13 @@ No SQL warehouse is needed, and UC connections only for rows that read through o
 Step-by-step setup for a new workspace: [docs/deploy.md](docs/deploy.md).
 
 ```bash
-# From the repo root (bundle lakefed_ingest_v2). Compute variables default to Azure node types.
+# From the repo root (bundle lakefed_cursor). Compute variables default to Azure node types.
+# The gate: the name test (no lakefed_ingest / edp resource names), then bundle validate.
+scripts/validate.sh -t <target> -p <profile>
 databricks bundle deploy -t <target> -p <profile>
 
 # One-time: create the Lakebase schema. (Upgrades migrate it on the next ingestion run.)
-databricks bundle run lakefed_ingest_setup -t <target> -p <profile>
+databricks bundle run lakefed_cursor_setup -t <target> -p <profile>
 
 # Load one secret per source database (or use an Azure Key Vault-backed scope). Rows that read
 # through a UC connection (use_remote_query) need none.
@@ -454,7 +456,7 @@ databricks secrets put-secret <scope> <secret_key> --string-value '{"user":"..",
 # Register tables: edit and run notebooks/load_control_example.ipynb.
 
 # Ingest a task_collection (the first run seeds; later runs apply Change Tracking increments).
-databricks bundle run lakefed_ingest -t <target> -p <profile> \
+databricks bundle run lakefed_cursor -t <target> -p <profile> \
   --params task_collection=<collection>,parallelism=32
 ```
 

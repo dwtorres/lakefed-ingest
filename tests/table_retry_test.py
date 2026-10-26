@@ -49,7 +49,7 @@ def _cfg(cid, load_type="cursor", host="h1"):
     return {"id": cid, "src_host": host, "src_port": 1433, "src_database": f"db{cid}", "src_schema": "dbo",
             "src_table": "orders", "secret_key": f"k{cid}", "select_list": "id, v", "primary_key": "id",
             "sink_catalog": "main", "sink_schema": "bronze", "sink_table": "orders", "load_type": load_type,
-            "cursor_column": "v"}
+            "cursor_expression": "v", "cursor_kind": "identity"}
 
 
 def _plan(cid, route="cursor_seed", cp=None, **kw):

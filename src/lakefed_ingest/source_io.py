@@ -9,7 +9,7 @@ Connection (per control row ``cfg``):
     ``cfg['src_connection']``, else the secret's own host field, else env ``LAKEFED_SQL_HOST``.
   * port default: the adapter's default port.
   * credentials: secret ``scope``/``key`` holding JSON ``{user, password}``. The scope is env
-    ``LAKEFED_SQL_SECRET_SCOPE`` (default ``lakefed_ingest``). The key is ``cfg['secret_key']``,
+    ``LAKEFED_SQL_SECRET_SCOPE`` (default ``lakefed-cursor``). The key is ``cfg['secret_key']``,
     else env ``LAKEFED_SQL_SECRET_KEY``, else legacy ``f"{src_connection}_json"``. Credentials are
     cached per (scope, key).
   * TLS: env ``LAKEFED_SQL_TRUST_SERVER_CERT`` (default ``true``), mapped per adapter.
@@ -35,7 +35,7 @@ from typing import List, Optional, Tuple
 
 import source_adapters
 
-_DEFAULT_SECRET_SCOPE = "lakefed_ingest"
+_DEFAULT_SECRET_SCOPE = "lakefed-cursor"
 
 
 _SQLSERVER = source_adapters.get_adapter(source_adapters.SQLSERVER)
@@ -230,6 +230,27 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()
     )
+
+
+_server_versions: dict = {}   # source_key -> major version (None: no SQL depends on it)
+
+
+def server_version(cfg: dict, slots=None) -> Optional[int]:
+    """The source's major version (``SourceAdapter.server_version_sql``), queried once per source and
+    kept for the process; None when the adapter has no SQL that depends on it."""
+    sql = source_adapters.for_cfg(cfg).server_version_sql()
+    if sql is None:
+        return None
+    key = source_key(cfg)
+    with _lock:
+        if key in _server_versions:
+            return _server_versions[key]
+    with _unit(slots, cfg):
+        row = _read(_spark(), cfg, sql).first()
+    version = None if row is None or row["server_version"] is None else int(row["server_version"])
+    with _lock:
+        _server_versions[key] = version
+    return version
 
 
 def _unit(slots, cfg: Optional[dict] = None):

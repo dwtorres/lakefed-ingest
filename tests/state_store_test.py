@@ -105,11 +105,8 @@ def test_control_columns_include_jdbc_and_secret_fields():
 _DDL = (Path(__file__).parent.parent / "src" / "lakefed_ingest" / "lakebase_schema.sql").read_text()
 
 
-def test_ddl_ct_constraint_no_longer_requires_remote_query():
-    # The CT constraint is re-declared idempotently and requires a resolvable host, not the
-    # governed remote_query transport.
-    assert "drop constraint if exists valid_ct_metadata" in _DDL
-    con = _DDL[_DDL.index("add constraint valid_ct_metadata"):]
+def test_ddl_a_source_is_a_host_or_a_connection():
+    con = _DDL[_DDL.index("add constraint valid_source"):]
     con = con[:con.index(";")]
     assert "use_remote_query" not in con
     assert "src_host is not null or src_connection is not null" in con
@@ -122,16 +119,8 @@ def test_ddl_a_read_through_a_connection_needs_the_connection():
         "(", "not", "use_remote_query", "or", "src_connection", "is", "not", "null", ")"]
 
 
-def test_ddl_migrates_checkpoint_to_control_id():
+def test_ddl_checkpoint_is_keyed_by_control_id():
     assert "constraint checkpoint_control_pk primary key (control_id)" in _DDL
-    assert "alter table lakefed_ingest.checkpoint add column if not exists control_id" in _DDL
-    assert "drop constraint if exists ct_checkpoint_pkey" in _DDL
-    assert "create unique index if not exists checkpoint_control_uq" in _DDL
-
-
-def test_ddl_adds_jdbc_columns_idempotently():
-    for col in ("src_host", "src_port", "secret_key"):
-        assert f"alter table lakefed_ingest.control add column if not exists {col}" in _DDL
 
 
 def test_ddl_has_no_dollar_quoted_blocks():
@@ -146,7 +135,7 @@ def test_ddl_has_no_dollar_quoted_blocks():
 
 def test_start_run_sql_inserts_running_and_returns_id():
     sql = ss.start_run_sql()
-    assert ss.RUN_TABLE == "lakefed_ingest.ingest_run" and ss.RUN_TABLE in sql
+    assert ss.RUN_TABLE == "lakefed_cursor.ingest_run" and ss.RUN_TABLE in sql
     assert "'running'" in sql
     assert "returning run_id" in sql
     assert sql.count("%s") == 4  # task_collection, job_run_id, cluster_id, parallelism
@@ -236,7 +225,7 @@ def test_unlock_collection_sql_matches_lock_key():
 
 def test_lock_application_name_is_labeled_and_capped():
     name = ss.lock_application_name("smoke_test", "12345")
-    assert name == "lakefed_ingest:smoke_test:12345"
+    assert name == "lakefed_cursor:smoke_test:12345"
     assert len(ss.lock_application_name("c" * 200, "r" * 50)) == 63   # Postgres limit
 
 
@@ -248,8 +237,6 @@ def test_control_columns_include_partition_settings():
 
 def test_partitioning_ddl_and_idempotent_migration():
     assert "partition_col         text" in _DDL and "partition_size_mb     int" in _DDL
-    assert "add column if not exists partition_col" in _DDL
-    assert "add column if not exists partition_size_mb" in _DDL
     assert "drop constraint if exists valid_partitioning" in _DDL
     assert ("not load_partitioned or (partition_col is not null and "
             "coalesce(partition_size_mb, 0) > 0)") in _DDL
@@ -410,14 +397,14 @@ def test_get_checkpoints_one_query_any_array():
 
 
 def test_get_checkpoints_maps_rows_by_control_id():
-    conn = FakeConn(fetch=[(7, "100", "incremental", "ok", "a, b", "cursor", "2026-10-14"),
-                           (8, None, "loaded", "ok", None, "full", None)])
+    conn = FakeConn(fetch=[(7, "100", "incremental", "ok", "a, b", "cursor", "2026-10-14", "2026-10-13"),
+                           (8, None, "loaded", "ok", None, "full", None, None)])
     got = ss.StateStore(conn).get_checkpoints(["7", 8])
     assert conn.calls == [(ss.get_checkpoints_sql(), ([7, 8],))]
     assert got == {7: {"position": "100", "phase": "incremental", "status": "ok", "select_list": "a, b",
-                       "strategy": "cursor", "last_success_at": "2026-10-14"},
+                       "strategy": "cursor", "last_success_at": "2026-10-14", "last_delete_snapshot_at": "2026-10-13"},
                    8: {"position": None, "phase": "loaded", "status": "ok", "select_list": None,
-                       "strategy": "full", "last_success_at": None}}
+                       "strategy": "full", "last_success_at": None, "last_delete_snapshot_at": None}}
     assert ss.StateStore(FakeConn()).get_checkpoints([]) == {}
 
 
@@ -472,38 +459,12 @@ def test_record_failed_tables_full_rows_and_plan_stage():
 
 # ---- generic checkpoint + renames: guarded migration and the applier's statement splitter ------
 
-def test_rename_statements_old_instance_renames_everything_once():
-    rels = {"control", "ct_checkpoint", "sweep_run", "ingest_event", "ct_checkpoint_control_uq",
-            "sweep_run_pkey", "sweep_run_collection_idx", "ingest_event_sweep_idx", "sweep_run_sweep_id_seq"}
-    cols = {("ct_checkpoint", "ct_version"), ("ct_checkpoint", "phase"), ("sweep_run", "sweep_id"),
-            ("ingest_event", "sweep_id"), ("ingest_event", "ct_version_from"),
-            ("ingest_event", "ct_version_to")}
-    got = ss.rename_statements(rels, cols)
-    assert got[:2] == ["alter table lakefed_ingest.ct_checkpoint rename to checkpoint",
-                       "alter table lakefed_ingest.sweep_run rename to ingest_run"]
-    # column renames address the NEW table names (table renames are simulated first)
-    assert "alter table lakefed_ingest.checkpoint rename column ct_version to position" in got
-    assert "alter table lakefed_ingest.ingest_run rename column sweep_id to run_id" in got
-    assert "alter table lakefed_ingest.ingest_event rename column ct_version_to to position_to" in got
-    assert "alter index lakefed_ingest.ct_checkpoint_control_uq rename to checkpoint_control_uq" in got
-    assert "alter sequence lakefed_ingest.sweep_run_sweep_id_seq rename to ingest_run_run_id_seq" in got
-    # an index that never existed on this instance is simply skipped
-    assert not any("ct_checkpoint_control_pk" in s for s in got)
 
 
-def test_rename_statements_is_noop_when_migrated_or_fresh():
-    rels = {"control", "checkpoint", "ingest_run", "ingest_event", "checkpoint_control_pk"}
-    cols = {("checkpoint", "position"), ("ingest_run", "run_id"), ("ingest_event", "run_id"),
-            ("ingest_event", "position_from"), ("ingest_event", "position_to")}
-    assert ss.rename_statements(rels, cols) == []
-    assert ss.rename_statements(set(), set()) == []
-
-
-def test_rename_statements_never_renames_onto_an_existing_object():
-    # both names present (e.g. a half-applied manual fix): leave it for a human, don't fail the apply
-    rels = {"ct_checkpoint", "checkpoint"}
-    cols = {("ct_checkpoint", "ct_version"), ("checkpoint", "position")}
-    assert ss.rename_statements(rels, cols) == []
+def test_no_rename_is_pending_for_the_new_schema():
+    # lakefed_cursor is a new schema: nothing to rename, whatever the catalog holds.
+    assert ss.RENAMES == []
+    assert ss.rename_statements({"control", "ct_checkpoint"}, {("ct_checkpoint", "ct_version")}) == []
 
 
 def test_split_sql_statements_strips_comments_with_semicolons():
@@ -513,7 +474,7 @@ def test_split_sql_statements_strips_comments_with_semicolons():
 
 def test_split_sql_statements_on_the_real_schema_file():
     stmts = ss.split_sql_statements(_DDL)
-    assert stmts[0] == "create schema if not exists lakefed_ingest"
+    assert stmts[0] == "create schema if not exists lakefed_cursor"
     assert all("--" not in s for s in stmts) and len(stmts) > 40
 
 
@@ -523,7 +484,8 @@ def test_split_sql_statements_on_the_real_schema_file():
 # Bump state_store.SCHEMA_VERSION and add its fingerprint here: deployments then migrate on their
 # next ingestion run.
 SCHEMA_FINGERPRINTS = {
-    1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
+    1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",   # lakefed_ingest root version
+    2: "6bf325557a775ca52cd3a83b4e01f8fd6a24c06a884af4a4e0ec04ddb3d84b85",   # lakefed_cursor: expression cursor, own names
 }
 
 
@@ -542,7 +504,7 @@ def test_schema_fingerprint_ignores_comments_and_whitespace():
 
 def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
     stmts = ss.split_sql_statements(_DDL)
-    assert any(s.startswith("create table if not exists lakefed_ingest.schema_version") for s in stmts)
+    assert any(s.startswith("create table if not exists lakefed_cursor.schema_version") for s in stmts)
     assert not any("concurrently" in s.lower() for s in stmts)       # not allowed in a transaction
 
 
@@ -552,23 +514,18 @@ def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
 # the statement forms with no database: a statement that would fail or do harm when re-applied fails here
 # instead of failing the next upgrade on every deployment.
 
-# Statements that change existing columns or rows, each reviewed as a no-op once applied and valid from
-# any earlier version (a re-applied type change to the same type doesn't rewrite the table: checked on
-# Lakebase, Postgres 16). Matched by the start of the normalized statement. A new statement of these
-# kinds fails test_ddl_statements_are_safe_to_re_apply until it's reviewed and listed here.
-REVIEWED_NON_ADDITIVE = (
-    "alter table lakefed_ingest.control alter column src_port drop default",
-    "alter table lakefed_ingest.control alter column primary_key drop not null",
-    "alter table lakefed_ingest.control alter column job_name drop not null",
-    "alter table lakefed_ingest.control alter column use_remote_query set default false",
-    "update lakefed_ingest.checkpoint cc set control_id = m.id from",            # where cc.control_id is null
-    "alter table lakefed_ingest.checkpoint alter column position drop default",
-    "alter table lakefed_ingest.checkpoint alter column position drop not null",
-    "alter table lakefed_ingest.checkpoint alter column position type text using position::text",
-    "update lakefed_ingest.checkpoint set phase = 'incremental' where phase = 'cdc'",
-    "alter table lakefed_ingest.ingest_event alter column position_from type text using position_from::text",
-    "alter table lakefed_ingest.ingest_event alter column position_to type text using position_to::text",
-    "update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc'",
+# Statements that change existing columns or rows, or drop objects, each reviewed as a no-op once
+# applied and valid from any earlier version. Matched by the start of the normalized statement. A new
+# statement of these kinds fails test_ddl_statements_are_safe_to_re_apply until it's reviewed and listed
+# here. The drops remove the root version's Change Tracking, CDC and append-mode columns (gap 11): the
+# schema is new, so no row holds them, and `if exists` makes each a no-op once applied.
+REVIEWED_NON_ADDITIVE = tuple(
+    [f"alter table lakefed_cursor.control drop column if exists {c}" for c in (
+        "job_name", "src_catalog", "enable_iceberg_reads", "sink_cluster_cols", "source_instance_group",
+        "warehouse_id", "ct_enabled", "cdc_capture_instance", "cursor_column", "write_mode")]
+    + [f"alter table lakefed_cursor.checkpoint drop column if exists {c}" for c in (
+        "ct_begin_version", "pending_position", "pending_run_id")]
+    + ["drop table if exists lakefed_cursor.reseed_queue"]
 )
 _NON_ADDITIVE = re.compile(r"^(update|insert|delete)\b|\balter column\b|\bdrop (default|not null)\b|\bset not null\b")
 
@@ -582,7 +539,8 @@ def ddl_problems(statements, reviewed=REVIEWED_NON_ADDITIVE):
         if re.search(r"\brename\b", s):
             out.append(f"rename (put it in state_store.RENAMES, which runs only pending renames): {short}")
         elif re.match(r"(drop|truncate)\b", s) or re.search(r"\bdrop (column|table|schema|index|view)\b", s):
-            out.append(f"destructive (needs a per-version migration step, not the cumulative re-apply): {short}")
+            if not (re.search(r"\bif exists\b", s) and s.startswith(reviewed)):
+                out.append(f"destructive (needs a per-version migration step, not the cumulative re-apply): {short}")
         elif s.startswith("create"):
             if not re.match(r"create (schema|table|(unique )?index) if not exists\b|create or replace (view|function)\b", s):
                 out.append(f"create without if not exists / or replace: {short}")
@@ -634,6 +592,8 @@ def test_ddl_check_flags_statements_that_are_unsafe_to_re_apply(stmt, why):
 
 
 def test_ddl_check_accepts_the_idempotent_forms():
+    assert ddl_problems(["alter table lakefed_cursor.control drop column if exists job_name"]) == []   # reviewed
+    assert ddl_problems(["alter table lakefed_cursor.control drop column if exists other"]) != []      # not reviewed
     assert ddl_problems([
         "create table if not exists lakefed_ingest.t (a int)",
         "create unique index if not exists t_uq on lakefed_ingest.t (a)",
@@ -708,11 +668,10 @@ def test_schema_version_is_zero_before_versions_were_recorded():
 
 def test_migrate_from_an_unversioned_database_applies_renames_ddl_and_version_in_one_transaction():
     db = MigrationDb(relations={"ct_checkpoint", "checkpoint_control_pk"}, columns={("ct_checkpoint", "ct_version")})
-    out = ss.StateStore(db).migrate("create table if not exists lakefed_ingest.x (a int); alter table lakefed_ingest.x add b int;")
-    assert out == {"from": 0, "renames": ["alter table lakefed_ingest.ct_checkpoint rename to checkpoint",
-                                          "alter table lakefed_ingest.checkpoint rename column ct_version to position"]}
-    assert db.ran()[2:] == ["create table if not exists lakefed_ingest.x (a int)", "alter table lakefed_ingest.x add b int",
-                            "insert into lakefed_ingest.schema_version (version) values (%s) on conflict (version) "
+    out = ss.StateStore(db).migrate("create table if not exists lakefed_cursor.x (a int); alter table lakefed_cursor.x add b int;")
+    assert out == {"from": 0, "renames": []}
+    assert db.ran() == ["create table if not exists lakefed_cursor.x (a int)", "alter table lakefed_cursor.x add b int",
+                            "insert into lakefed_cursor.schema_version (version) values (%s) on conflict (version) "
                             "do update set applied_at = now(), applied_by = current_user"]
     assert all(in_tx for _, in_tx in db.statements) and db.committed is True
     # Serialized by the schema lock, taken before the version is read; DDL waits are bounded.
@@ -730,11 +689,6 @@ def test_migrate_is_a_noop_at_the_current_version_unless_forced():
     assert out == {"from": ss.SCHEMA_VERSION, "renames": []} and "create table t (a int)" in db.ran()
 
 
-def test_migrate_moves_the_preview_schema_first():
-    db = MigrationDb(schemas={"lakefed_ingest_mt"})
-    ss.StateStore(db).migrate("select 1;")
-    assert db.ran()[0] == "alter schema lakefed_ingest_mt rename to lakefed_ingest"
-
 
 def test_migrate_failure_rolls_back_and_a_newer_database_is_refused():
     db = MigrationDb(fail_on="valid_remote_query")
@@ -748,12 +702,10 @@ def test_migrate_failure_rolls_back_and_a_newer_database_is_refused():
 
 
 def test_ddl_generic_checkpoint_and_telemetry_columns():
-    for frag in ("create table if not exists lakefed_ingest.checkpoint",
-                 "strategy       text        not null default 'ct'",
-                 "alter column position type text using position::text",
-                 "add column if not exists strategy text not null default 'ct'",
+    for frag in ("create table if not exists lakefed_cursor.checkpoint",
+                 "strategy                text        not null default 'cursor'",
                  "phase in ('seeding', 'incremental', 'loaded')",
-                 "create table if not exists lakefed_ingest.ingest_run",
+                 "create table if not exists lakefed_cursor.ingest_run",
                  "run_id          bigserial   primary key",
                  "position_from   text", "position_to     text"):
         assert frag in _DDL, frag
@@ -761,18 +713,6 @@ def test_ddl_generic_checkpoint_and_telemetry_columns():
     for old in ("ct_checkpoint (", "sweep_run (", "sweep_id ", "ct_version "):
         assert old not in code, old
 
-
-def test_ddl_control_strategy_constraints_and_columns():
-    for col in ("cursor_column", "cdc_capture_instance", "jdbc_options"):
-        assert f"alter table lakefed_ingest.control add column if not exists {col} text" in _DDL
-        assert col in ss.CONTROL_COLUMNS
-    assert "alter column primary_key drop not null" in _DDL          # full loads need no PK
-    assert "load_type in ('ct', 'cdc', 'cursor', 'full')" in _DDL
-    assert "src_type in ('sqlserver', 'oracle', 'postgresql', 'mysql')" in _DDL
-    assert "drop constraint if exists control_load_type_check" in _DDL  # the old inline check
-    cur = _DDL[_DDL.index("add constraint valid_cursor_metadata"):]
-    cur = cur[:cur.index(";")]
-    assert "cursor_column" in cur and "primary_key" in cur
 
 
 def test_strategy_name_and_position_text():
@@ -792,7 +732,7 @@ def test_mixed_sinks_query_starts_from_dedicated_rows_and_maps_tuples():
 
 def test_ddl_indexes_dedicated_rows_by_sink():
     assert ("create index if not exists control_dedicated_sink_idx\n"
-            "    on lakefed_ingest.control (lower(sink_catalog), lower(sink_schema), lower(sink_table))\n"
+            "    on lakefed_cursor.control (lower(sink_catalog), lower(sink_schema), lower(sink_table))\n"
             "    where client_id is null;") in _DDL
 
 
@@ -826,13 +766,8 @@ def test_without_reconnect_a_dropped_connection_stays_dropped():
     assert store._cursor() == "c1" and store.is_alive() is False
 
 
-def test_ddl_write_mode_client_attrs_and_pending_columns():
-    assert "control add column if not exists write_mode text not null default 'merge'" in _DDL
-    assert "control add column if not exists client_attrs text" in _DDL
-    assert "write_mode" in ss.CONTROL_COLUMNS and "client_attrs" in ss.CONTROL_COLUMNS
-    con = _DDL[_DDL.index("add constraint valid_write_mode"):]
-    con = con[:con.index(";")]
-    assert "write_mode in ('merge', 'append')" in con and "load_type in ('ct', 'full')" in con
+def test_ddl_client_attrs_column_and_check():
+    assert "client_attrs          text" in _DDL and "client_attrs" in ss.CONTROL_COLUMNS
     assert "jsonb_typeof(client_attrs::jsonb) = 'object'" in _DDL
 
 
@@ -921,3 +856,35 @@ def test_join_sources_holds_one_shared_lock_per_source_and_counts_their_holders(
     (sql, params), = conn.calls
     assert "mode = 'ShareLock'" in sql and "classid::bigint = %s" in sql and "objid::bigint = any(%s)" in sql
     assert params == (ss.SOURCE_LOCK_CLASS, list(keys.values()))
+
+
+# ---- schema v2: lakefed_cursor, expression cursor columns (US3) ------------------------------------------
+
+def test_schema_v2_names_and_columns():
+    assert ss.SCHEMA == "lakefed_cursor" and ss.SCHEMA_VERSION == 2 and ss.RENAMES == []
+    assert "lakefed_ingest." not in _DDL
+    stmts = ss.split_sql_statements(_DDL)
+    assert ddl_problems(stmts) == []
+    for col in ("cursor_expression", "cursor_kind", "cursor_lookback_s", "delete_mode", "delete_min_interval_s",
+                "null_cursor_policy"):
+        assert col in _DDL and col in ss.CONTROL_COLUMNS, col
+    assert "last_delete_snapshot_at" in _DDL and "last_delete_snapshot_at" in ss.get_checkpoints_sql()
+    assert "load_type             text        not null default 'cursor'" in _DDL
+    assert "load_type in ('cursor', 'full')" in _DDL
+    for name in ("valid_load_type", "valid_src_type", "valid_cursor_kind", "valid_delete_mode", "valid_null_cursor_policy",
+                 "valid_cursor_metadata", "valid_full_metadata", "valid_source", "valid_remote_query", "valid_intervals"):
+        assert f"drop constraint if exists {name}" in _DDL and f"add constraint {name}" in _DDL, name
+    assert "create unique index if not exists control_sink_client_uq" in _DDL
+    code = "\n".join(l.split("--")[0] for l in _DDL.splitlines()).lower()
+    for old in ("valid_ct_metadata", "valid_write_mode", "valid_cdc_metadata", "'ct'", "'cdc'", "'append'"):
+        assert f"add constraint {old}" not in code and (old not in code or old.startswith("valid")), old
+    assert "drop table if exists lakefed_cursor.reseed_queue" in _DDL
+
+
+def test_gap_11_dead_columns_dropped():
+    for col in ("job_name", "src_catalog", "enable_iceberg_reads", "sink_cluster_cols", "source_instance_group",
+                "warehouse_id", "ct_enabled", "cdc_capture_instance", "cursor_column", "write_mode"):
+        assert f"alter table lakefed_cursor.control drop column if exists {col}" in _DDL, col
+        assert col not in ss.CONTROL_COLUMNS, col
+    for col in ("ct_begin_version", "pending_position", "pending_run_id"):
+        assert f"alter table lakefed_cursor.checkpoint drop column if exists {col}" in _DDL, col

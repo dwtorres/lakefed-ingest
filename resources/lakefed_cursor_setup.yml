@@ -1,6 +1,6 @@
 # Automated prerequisites: the Lakebase OLTP instance + its UC-registered database, the source
 # credential secret scope, and a setup job that applies / migrates the Lakebase schema (control,
-# checkpoints, reseed queue, telemetry).
+# checkpoints, telemetry).
 #
 # NOTE: deploying this file CREATES BILLABLE INFRASTRUCTURE (a Lakebase instance). To reuse
 # pre-provisioned resources instead, adopt them with `databricks bundle deployment bind` before the
@@ -21,7 +21,7 @@ resources:
     lakebase_catalog:
       # Registers the Lakebase database in Unity Catalog so control / telemetry tables are queryable
       # from DBSQL (docs/monitoring.md). Named so it can't collide with the job_orchestration version's
-      # `lakefed_ingest` catalog.
+      # `lakefed_ingest` catalogs of the lakefed-ingest bundles.
       name: ${var.lakebase_catalog}
       database_instance_name: ${resources.database_instances.lakebase.name}
       database_name: ${var.lakebase_database}
@@ -36,8 +36,8 @@ resources:
       name: ${var.secret_scope}
 
   jobs:
-    lakefed_ingest_setup:
-      name: "lakefed_ingest_setup"
+    lakefed_cursor_setup:
+      name: "lakefed_cursor_setup"
       description: "Apply / migrate the Lakebase schema (control, hot state, telemetry). Idempotent."
       job_clusters:
         # Small single-node cluster: the setup task only runs DDL against Lakebase.
@@ -52,7 +52,7 @@ resources:
               spark.master: "local[*]"
             custom_tags:
               ResourceClass: SingleNode
-              project: lakefed_ingest
+              project: lakefed_cursor
       tasks:
         - task_key: apply_lakebase_schema
           notebook_task:
@@ -68,7 +68,7 @@ resources:
                 package: "databricks-sdk==0.145.0"
       tags:
         business_unit: ""
-        project: lakefed_ingest
+        project: lakefed_cursor
       queue:
         enabled: false
       parameters:

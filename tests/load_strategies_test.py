@@ -48,8 +48,8 @@ def test_cursor_runs_where_the_adapter_implements_it():
 def test_cursor_position_round_trip():
     import cursor_engine as cur
     s = ls.get_strategy("cursor")
-    text = cur.encode_position("rv", "timestamp", "2001")
-    assert s.decode_position(s.encode_position(text)) == {"col": "rv", "type": "timestamp", "value": "2001"}
+    text = cur.encode_position("rv", "rowversion", "timestamp", "2001")
+    assert s.decode_position(s.encode_position(text)) == {"expr": "rv", "kind": "rowversion", "type": "timestamp", "value": "2001"}
     assert s.decode_position(None) is None and s.decode_position("287493") is None
 
 

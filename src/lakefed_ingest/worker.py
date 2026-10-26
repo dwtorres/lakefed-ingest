@@ -11,7 +11,8 @@ decided by the planner:
                      cursor_skew_s; logged as alert=max_above_clock); unchanged if equal to the
                      checkpoint, else read (position - lookback, hi] + upsert MERGE by PK, advance
                      to `hi`. An identity cursor logs `inserts_only` once per run per table
-  schema_reseed    - control.select_list gained columns vs the recorded one: enqueue a reseed
+  schema_reseed    - control.select_list gained columns vs the recorded one, or the cursor_expression
+                     / cursor_kind changed (plan["reason"]): enqueue a reseed
   (retry)          - table_retries: the same route again on the fresh checkpoint
 The `stage` variable records how far a table got, so a failure pinpoints read vs merge vs
 checkpoint. The collection lock is re-checked (``deps.guard``, cached, <=1 query/30s) right before
@@ -62,6 +63,7 @@ def ingest_one(plan, run_id, deps, attempt=0):
                                      select_list=cfg["select_list"])
             outcome = "loaded"
         elif route == "cursor_seed":
+            cursor_engine.validate_expression(cfg)   # the pure rules, before any source read
             stage = "ensure_sink"
             sink_writer.ensure_sink_table(spark, cfg, sink, slots=slots)
             stage = "read"
@@ -77,13 +79,14 @@ def ingest_one(plan, run_id, deps, attempt=0):
             stage = "checkpoint"
             assert_lock_held()
             hi = cursor_engine.seed_position(cfg, typ, hi, time.monotonic() - seed_started)  # temporal: pulled back by the seed duration
-            store.advance_checkpoint(cfg, position=cursor_engine.encode_position(cfg["cursor_column"], typ, hi),
+            store.advance_checkpoint(cfg, position=cursor_engine.encode_position(cfg["cursor_expression"], cfg["cursor_kind"], typ, hi),
                                      phase=ss.INCREMENTAL, detail=_detail("seed complete", alert),
                                      select_list=cfg["select_list"])
             v_to = hi
             outcome = "seeded"
         elif route == "cursor":
             pos = plan["position"]
+            cursor_engine.validate_expression(cfg)
             stage = "read"
             hi, alert = cursor_engine.high_watermark(cfg, pos["type"], deps.params["cursor_skew_s"], slots=slots)  # BEFORE the read
             _log_alert(log, alert, db, schema, table)
@@ -104,14 +107,15 @@ def ingest_one(plan, run_id, deps, attempt=0):
                 outcome = "unchanged"
             stage = "checkpoint"
             assert_lock_held()
-            store.advance_checkpoint(cfg, position=cursor_engine.encode_position(pos["col"], pos["type"], new_value),
+            store.advance_checkpoint(cfg, position=cursor_engine.encode_position(pos["expr"], pos["kind"], pos["type"], new_value),
                                      detail=_detail(None, alert), select_list=cfg["select_list"])
             v_to = new_value
         else:  # schema_reseed
             stage = "checkpoint"
             assert_lock_held()
-            store.enqueue_reseed(cfg, reason="schema_change")  # flips phase -> seeding
-            log(f"[reseed:schema_change] {db}.{schema}.{table}")
+            reason = plan.get("reason", "schema_change")
+            store.enqueue_reseed(cfg, reason=reason)  # flips phase -> seeding
+            log(f"[reseed:{reason}] {db}.{schema}.{table}")
             outcome = "reseed_enqueued"
 
     except Exception as e:

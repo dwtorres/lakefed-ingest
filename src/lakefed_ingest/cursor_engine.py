@@ -1,18 +1,19 @@
-"""Cursor (high-watermark) strategy: incremental reads on a monotonically increasing column
-(``control.cursor_column``), MERGEd into the Delta sink by PK. Every dialect difference (type
-lookup, clock, text rendering, literals) is a ``SourceAdapter`` method; this module never branches on
-``src_type``.
+"""Cursor (high-watermark) strategy: incremental reads on a monotonically increasing SQL expression
+(``control.cursor_expression``: one to three source columns, folded with GREATEST / COALESCE), MERGEd
+into the Delta sink by PK. Every dialect difference (type lookup, clock, text rendering, literals, the
+GREATEST form) is a ``SourceAdapter`` method; this module never branches on ``src_type``.
 
 Per cycle, for a seeded table (checkpoint phase ``incremental``):
-  1. ``hi`` = the column's current high watermark (one small source query);
+  1. ``hi`` = the expression's current high watermark (one small source query);
   2. ``hi`` == checkpoint position -> unchanged (no read, no MERGE);
-  3. otherwise read ``cursor_column > position AND cursor_column <= hi`` (ONE source read) and
+  3. otherwise read ``expr > position AND expr <= hi`` (ONE source read) and
      upsert-MERGE by PK; the checkpoint advances to ``hi`` only after the MERGE commits
      (at-least-once — re-reading a window is harmless, the MERGE is idempotent).
 The seed captures ``hi`` BEFORE the full copy, so rows written during the seed are re-read by the
 first increment (no gap).
 
-Supported column types (``SourceAdapter.type_class_of`` of ``cursor_column``; SQL Server names shown,
+Supported column types (``SourceAdapter.type_class_of`` of the expression's columns, which share one
+type; SQL Server names shown,
 see each adapter for its own), by kind:
   * ``identity`` (type class ``numeric``): tinyint, smallint, int, bigint, decimal, numeric (identity keys / sequences). A
     value is taken at insert, not at commit, so a late commit below a read ``hi`` is lost: the kind
@@ -32,9 +33,15 @@ updates are captured only if they move the cursor column (``rowversion`` always 
 never does). A ``hi`` below the position (a source truncate or reload) fails the table; the position
 never moves backwards.
 
-Position (``checkpoint.position``, text) is JSON ``{"col", "type", "value"}``: the column and its
-type are recorded so a changed ``cursor_column`` re-seeds and every later cycle needs no type
-lookup. ``value`` is canonical source text (ISO 8601 for temporal, decimal text otherwise).
+Position (``checkpoint.position``, text) is JSON ``{"expr", "kind", "type", "value"}``
+(contracts/position.md): the expression text, ``cursor_kind`` and the type are recorded so a changed
+expression or kind re-seeds and every later cycle needs no type lookup. ``value`` is canonical source
+text (ISO 8601 for temporal, decimal text otherwise).
+
+``validate_expression`` (data-model rules 4 to 7) checks the expression before any source read: one
+to three columns, GREATEST / COALESCE only, one shared type, no nullable input unless
+``null_cursor_policy`` is ``seed_only`` (then a NULL-expression row is copied by the seed and never
+read by an increment, whose window is ``(lo, hi]``).
 
 Pure builders are unit-tested in tests/cursor_engine_test.py; source access reuses ``source_io``
 (one slot per query unit, lazy Spark imports) and sink writes reuse ``sink_writer``.
@@ -47,11 +54,15 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import sink_writer
 import source_adapters
 import source_io
+
+CURSOR_KINDS = ("rowversion", "db_timestamp", "app_timestamp", "identity")
+NULL_CURSOR_POLICIES = ("reject", "seed_only")
+_MILLISECOND_TYPES = ("datetime", "smalldatetime")
 
 _NUMERIC_VALUE = re.compile(r"^-?\d+(\.\d+)?$")
 _TEMPORAL_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,7})?)?)?([+-]\d{2}:\d{2}|Z)?$")
@@ -69,53 +80,150 @@ def _kind(cfg: dict, typ: str) -> str:
 
 # ---- position --------------------------------------------------------------------------------------
 
-def encode_position(col: str, typ: str, value: Optional[str]) -> str:
-    return json.dumps({"col": col, "type": typ, "value": value}, separators=(",", ":"))
+def encode_position(expr: str, kind: str, typ: str, value: Optional[str]) -> str:
+    """contracts/position.md. A ``datetime`` / ``smalldatetime`` value carries at most three fractional
+    digits (the source holds no more)."""
+    if value is not None and str(typ).lower() in _MILLISECOND_TYPES:
+        value = source_adapters.trim_fraction(str(value), 3)
+    return json.dumps({"expr": expr, "kind": kind, "type": typ, "value": value}, separators=(",", ":"))
 
 
 def decode_position(text: Optional[str]) -> Optional[dict]:
-    """{"col", "type", "value"} or None (no / unreadable position -> the planner re-seeds)."""
+    """{"expr", "kind", "type", "value"} or None (no / unreadable position, or the old ``{col, ...}``
+    shape -> the planner re-seeds)."""
     if not text:
         return None
     try:
         d = json.loads(text)
     except (TypeError, ValueError):
         return None
-    if not isinstance(d, dict) or not d.get("col") or not d.get("type"):
+    if not isinstance(d, dict) or not all(d.get(k) for k in ("expr", "kind", "type")):
         return None
-    return {"col": d["col"], "type": d["type"], "value": d.get("value")}
+    return {"expr": d["expr"], "kind": d["kind"], "type": d["type"], "value": d.get("value")}
+
+
+# ---- the expression (pure) -------------------------------------------------------------------------
+
+# One pass over literals (skipped), quoted identifiers, and bare words; a bare word followed by '(' is a call.
+_TOKEN = re.compile(r"N?'(?:[^']|'')*'|\[([^\]]+)\]|\"([^\"]+)\"|\b([A-Za-z_][\w$#]*)\b")
+_KEYWORDS = {"DATE", "TIMESTAMP", "NULL", "AS"}   # literal prefixes that are not columns
+
+
+def expression_columns(expression: str) -> List[str]:
+    """The source columns an expression references, as written, each once (case-insensitive)."""
+    text = expression or ""
+    out: List[str] = []
+    for m in _TOKEN.finditer(text):
+        name = next((g for g in m.groups() if g is not None), None)
+        if name is None:   # a string literal
+            continue
+        if m.group(3) and (name.upper() in _KEYWORDS or text[m.end():].lstrip().startswith("(")):
+            continue
+        if name.lower() not in {c.lower() for c in out}:
+            out.append(name)
+    return out
+
+
+def null_cursor_policy(cfg: dict) -> str:
+    return str(cfg.get("null_cursor_policy") or "reject").strip().lower()
+
+
+def validate_expression(cfg: dict, column_types: Optional[Dict[str, Tuple[str, bool]]] = None) -> Optional[str]:
+    """Reject a bad ``cursor_expression`` with a message that names the problem (FR-011, FR-012,
+    FR-015, FR-009): only GREATEST / COALESCE, one to three columns, a ``rowversion`` kind over one
+    column. With ``column_types`` = {column: (type_name, nullable)} from ``column_type_sql``, also: every
+    column exists, all share one type, and no input is nullable under ``null_cursor_policy`` ``reject``.
+    Returns the shared type name (lower case), or None for the pure checks alone."""
+    expr, where = cfg.get("cursor_expression") or "", f"{cfg['src_schema']}.{cfg['src_table']}"
+    bad = sorted(set(sink_writer.expression_functions(expr)) - sink_writer.SINK_FUNCTIONS)
+    if bad:
+        raise ValueError(f"cursor_expression on {where} uses {', '.join(bad)}: only GREATEST and COALESCE are allowed")
+    cols = expression_columns(expr)
+    if not 1 <= len(cols) <= 3:
+        raise ValueError(f"cursor_expression on {where} references {len(cols)} columns; it must reference 1 to 3")
+    if str(cfg.get("cursor_kind") or "").lower() == "rowversion" and len(cols) > 1:
+        raise ValueError(f"cursor_kind rowversion on {where} takes one column; the expression references {len(cols)}")
+    if column_types is None:
+        return None
+    types = {c.lower(): (str(t).lower(), bool(n)) for c, (t, n) in column_types.items()}
+    missing = [c for c in cols if c.lower() not in types]
+    if missing:
+        raise ValueError(f"cursor_expression column '{missing[0]}' not found on {where}")
+    by_type = {}
+    for c in cols:
+        by_type.setdefault(types[c.lower()][0], c)
+    if len(by_type) > 1:
+        raise ValueError(f"cursor_expression on {where} mixes types: "
+                         + ", ".join(f"{c} {t}" for t, c in by_type.items()) + "; all columns must share one type")
+    nullable = [c for c in cols if types[c.lower()][1]]
+    if nullable and null_cursor_policy(cfg) == "reject":
+        raise ValueError(f"cursor_expression input '{nullable[0]}' on {where} is nullable: rows with a NULL value would "
+                         "never be read incrementally. Wrap it in COALESCE, or set null_cursor_policy seed_only")
+    typ = next(iter(by_type))
+    _kind(cfg, typ)   # a supported cursor type
+    return typ
+
+
+def _split_args(body: str) -> Optional[List[str]]:
+    """Top-level comma-separated arguments of one call body; None when ``body`` is not one call."""
+    args, depth, start, quoted = [], 0, 0, False
+    for i, ch in enumerate(body):
+        if ch == "'":
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif ch == "," and depth == 0:
+            args.append(body[start:i].strip())
+            start = i + 1
+    args.append(body[start:].strip())
+    return args
 
 
 # ---- SQL builders (pure; every dialect difference is a SourceAdapter method) ----------------------
 
-def _col(cfg: dict) -> str:
-    """``cursor_column`` quoted for the source dialect."""
-    return source_adapters.for_cfg(cfg).quote_ident(cfg["cursor_column"])
+def _expr(cfg: dict, typ: str, server_version=None) -> str:
+    """``cursor_expression`` for the source. A top-level GREATEST goes through the adapter
+    (``greatest_expr``: SQL Server before 2022 has none, so it becomes a CASE); anything else is the
+    operator's text as written."""
+    # shortcut: only an outermost GREATEST is rewritten; a nested one stays, upgrade when a source needs it
+    text = str(cfg["cursor_expression"]).strip()
+    m = re.match(r"^GREATEST\s*\((.*)\)$", text, re.I | re.S)
+    args = _split_args(m.group(1)) if m else None
+    if args is None:
+        return text
+    return source_adapters.for_cfg(cfg).greatest_expr(args, typ, server_version)
 
 
 def column_type_sql(cfg: dict) -> str:
-    """One row ``column_name``, ``type_name``, ``is_nullable`` (0/1) of ``cursor_column`` (no row when
-    the column doesn't exist)."""
-    return source_adapters.for_cfg(cfg).cursor_type_sql(cfg["src_schema"], cfg["src_table"], [cfg["cursor_column"]])
+    """One row ``column_name``, ``type_name``, ``is_nullable`` (0/1) per column the expression
+    references (no row for a column that doesn't exist)."""
+    return source_adapters.for_cfg(cfg).cursor_type_sql(cfg["src_schema"], cfg["src_table"],
+                                                        expression_columns(cfg["cursor_expression"]))
 
 
 def nullable_sql(cfg: dict) -> str:
-    """Scalar subquery: 1 if ``cursor_column`` is nullable (checked on every run, not just at seed —
-    a column can be altered to NULL after the table was seeded)."""
-    return f"(SELECT is_nullable FROM ({column_type_sql(cfg)}) t)"
+    """Scalar subquery: 1 if any referenced column is nullable (checked on every run, not just at
+    seed — a column can be altered to NULL after the table was seeded)."""
+    return f"(SELECT MAX(is_nullable) FROM ({column_type_sql(cfg)}) t)"
 
 
-def high_watermark_sql(cfg: dict, typ: str) -> str:
-    """One row ``hi``, ``nullable`` (and ``src_now`` for a temporal kind): the cursor column's high
-    watermark as canonical source text (NULL on an empty table), its nullability, and the source clock
-    in the same rendering as ``hi`` (one query per run for all). The adapter renders the text
-    (``max_text_sql``: ISO 8601 for temporal, decimal text otherwise; SQL Server caps a rowversion
+def high_watermark_sql(cfg: dict, typ: str, server_version=None) -> str:
+    """One row ``hi``, ``nullable`` (and ``src_now`` for a temporal kind): the expression's high
+    watermark as canonical source text (NULL on an empty table), its inputs' nullability, and the
+    source clock in the same rendering as ``hi`` (one query per run for all). The adapter renders the
+    text (``max_text_sql``: ISO 8601 for temporal, decimal text otherwise; SQL Server caps a rowversion
     below MIN_ACTIVE_ROWVERSION() so open transactions are never skipped)."""
     a = source_adapters.for_cfg(cfg)
     src_now = ""
     if _kind(cfg, typ) == "temporal":
         src_now = f", {a.cursor_text_sql(a.source_now_sql(typ), typ)} AS src_now"
-    return (f"SELECT {a.max_text_sql(_col(cfg), typ)} AS hi, {nullable_sql(cfg)} AS nullable{src_now} "
+    return (f"SELECT {a.max_text_sql(_expr(cfg, typ, server_version), typ)} AS hi, {nullable_sql(cfg)} AS nullable{src_now} "
             f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}")
 
 
@@ -129,15 +237,16 @@ def literal(cfg: dict, value: str, typ: str) -> str:
     return source_adapters.for_cfg(cfg).cursor_literal(v, typ)
 
 
-def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str, lookback_s: int) -> str:
-    """``cursor_column > lo AND cursor_column <= hi`` (no lower bound when ``lo`` is None — a table
-    that was empty at seed time). Sargable: the literal is cast to the column's type, not vice versa.
+def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str, lookback_s: int, server_version=None) -> str:
+    """``expr > lo AND expr <= hi`` (no lower bound when ``lo`` is None — a table that was empty at
+    seed time). Sargable: the literal is cast to the expression's type, not vice versa. A row whose
+    expression is NULL is never in the window (``seed_only``: the seed copied it).
 
     A temporal cursor is assigned when the row is written, not when it commits, so a row can commit
     after a read whose ``hi`` is above it. The lower bound is pulled back by ``lookback_s`` for
     temporal kinds (the MERGE makes the re-read harmless); rowversion and identity stay exact (an
     identity is inserts-only: a late commit below ``hi`` is lost whatever the lookback)."""
-    col = _col(cfg)
+    col = _expr(cfg, typ, server_version)
     upper = f"{col} <= {literal(cfg, hi, typ)}"
     if lo is None:
         return upper
@@ -196,27 +305,23 @@ def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
 # ---- source access ---------------------------------------------------------------------------------
 
 def column_type(cfg: dict, slots=None) -> str:
-    """The cursor column's source type name; raises a clear error if missing, unsupported or nullable.
-
-    A nullable cursor column is refused: incremental reads select ``col > lo AND col <= hi``, so a
-    row whose cursor value is NULL would never be read (the seed copies it, later changes to it
-    would be silently missed)."""
+    """The expression's source type name (``validate_expression`` over the referenced columns' types);
+    raises a clear error for a missing, unsupported or mixed-type column, or a nullable input under
+    ``null_cursor_policy`` ``reject``: incremental reads select ``expr > lo AND expr <= hi``, so a row
+    whose expression is NULL would never be read (the seed copies it, later changes to it would be
+    silently missed)."""
     with source_io._unit(slots, cfg):
-        row = source_io._read(source_io._spark(), cfg, column_type_sql(cfg)).first()
-    if row is None or row["type_name"] is None:
-        raise ValueError(f"cursor_column '{cfg['cursor_column']}' not found on "
-                         f"{cfg['src_schema']}.{cfg['src_table']}")
-    typ = str(row["type_name"]).lower()
-    _kind(cfg, typ)
-    _refuse_nullable(cfg, row["is_nullable"])
-    return typ
+        rows = source_io._read(source_io._spark(), cfg, column_type_sql(cfg)).collect()
+    types = {str(r["column_name"]): (str(r["type_name"]), bool(r["is_nullable"]))
+             for r in rows if r["type_name"] is not None}
+    return validate_expression(cfg, types)
 
 
 def _refuse_nullable(cfg: dict, nullable) -> None:
-    if nullable:
-        raise ValueError(f"cursor_column '{cfg['cursor_column']}' on {cfg['src_schema']}.{cfg['src_table']} "
-                         "is nullable: rows with a NULL value would never be read incrementally. Use a NOT NULL "
-                         "column (rowversion recommended), or load_type ct or full")
+    if nullable and null_cursor_policy(cfg) == "reject":
+        raise ValueError(f"a cursor_expression input on {cfg['src_schema']}.{cfg['src_table']} is nullable: rows with a "
+                         "NULL value would never be read incrementally. Wrap it in COALESCE, or set "
+                         "null_cursor_policy seed_only")
 
 
 def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Optional[str], bool]:
@@ -224,8 +329,9 @@ def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Option
     is capped at the source clock plus ``skew_s`` — a row stamped in the future would otherwise pin
     the window above every later row — and ``alert`` (``max_above_clock``) says the cap applied; the
     capped rows are read once the clock passes them."""
+    version = source_io.server_version(cfg, slots)
     with source_io._unit(slots, cfg):
-        row = source_io._read(source_io._spark(), cfg, high_watermark_sql(cfg, typ)).first()
+        row = source_io._read(source_io._spark(), cfg, high_watermark_sql(cfg, typ, version)).first()
     if row is None or row["hi"] is None:
         return None, False
     _refuse_nullable(cfg, row["nullable"])
@@ -242,7 +348,8 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
                    lookback_s: int, slots=None) -> Optional[int]:
     """Read (lo, hi] and upsert-MERGE it into the sink — ONE source read feeding the MERGE (no
     ``.cache()``/``count()``). Returns rows affected from the MERGE metrics (None if unavailable)."""
-    query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi, lookback_s))
+    version = source_io.server_version(cfg, slots)
+    query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi, lookback_s, version))
     def once():
         with source_io._unit(slots, cfg):
             df = sink_writer._tag(source_io._read(spark, cfg, query), cfg)
@@ -272,7 +379,7 @@ def plan_increment(cfg: dict, position: dict, hi: Optional[str]) -> Tuple[str, O
     if hi is None:
         return "unchanged", value, note
     if value is not None and _parse(kind, hi) < _parse(kind, value):
-        raise ValueError(f"high watermark {hi} of cursor_column '{position.get('col')}' is below the checkpoint "
+        raise ValueError(f"high watermark {hi} of cursor_expression '{position.get('expr')}' is below the checkpoint "
                          f"position {value}: a source truncate or reload? The position stays; reseed the "
                          "table to start over (enqueue a reseed)")
     if hi == value and kind != "temporal":

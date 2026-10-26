@@ -48,6 +48,16 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
         return str(e)   # names the valid values: cursor, full
     if strategy.requires_pk and not source_io._split(cfg.get("primary_key")):
         return f"load_type {cfg.get('load_type') or ls.CURSOR} needs a primary_key (it MERGEs by it)"
+    if strategy.name == ls.CURSOR:
+        if not cfg.get("cursor_expression") or not cfg.get("cursor_kind"):
+            return "load_type cursor needs cursor_expression and cursor_kind"
+        if str(cfg["cursor_kind"]).strip().lower() not in cursor_engine.CURSOR_KINDS:
+            return f"unknown cursor_kind {cfg['cursor_kind']!r}: use one of {', '.join(cursor_engine.CURSOR_KINDS)}"
+    delete_mode = str(cfg.get("delete_mode") or "none").strip().lower()
+    if delete_mode in ("soft_column", "full_compare"):
+        return f"delete_mode {delete_mode} is not implemented: use none or pk_snapshot"
+    if delete_mode not in ("none", "pk_snapshot"):
+        return f"unknown delete_mode {cfg.get('delete_mode')!r}: use none or pk_snapshot"
     if source_io.uses_remote_query(cfg) and not cfg.get("src_connection"):
         return "use_remote_query reads through the Unity Catalog connection in src_connection, which is not set"
     try:
@@ -94,15 +104,18 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
 
 def _route_cursor(cfg: dict, cp: Optional[dict], reseed_on_new_columns: bool = True) -> dict:
     """Cursor tables: seed when there's no usable cursor checkpoint (none, phase seeding, another
-    strategy's, or recorded for a different cursor_column); reseed when select_list gained columns
-    (unless ``reseed_on_new_columns`` is off); else a per-table high-watermark increment."""
+    strategy's, or not a cursor position); reseed when the position's ``expr`` or ``kind`` differs
+    byte for byte from the control row (FR-014), or when select_list gained columns (unless
+    ``reseed_on_new_columns`` is off); else a per-table high-watermark increment."""
     pos = cursor_engine.decode_position(cp.get("position")) if cp else None
     if (cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CURSOR) != ls.CURSOR
-            or pos is None or pos["col"].lower() != str(cfg.get("cursor_column") or "").lower()):
+            or pos is None):
         return {"cfg": cfg, "route": "cursor_seed", "cp": cp}
+    if pos["expr"] != cfg.get("cursor_expression") or pos["kind"] != cfg.get("cursor_kind"):
+        return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": [], "reason": "expression_change"}
     added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
     if added and reseed_on_new_columns:
-        return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": added}
+        return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": added, "reason": "schema_change"}
     return {"cfg": cfg, "route": "cursor", "cp": cp, "position": pos}
 
 

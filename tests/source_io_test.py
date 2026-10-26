@@ -66,7 +66,7 @@ def test_secret_ref_prefers_control_secret_key(monkeypatch):
 def test_secret_ref_legacy_fallback_and_missing(monkeypatch):
     monkeypatch.delenv("LAKEFED_SQL_SECRET_KEY", raising=False)
     monkeypatch.delenv("LAKEFED_SQL_SECRET_SCOPE", raising=False)
-    assert sio.secret_ref({"id": 1, "src_connection": "c1"}) == ("lakefed_ingest", "c1_json")
+    assert sio.secret_ref({"id": 1, "src_connection": "c1"}) == ("lakefed-cursor", "c1_json")
     try:
         sio.secret_ref({"id": 2})
     except ValueError:
@@ -192,3 +192,19 @@ def test_units_take_a_permit_of_each_rows_source():
     with sio._unit(slots):                                    # Delta-only units take no permit
         assert slots.in_flight == 1
     assert sio._unit(None, _REMOTE) is not None and sio._units(None, [_REMOTE]) is not None
+
+
+def test_server_version_is_queried_once_per_source(monkeypatch):
+    reads = []
+
+    class _Rows:
+        def __init__(self, rows): self._rows = rows
+        def first(self): return self._rows[0] if self._rows else None
+    monkeypatch.setattr(sio, "_spark", lambda: None)
+    monkeypatch.setattr(sio, "_read", lambda sp, cfg, q, **kw: reads.append(q) or _Rows([{"server_version": 15}]))
+    sio._server_versions.clear()
+    a = dict(_MERGE_CFG, src_type="sqlserver", src_host="h1", src_database="d1")
+    assert sio.server_version(a) == 15 and sio.server_version(dict(a, src_database="d2")) == 15
+    assert len(reads) == 1 and "ProductMajorVersion" in reads[0]
+    assert sio.server_version(dict(a, src_host="h2")) == 15 and len(reads) == 2     # another server
+    assert sio.server_version(dict(a, src_type="oracle")) is None and len(reads) == 2  # no version-dependent SQL

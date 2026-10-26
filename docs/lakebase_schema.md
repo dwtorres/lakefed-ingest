@@ -243,9 +243,10 @@ the pending `state_store.RENAMES`, to a database at any earlier version. So ever
 - **Idempotent:** safe to run again. Use `create ... if not exists`, `add column if not exists`, and
   `drop constraint if exists` right before `add constraint`. A backfill (`update`) must be a no-op
   once applied, for example `where control_id is null`.
-- **Additive:** no `drop table`, `drop column` or `truncate`. A change that can't be written this way
-  (a destructive change, a one-time step for one version) needs a per-version migration step, which
-  the framework doesn't have yet.
+- **Additive:** no `truncate`. A `drop column if exists` or `drop table if exists` is allowed only
+  after review: list it in `REVIEWED_NON_ADDITIVE` (the root version's Change Tracking, CDC and
+  append columns are dropped this way). Any other destructive change needs a per-version migration
+  step, which the framework doesn't have yet.
 - **Valid from any earlier version:** the statement may run on a database several versions behind.
 - **Valid in a transaction:** no `CREATE INDEX CONCURRENTLY`, no `DO $$` blocks.
 

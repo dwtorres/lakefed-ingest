@@ -9,7 +9,7 @@ import worker
 
 def _cfg():
     return {"id": 7, "src_database": "db", "src_schema": "dbo", "src_table": "t", "load_type": "cursor",
-            "cursor_column": "mod", "select_list": None, "sink_catalog": "c", "sink_schema": "s",
+            "cursor_expression": "mod", "cursor_kind": "identity", "select_list": None, "sink_catalog": "c", "sink_schema": "s",
             "sink_table": "t"}
 
 
@@ -76,6 +76,7 @@ def fakes(monkeypatch, calls):
         sink_fqn=lambda cfg: "c.s.t", ensure_sink_table=lambda *a, **kw: None, seed=write("seed")))
     monkeypatch.setattr(worker, "cursor_engine", SimpleNamespace(
         column_type=lambda cfg, slots=None: "int", high_watermark=high_watermark,
+        validate_expression=worker.cursor_engine.validate_expression,
         seed_position=worker.cursor_engine.seed_position, encode_position=worker.cursor_engine.encode_position,
         plan_increment=worker.cursor_engine.plan_increment, lookback_seconds=worker.cursor_engine.lookback_seconds,
         read_and_merge=write("merge")))
@@ -87,7 +88,7 @@ def fakes(monkeypatch, calls):
 PLANS = {
     "cursor_seed": ({"route": "cursor_seed", "cfg": _cfg(), "cp": None}, "seed"),
     "cursor": ({"route": "cursor", "cfg": _cfg(), "cp": {"phase": "incremental"},
-                "position": {"col": "mod", "type": "int", "value": "10"}}, "merge"),
+                "position": {"expr": "mod", "kind": "identity", "type": "int", "value": "10"}}, "merge"),
     "full": ({"route": "full", "cfg": dict(_cfg(), load_type="full"), "cp": None}, "full_load"),
 }
 
@@ -146,7 +147,7 @@ def test_cursor_seed_captures_hi_before_seed_and_advances_to_it(deps, fakes, cal
     names = _names(calls)
     assert names.index("high_watermark") < names.index("seed")
     advance = [c for c in calls if c[0] == "advance"][0]
-    assert advance[1] == worker.cursor_engine.encode_position("mod", "int", "42")
+    assert advance[1] == worker.cursor_engine.encode_position("mod", "identity", "int", "42")
     assert advance[2]["phase"] == "incremental"
 
 
@@ -164,7 +165,7 @@ def test_cursor_route_plans_merges_then_advances_to_hi(deps, fakes, calls, monke
     assert seen == [("plan_increment", "10", "42")]
     assert names.index("high_watermark") < names.index("merge") < names.index("advance")
     advance = [c for c in calls if c[0] == "advance"][0]
-    assert advance[1] == worker.cursor_engine.encode_position("mod", "int", "42")
+    assert advance[1] == worker.cursor_engine.encode_position("mod", "identity", "int", "42")
 
 
 def test_max_timeout_fails_table_and_keeps_position(deps, fakes, calls, monkeypatch):

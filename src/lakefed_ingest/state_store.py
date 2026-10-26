@@ -1,4 +1,4 @@
-"""Lakebase state accessor for lakefed_ingest (control, checkpoints, telemetry).
+"""Lakebase state accessor for lakefed_cursor (control, checkpoints, telemetry).
 
 The framework is strategy-agnostic: ``control.load_type`` selects a load strategy
 (``load_strategies``) and ``control.src_type`` a source adapter (``source_adapters``). Per ADR-0004,
@@ -28,7 +28,7 @@ import threading
 import zlib
 from typing import Callable, List, Optional
 
-SCHEMA = "lakefed_ingest"
+SCHEMA = "lakefed_cursor"
 CONTROL_TABLE = f"{SCHEMA}.control"
 CHECKPOINT_TABLE = f"{SCHEMA}.checkpoint"
 RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion run
@@ -41,14 +41,12 @@ LOADED = "loaded"    # full: last reload committed (no resumable position)
 # Columns selected from the control table, in order. list_task_configs / get_task return dicts
 # keyed by these names (the ``cfg`` the sweep, source_io and sink_writer consume).
 CONTROL_COLUMNS = [
-    "id", "job_name", "task_collection", "src_type", "src_connection", "src_host", "src_port",
-    "secret_key", "src_database",
-    "src_catalog", "src_schema", "src_table", "sink_catalog", "sink_schema", "sink_table",
-    "enable_iceberg_reads", "primary_key", "sink_cluster_cols", "load_type", "load_partitioned",
-    "partition_col", "partition_size_mb",
-    "select_list", "use_remote_query", "ct_enabled", "cursor_column", "cdc_capture_instance",
-    "jdbc_options", "source_instance_group", "tier", "priority", "warehouse_id", "task_enabled",
-    "client_id", "write_mode", "client_attrs",
+    "id", "task_collection", "src_type", "src_connection", "src_host", "src_port", "secret_key",
+    "src_database", "src_schema", "src_table", "sink_catalog", "sink_schema", "sink_table",
+    "primary_key", "load_type", "load_partitioned", "partition_col", "partition_size_mb",
+    "select_list", "use_remote_query", "cursor_expression", "cursor_kind", "cursor_lookback_s",
+    "delete_mode", "delete_min_interval_s", "null_cursor_policy",
+    "jdbc_options", "tier", "priority", "task_enabled", "client_id", "client_attrs",
 ]
 
 
@@ -65,26 +63,12 @@ def position_text(value) -> Optional[str]:
 # --------------------------------------------------------------------------------------
 # Schema migration helpers for apply_lakebase_schema.ipynb (pure; unit-tested).
 # --------------------------------------------------------------------------------------
-# Renames from the CT-only naming to the generic one. Postgres has no IF EXISTS form for column
-# renames (and table/index renames fail when the target exists), so the applier inspects the catalog
-# and runs only the renames still pending — re-applying is a no-op. Applied BEFORE lakebase_schema.sql,
-# so its create-if-not-exists statements find the renamed objects (and their data) in place.
+# Pending renames. Postgres has no IF EXISTS form for column renames (and table/index renames fail
+# when the target exists), so the applier inspects the catalog and runs only the renames still
+# pending — re-applying is a no-op. Applied BEFORE lakebase_schema.sql, so its create-if-not-exists
+# statements find the renamed objects (and their data) in place. Empty: schema lakefed_cursor is new.
 #   (kind, table (columns only), old name, new name)
-RENAMES = [
-    ("table", None, "ct_checkpoint", "checkpoint"),
-    ("table", None, "sweep_run", "ingest_run"),
-    ("column", "checkpoint", "ct_version", "position"),
-    ("column", "ingest_run", "sweep_id", "run_id"),
-    ("column", "ingest_event", "sweep_id", "run_id"),
-    ("column", "ingest_event", "ct_version_from", "position_from"),
-    ("column", "ingest_event", "ct_version_to", "position_to"),
-    ("index", None, "ct_checkpoint_control_pk", "checkpoint_control_pk"),
-    ("index", None, "ct_checkpoint_control_uq", "checkpoint_control_uq"),
-    ("index", None, "sweep_run_pkey", "ingest_run_pkey"),
-    ("index", None, "sweep_run_collection_idx", "ingest_run_collection_idx"),
-    ("index", None, "ingest_event_sweep_idx", "ingest_event_run_idx"),
-    ("sequence", None, "sweep_run_sweep_id_seq", "ingest_run_run_id_seq"),
-]
+RENAMES = []
 
 
 def rename_statements(relations, columns, schema: str = SCHEMA) -> List[str]:
@@ -121,8 +105,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 # is newer than its database applies the pending migration itself (StateStore.migrate): upgrading is a
 # deploy. Bump SCHEMA_VERSION with every change to lakebase_schema.sql or RENAMES; a unit test pins the
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
-#   0 = no version recorded (deployed before versions existed)   1 = first recorded version
-SCHEMA_VERSION = 1
+#   0 = no version recorded   1 = lakefed_ingest root version   2 = lakefed_cursor: expression cursor, own names
+SCHEMA_VERSION = 2
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -220,8 +204,8 @@ def get_checkpoint_sql() -> str:
 def get_checkpoints_sql() -> str:
     """Checkpoints for MANY control tasks in one round trip (the sweep's planning phase).
     Param: list of control ids (bound as a Postgres array)."""
-    return (f"select control_id, position, phase, status, select_list, strategy, last_success_at "
-            f"from {CHECKPOINT_TABLE} where control_id = any(%s)")
+    return (f"select control_id, position, phase, status, select_list, strategy, last_success_at, "
+            f"last_delete_snapshot_at from {CHECKPOINT_TABLE} where control_id = any(%s)")
 
 
 def upsert_checkpoint_sql() -> str:
@@ -398,7 +382,7 @@ def close_abandoned_runs_sql() -> str:
 # Changing the namespace changes every key: don't let a run of an older build (namespace
 # 'lakefed_ingest.sweep:') overlap a run of this one for the same collection during an upgrade.
 # --------------------------------------------------------------------------------------
-LOCK_NAMESPACE = "lakefed_ingest:"
+LOCK_NAMESPACE = "lakefed_cursor:"
 
 
 def collection_lock_key(task_collection: str) -> str:
@@ -408,7 +392,7 @@ def collection_lock_key(task_collection: str) -> str:
 
 def lock_application_name(task_collection: str, job_run_id: str = "") -> str:
     """Label for the lock connection, visible in pg_stat_activity (Postgres caps it at 63 chars)."""
-    return f"lakefed_ingest:{task_collection}:{job_run_id}"[:63]
+    return f"lakefed_cursor:{task_collection}:{job_run_id}"[:63]
 
 
 def try_lock_collection_sql() -> str:
@@ -569,12 +553,6 @@ class StateStore:
                                    f"{SCHEMA_VERSION}: deploy the newer code instead")
             if before == SCHEMA_VERSION and not force:
                 return None
-            # Instances created before the schema was renamed: move lakefed_ingest_mt (all tables and
-            # data) to lakefed_ingest first.
-            cur.execute("select nspname from pg_namespace where nspname in ('lakefed_ingest_mt', %s)", (SCHEMA,))
-            present = {r[0] for r in cur.fetchall()}
-            if "lakefed_ingest_mt" in present and SCHEMA not in present:
-                cur.execute(f"alter schema lakefed_ingest_mt rename to {SCHEMA}")
             cur.execute("select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace "
                         "where n.nspname = %s", (SCHEMA,))
             relations = {r[0] for r in cur.fetchall()}
@@ -637,7 +615,7 @@ class StateStore:
             cur.execute(get_checkpoints_sql(), (ids,))
             rows = cur.fetchall()
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
-                            "strategy": r[5], "last_success_at": r[6]} for r in rows}
+                            "strategy": r[5], "last_success_at": r[6], "last_delete_snapshot_at": r[7]} for r in rows}
 
     def advance_checkpoint(self, cfg: dict, position, phase=INCREMENTAL, status="ok", detail=None,
                            select_list=None, strategy=None):

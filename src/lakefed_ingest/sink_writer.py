@@ -462,6 +462,32 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
     return int(rows or 0)
 
 
+# ---- the cursor expression on the sink side (research R-07) -----------------------------------------
+SINK_FUNCTIONS = frozenset({"GREATEST", "COALESCE"})   # the same text runs on the source and in Spark SQL
+_LITERAL = re.compile(r"N?'(?:[^']|'')*'")
+_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
+
+def strip_literals(text: str) -> str:
+    """``text`` with every ``'...'`` (and ``N'...'``) string literal replaced by ``''``."""
+    return _LITERAL.sub("''", text)
+
+
+def expression_functions(expression: str) -> List[str]:
+    """Upper-cased names of the functions an expression calls."""
+    return [m.group(1).upper() for m in _CALL.finditer(strip_literals(expression or ""))]
+
+
+def sink_expr(expression: str) -> str:
+    """The cursor expression for Spark SQL on the sink: GREATEST and COALESCE map one to one, so the
+    text passes through; any other function raises (it has no sink counterpart)."""
+    bad = sorted(set(expression_functions(expression)) - SINK_FUNCTIONS)
+    if bad:
+        raise ValueError(f"cursor_expression uses {', '.join(bad)}, which Spark SQL cannot run on the sink: "
+                         "only GREATEST and COALESCE are allowed")
+    return expression.strip()
+
+
 def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     """Idempotent I/U/D MERGE of staged change rows (temp view ``view``, column ``op``) into the sink, by PK.
 

@@ -1,8 +1,8 @@
-# Deploying lakefed_ingest
+# Deploying lakefed_cursor
 
-Everything the default version needs is a resource in its bundle (`lakefed_ingest_v2`, at the repo
+Everything the default version needs is a resource in its bundle (`lakefed_cursor`, at the repo
 root): the Lakebase instance and its UC-registered database, the secret scope, and the ingestion and
-setup jobs on job clusters (`resources/lakefed_ingest*.yml`). `databricks bundle deploy` is
+setup jobs on job clusters (`resources/lakefed_cursor*.yml`). `databricks bundle deploy` is
 idempotent for resources the bundle owns. This page covers the steps the bundle can't do. Run all
 commands from the repo root. (The job orchestration version is a separate bundle; see
 `../job_orchestration/README.md`.)
@@ -22,11 +22,11 @@ targets:
       driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound: size this first
       num_workers: 2
       # Optional overrides (defaults shown):
-      # lakebase_instance: lakefed-ingest
+      # lakebase_instance: lakefed-cursor
       # lakebase_capacity: CU_1
-      # lakebase_database: lakefed_ingest
-      # lakebase_catalog: lakefed_ingest_lakebase
-      # secret_scope: lakefed_ingest
+      # lakebase_database: databricks_postgres
+      # lakebase_catalog: lakefed_cursor_lakebase
+      # secret_scope: lakefed-cursor
       # Ingestion job parameter defaults, e.g. for a large estate (see README "Large estates"):
       # append_batch_size: "16"
       # max_seeds_per_run: "10000"
@@ -48,7 +48,7 @@ databricks bundle deployment bind secret_scope <scope-name>       -t dev
 
 Before binding, set the matching bundle variables (`lakebase_instance`, `lakebase_database`,
 `lakebase_catalog`, `secret_scope`) in your target; after binding, the bundle manages them. Existing
-jobs can be adopted the same way (`bind lakefed_ingest <job-id>`, `bind lakefed_ingest_setup
+jobs can be adopted the same way (`bind lakefed_cursor <job-id>`, `bind lakefed_cursor_setup
 <job-id>`). Run `databricks bundle plan -t dev` before the first deploy and confirm it deletes nothing.
 
 **Upgrading a preview deployment (Lakebase resources in the `lakefed_ingest` bundle).** Earlier
@@ -75,8 +75,8 @@ cd ..
    `lakebase_instance: lakefed-ingest-mt`, `lakebase_database: lakefed_ingest_mt`,
    `lakebase_catalog: lakefed_ingest_mt_pg`, `secret_scope: lakefed_ingest_mt`.
 3. Bind them here (`bind lakebase`, `bind lakebase_catalog`, `bind secret_scope`, and optionally the
-   two jobs as `lakefed_ingest` / `lakefed_ingest_setup`), run `databricks bundle plan` and confirm it
-   deletes nothing, deploy, then run `lakefed_ingest_setup` to migrate the schema in place.
+   two jobs as `lakefed_cursor` / `lakefed_cursor_setup`), run `databricks bundle plan` and confirm it
+   deletes nothing, deploy, then run `lakefed_cursor_setup` to migrate the schema in place.
 
 If `unbind` reports that a key isn't in the state, that resource was never deployed by the old
 bundle, so skip it.
@@ -88,8 +88,9 @@ catalog or set `lakebase_catalog` to its name — creating a second catalog for 
 ## 2. Deploy and apply the schema
 
 ```bash
+scripts/validate.sh -t dev                        # name test, then bundle validate
 databricks bundle deploy -t dev
-databricks bundle run lakefed_ingest_setup -t dev   # idempotent
+databricks bundle run lakefed_cursor_setup -t dev   # idempotent
 ```
 
 > Deploying creates a **billable** Lakebase instance (unless you bound an existing one).
@@ -122,7 +123,7 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent
      reads don't use it).
 5. **Oracle / MySQL sources only: JDBC driver.** Databricks Runtime bundles the SQL Server and
    PostgreSQL drivers but not Oracle's or MySQL's. Uncomment the matching Maven library in
-   `resources/lakefed_ingest.yml` (pin an approved version) and redeploy. Connection notes:
+   `resources/lakefed_cursor.yml` (pin an approved version) and redeploy. Connection notes:
    - Oracle: `src_database` = service name, `src_schema` = owner (use the stored upper-case names).
      The partitioned seed sizes tables from `ALL_TABLES` statistics (needs only `SELECT` on the
      table; gather statistics for accurate partition counts). TLS (TCPS) needs a wallet/truststore
@@ -134,7 +135,7 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 ## 4. First run and verification
 
 ```bash
-databricks bundle run lakefed_ingest -t dev --params task_collection=<name>
+databricks bundle run lakefed_cursor -t dev --params task_collection=<name>
 ```
 
 The first run seeds; later runs apply Change Tracking increments (`ct` rows), read rows above the
@@ -143,7 +144,7 @@ watermark (`cursor` rows), or reload the table (`full` rows). Check progress and
 
 **Upgrading an existing deployment:** pull and deploy. The next ingestion run finds the database
 behind its schema version and migrates it first, in one transaction (a failure changes nothing and
-fails the run with the cause). To migrate before the next run instead, run `lakefed_ingest_setup`.
+fails the run with the cause). To migrate before the next run instead, run `lakefed_cursor_setup`.
 Either way the migration needs the schema's owner: the deployer, unless the jobs run as another
 identity. From an early deploy, it renames the `ct_checkpoint` / `sweep_run` tables and their
 CT-specific columns to the generic `checkpoint` / `ingest_run` names in place (data kept).

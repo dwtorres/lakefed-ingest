@@ -61,13 +61,13 @@ class CursorStrategy(LoadStrategy):
     """Cursor (high-watermark) increments (``cursor_engine``) for every adapter that implements the
     cursor methods of ``SourceAdapter`` (SQL Server, Oracle, PostgreSQL; MySQL raises).
 
-    * control: ``cursor_column`` (monotonic: rowversion, identity, or an application-maintained
-      updated_at) and ``primary_key`` (rows are MERGEd by PK; a DB constraint enforces both);
+    * control: ``cursor_expression`` (one to three columns of one monotonic type: rowversion, identity,
+      or an application-maintained updated_at, folded with GREATEST / COALESCE), ``cursor_kind`` and ``primary_key`` (rows are MERGEd by PK; a DB constraint enforces both);
     * first cycle: capture ``hi`` BEFORE a full seed, checkpoint position = hi;
     * each cycle: ``hi'``; equal -> unchanged, else read ``(position, hi']`` (one source read),
       upsert-MERGE by PK, then advance to hi' (at-least-once; the MERGE is idempotent);
-    * position = JSON ``{col, type, value}`` (``cursor_engine.encode_position``) — a changed
-      ``cursor_column`` re-seeds;
+    * position = JSON ``{expr, kind, type, value}`` (``cursor_engine.encode_position``) — a changed
+      expression or kind re-seeds;
     * deletes are NOT captured (use a periodic ``full``).
     """
 

@@ -3,10 +3,10 @@ import planner
 import state_store as ss
 
 
-def _cfg(cid, db, table, host="h1", sl="id, v", load_type="cursor", col="updated_at"):
+def _cfg(cid, db, table, host="h1", sl="id, v", load_type="cursor", col="updated_at", kind="app_timestamp"):
     return {"id": cid, "src_host": host, "src_port": 1433, "src_database": db, "secret_key": f"k-{db}",
             "src_schema": "dbo", "src_table": table, "select_list": sl, "primary_key": "id",
-            "load_type": load_type, "cursor_column": col}
+            "load_type": load_type, "cursor_expression": col, "cursor_kind": kind}
 
 
 def _cp(v, phase=ss.INCREMENTAL, sl="id, v", strategy="full"):
@@ -18,9 +18,10 @@ def _cur_cfg(cid=1, col="updated_at", sl="id, v"):
     return _cfg(cid, "d1", "t", sl=sl, col=col)
 
 
-def _cur_cp(col="updated_at", value="2026-01-01T00:00:00", sl="id, v", phase=ss.INCREMENTAL, strategy="cursor"):
+def _cur_cp(expr="updated_at", value="2026-01-01T00:00:00", sl="id, v", phase=ss.INCREMENTAL, strategy="cursor",
+            kind="app_timestamp"):
     import cursor_engine
-    return {"position": cursor_engine.encode_position(col, "datetime2", value), "phase": phase,
+    return {"position": cursor_engine.encode_position(expr, kind, "datetime2", value), "phase": phase,
             "status": "ok", "select_list": sl, "strategy": strategy}
 
 
@@ -58,17 +59,16 @@ def test_cursor_routes_seed_then_increment():
     assert [p["route"] for p in plans] == ["cursor_seed"]
     plans = planner.route_tables([_cur_cfg()], {1: _cur_cp()})
     assert [p["route"] for p in plans] == ["cursor"]
-    assert plans[0]["position"] == {"col": "updated_at", "type": "datetime2", "value": "2026-01-01T00:00:00"}
+    assert plans[0]["position"] == {"expr": "updated_at", "kind": "app_timestamp", "type": "datetime2",
+                                    "value": "2026-01-01T00:00:00"}
 
 
 def test_cursor_reseeds_on_unusable_or_foreign_checkpoint():
     for cp in (_cur_cp(phase=ss.SEEDING),                        # reseed queued
                _cur_cp(strategy="full"),                         # load_type switched
                dict(_cur_cp(), position="12345"),                # not a cursor position
-               _cur_cp(col="other_col")):                        # cursor_column changed
+               dict(_cur_cp(), position='{"col": "updated_at", "type": "datetime2", "value": "1"}')):   # the old shape
         assert [p["route"] for p in planner.route_tables([_cur_cfg()], {1: cp})] == ["cursor_seed"], cp
-    plans = planner.route_tables([_cur_cfg(col="Updated_At")], {1: _cur_cp()})   # case-insensitive
-    assert [p["route"] for p in plans] == ["cursor"]
 
 
 def test_cursor_select_list_growth_routes_to_schema_reseed():
@@ -183,3 +183,26 @@ def test_freshness_interval_skips_quiet_rows_whose_stamp_is_recent():
     rows = [(1, 100, None), (2, 100, None), (3, 100, None), (4, 100, None), (5, 100, "id, v")]
     assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=now)] == [2, 3, 4, 5]
     assert planner.bulk_rows_to_write(rows, cps, 0) == rows
+
+
+# ---- expression cursor (US3) --------------------------------------------------------------------------
+
+def test_changed_expression_or_kind_routes_to_schema_reseed():
+    cfg = _cur_cfg()
+    assert planner.route_tables([cfg], {1: _cur_cp()})[0]["route"] == "cursor"
+    for cp in (_cur_cp(expr="GREATEST(updated_at, created_at)"), _cur_cp(expr="Updated_At"), _cur_cp(kind="db_timestamp")):
+        plan = planner.route_tables([cfg], {1: cp})[0]
+        assert plan["route"] == "schema_reseed" and plan["reason"] == "expression_change", cp
+
+
+def test_config_error_rejects_unimplemented_delete_modes_and_unknown_kinds():
+    ok = _cfg(1, "d1", "a")
+    assert planner.config_error(dict(ok, delete_mode="none")) is None
+    assert planner.config_error(dict(ok, delete_mode="pk_snapshot")) is None
+    for mode in ("soft_column", "full_compare"):
+        assert "not implemented" in planner.config_error(dict(ok, delete_mode=mode))
+    assert "delete_mode" in planner.config_error(dict(ok, delete_mode="bogus"))
+    assert "cursor_kind" in planner.config_error(dict(ok, cursor_kind="sequence"))
+    assert "cursor_kind" in planner.config_error(dict(ok, cursor_kind=None))
+    assert "cursor_expression" in planner.config_error(dict(ok, cursor_expression=None))
+    assert planner.config_error(dict(ok, load_type="full", cursor_expression=None, cursor_kind=None)) is None

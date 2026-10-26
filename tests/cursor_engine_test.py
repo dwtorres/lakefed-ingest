@@ -8,16 +8,23 @@ import pytest
 import cursor_engine as cur
 import source_adapters as sa
 
-CFG = {"src_schema": "dbo", "src_table": "orders", "cursor_column": "updated_at",
+CFG = {"src_schema": "dbo", "src_table": "orders", "cursor_expression": "[updated_at]", "cursor_kind": "app_timestamp",
        "select_list": "id, amount, updated_at", "primary_key": "id"}
-PG = {**CFG, "src_type": "postgresql", "src_schema": "public"}
-ORA = {**CFG, "src_type": "oracle", "src_schema": "hr"}
+PG = {**CFG, "src_type": "postgresql", "src_schema": "public", "cursor_expression": '"updated_at"'}
+ORA = {**CFG, "src_type": "oracle", "src_schema": "hr", "cursor_expression": '"updated_at"'}
 # (cfg, temporal type) per dialect; the numeric type by src_type.
 DIALECTS = [pytest.param(CFG, "datetime2", id="sqlserver"),
             pytest.param(ORA, "timestamp(6)", id="oracle"),
             pytest.param(PG, "timestamp without time zone", id="postgresql")]
 NUMERIC = {"sqlserver": "int", "oracle": "NUMBER", "postgresql": "integer"}
 BAD_TYPE = {"sqlserver": "float", "oracle": "VARCHAR2", "postgresql": "real"}
+
+
+@pytest.fixture(autouse=True)
+def _no_server_version_query(monkeypatch):
+    """The version lookup is one real source query (tests/source_io_test.py); here it is not under test."""
+    import source_io
+    monkeypatch.setattr(source_io, "server_version", lambda cfg, slots=None: None)
 
 
 @pytest.fixture(params=[pytest.param(d.values, id=d.id) for d in DIALECTS])
@@ -30,17 +37,13 @@ def _num(cfg):
     return NUMERIC[sa.for_cfg(cfg).src_type]
 
 
-def test_position_round_trip_and_garbage():
-    text = cur.encode_position("updated_at", "datetime2", "2026-01-01T10:00:00.1234567")
-    assert cur.decode_position(text) == {"col": "updated_at", "type": "datetime2",
-                                         "value": "2026-01-01T10:00:00.1234567"}
-    assert cur.decode_position(cur.encode_position("id", "int", None))["value"] is None
+def test_position_garbage_decodes_to_none():
     for bad in (None, "", "287493", "not json", '{"col": "x"}', "[1]"):
         assert cur.decode_position(bad) is None
 
 
 def test_type_lookup_sql_quotes_names():
-    sql = cur.column_type_sql(dict(CFG, src_table="odd]name", cursor_column="it's"))
+    sql = cur.column_type_sql(dict(CFG, src_table="odd]name", cursor_expression="[it's]"))
     assert "OBJECT_ID(N'[dbo].[odd]]name]')" in sql and "c.name IN (N'it''s')" in sql
 
 
@@ -91,14 +94,15 @@ def test_sqlserver_literals_pass_through_the_adapter():
 
 def test_read_where_bounds(dialect):
     cfg, _ = dialect
-    col, num = cur._col(cfg), _num(cfg)
+    num = _num(cfg)
+    col = cur._expr(cfg, num)
     assert cur.read_where(cfg, num, "10", "20", 600) == f"{col} > 10 AND {col} <= 20"
     assert cur.read_where(cfg, num, None, "20", 600) == f"{col} <= 20"   # empty at seed
 
 
 def test_temporal_lower_bound_is_pulled_back_by_the_lookback(dialect):
     cfg, typ = dialect
-    a, col = sa.for_cfg(cfg), cur._col(cfg)
+    a, col = sa.for_cfg(cfg), cur._expr(cfg, typ)
     where = cur.read_where(cfg, typ, "2026-01-01T10:00:00.1234567", "2026-01-01T11:00:00", 600)
     assert "2026-01-01T09:50:00.123456" in where            # 10 min back, 7th digit dropped
     assert where.endswith(f"<= {a.cursor_literal('2026-01-01T11:00:00', typ)}")
@@ -139,7 +143,7 @@ def test_postgres_cursor_sql():
 
 def test_temporal_cursor_still_reads_its_lookback_when_hi_is_unchanged(dialect):
     cfg, typ = dialect
-    pos = {"col": "updated_at", "type": typ, "value": "2026-01-01T10:00:00"}
+    pos = {"expr": "updated_at", "kind": "app_timestamp", "type": typ, "value": "2026-01-01T10:00:00"}
     assert cur.plan_increment(cfg, pos, "2026-01-01T10:00:00") == ("read", "2026-01-01T10:00:00", None)
     assert cur.plan_increment(cfg, pos, None) == ("unchanged", "2026-01-01T10:00:00", None)
     assert cur.plan_increment(cfg, {**pos, "type": _num(cfg), "value": "5"}, "5") == ("unchanged", "5", "inserts_only")
@@ -163,7 +167,7 @@ def test_upsert_merge_has_no_delete_branch():
 
 
 def test_plan_increment():
-    pos = {"col": "c", "type": "int", "value": "20"}
+    pos = {"expr": "c", "kind": "app_timestamp", "type": "int", "value": "20"}
     assert cur.plan_increment(CFG, pos, "20")[:2] == ("unchanged", "20")
     assert cur.plan_increment(CFG, pos, None)[:2] == ("unchanged", "20")          # source emptied: keep position
     assert cur.plan_increment(CFG, pos, "25")[:2] == ("read", "25")
@@ -173,6 +177,7 @@ def test_plan_increment():
 class _Rows:
     def __init__(self, rows): self._rows = rows
     def first(self): return self._rows[0] if self._rows else None
+    def collect(self): return list(self._rows)
 
 
 def test_column_type_lookup_errors_clearly(monkeypatch, dialect):
@@ -180,22 +185,22 @@ def test_column_type_lookup_errors_clearly(monkeypatch, dialect):
     import source_io
     monkeypatch.setattr(source_io, "_spark", lambda: None)
     monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([]))
-    with pytest.raises(ValueError, match=f"cursor_column 'updated_at' not found on {cfg['src_schema']}.orders"):
+    with pytest.raises(ValueError, match=f"cursor_expression column 'updated_at' not found on {cfg['src_schema']}.orders"):
         cur.column_type(cfg)
-    bad = {"type_name": BAD_TYPE[sa.for_cfg(cfg).src_type], "is_nullable": 0}
+    bad = {"column_name": "updated_at", "type_name": BAD_TYPE[sa.for_cfg(cfg).src_type], "is_nullable": 0}
     monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([bad]))
     with pytest.raises(ValueError, match="not supported"):
         cur.column_type(cfg)
-    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"type_name": typ.upper(), "is_nullable": 0}]))
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"column_name": "updated_at", "type_name": typ.upper(), "is_nullable": 0}]))
     assert cur.column_type(cfg) == typ.lower()
 
 
-def test_nullable_cursor_column_is_refused(monkeypatch, dialect):
+def test_nullable_cursor_input_is_refused(monkeypatch, dialect):
     # A NULL cursor value is never > lo, so such rows would be silently missed by every increment.
     cfg, typ = dialect
     import source_io
     monkeypatch.setattr(source_io, "_spark", lambda: None)
-    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"type_name": typ, "is_nullable": 1}]))
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"column_name": "updated_at", "type_name": typ, "is_nullable": 1}]))
     with pytest.raises(ValueError, match="is nullable"):
         cur.column_type(cfg)
     assert "AS is_nullable" in cur.column_type_sql(cfg) and cur.column_type_sql(cfg) in cur.nullable_sql(cfg)
@@ -364,23 +369,24 @@ def test_gap_4_hi_capped_at_source_clock_plus_skew(monkeypatch, cfg, typ):
 
 def test_gap_3_identity_reads_without_lookback(dialect):
     cfg, typ = dialect
-    num, col = _num(cfg), cur._col(cfg)
+    num = _num(cfg)
+    col = cur._expr(cfg, num)
     assert cur._kind(cfg, num) == "identity"
     assert cur.read_where(cfg, num, "10", "20", lookback_s=3600) == f"{col} > 10 AND {col} <= 20"
-    assert cur.plan_increment(cfg, {"col": "id", "type": num, "value": "10"}, "20") == ("read", "20", "inserts_only")
-    assert cur.plan_increment(cfg, {"col": "id", "type": num, "value": "10"}, "10") == ("unchanged", "10", "inserts_only")
-    temporal = {"col": "updated_at", "type": typ, "value": "2026-01-01T00:00:00"}
+    assert cur.plan_increment(cfg, {"expr": "id", "kind": "app_timestamp", "type": num, "value": "10"}, "20") == ("read", "20", "inserts_only")
+    assert cur.plan_increment(cfg, {"expr": "id", "kind": "app_timestamp", "type": num, "value": "10"}, "10") == ("unchanged", "10", "inserts_only")
+    temporal = {"expr": "updated_at", "kind": "app_timestamp", "type": typ, "value": "2026-01-01T00:00:00"}
     assert cur.plan_increment(cfg, temporal, "2026-01-01T00:00:00")[2] is None
 
 
 @pytest.mark.parametrize("typ,pos,hi", [("int", "20", "19"), ("rowversion", "20", "19"),
                                         ("datetime2", "2026-01-02T00:00:00", "2026-01-01T00:00:00")])
 def test_gap_8_hi_below_position_raises(typ, pos, hi):
-    position = {"col": "c", "type": typ, "value": pos}
+    position = {"expr": "c", "kind": "app_timestamp", "type": typ, "value": pos}
     with pytest.raises(ValueError, match="truncate or reload"):
         cur.plan_increment(CFG, position, hi)
     assert position["value"] == pos
-    assert cur.plan_increment(CFG, {"col": "c", "type": "int", "value": "9"}, "10")[:2] == ("read", "10")   # not text order
+    assert cur.plan_increment(CFG, {"expr": "c", "kind": "app_timestamp", "type": "int", "value": "9"}, "10")[:2] == ("read", "10")   # not text order
 
 
 @pytest.mark.parametrize("cfg,typ", DIALECTS)
@@ -401,7 +407,7 @@ def test_gap_7_tie_rows_land_in_later_window(cfg, typ):
 @pytest.mark.parametrize("cfg,typ", DIALECTS)
 def test_rows_below_cap_read_after_capped_hi(monkeypatch, cfg, typ):
     rows = {"late": "2099-01-01T00:00:00", "r1": "2026-10-26T10:03:00", "r2": "2026-10-26T10:08:00"}
-    pos = {"col": "updated_at", "type": typ, "value": "2026-10-26T10:00:00"}
+    pos = {"expr": "updated_at", "kind": "app_timestamp", "type": typ, "value": "2026-10-26T10:00:00"}
     _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
     hi, alert = cur.high_watermark(cfg, typ, skew_s=300)
     assert (hi, alert) == ("2026-10-26T10:05:00", True)
@@ -423,3 +429,93 @@ def test_rowversion_hi_stays_below_min_active_rowversion_and_reads_exact(cfg):
     assert "ELSE CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT) - 1 END" in sql and "src_now" not in sql
     assert cur.read_where(cfg, "rowversion", "10", "20", lookback_s=3600) == (
         "[updated_at] > CAST(CAST(10 AS BIGINT) AS BINARY(8)) AND [updated_at] <= CAST(CAST(20 AS BIGINT) AS BINARY(8))")
+
+
+# ---- expression cursor (US3: position shape, validation, seed_only windows) --------------------------
+THREE = "GREATEST(COALESCE(updated_at, DATE '1900-01-01'), COALESCE(created_at, DATE '1900-01-01'), closed_at)"
+
+
+def test_position_has_expr_kind_type_value():
+    text = cur.encode_position("GREATEST(a, b)", "db_timestamp", "datetime2", "2026-01-01T10:00:00.1234567")
+    assert cur.decode_position(text) == {"expr": "GREATEST(a, b)", "kind": "db_timestamp", "type": "datetime2",
+                                         "value": "2026-01-01T10:00:00.1234567"}
+    assert cur.decode_position(cur.encode_position("id", "identity", "int", None))["value"] is None
+    for missing in ('{"kind": "identity", "type": "int", "value": "1"}', '{"expr": "a", "type": "int", "value": "1"}',
+                    '{"expr": "a", "kind": "identity", "value": "1"}', '{"col": "a", "type": "int", "value": "1"}'):   # the old shape
+        assert cur.decode_position(missing) is None, missing
+    for typ in ("datetime", "smalldatetime"):
+        assert cur.decode_position(cur.encode_position("a", "app_timestamp", typ, "2026-01-01T10:00:00.1234567"))["value"] \
+            == "2026-01-01T10:00:00.123"
+
+
+def _types(cfg, nullable=(), **cols):
+    typ = {"sqlserver": "datetime2", "oracle": "TIMESTAMP(6)", "postgresql": "timestamp without time zone"}[sa.for_cfg(cfg).src_type]
+    return {c: (cols.get(c, typ), c in nullable) for c in ("updated_at", "created_at", "closed_at", "a", "b")}
+
+
+def test_gap_6_expression_validation(dialect):
+    cfg, typ = dialect
+    row = dict(cfg, cursor_expression=THREE, cursor_kind="db_timestamp")
+    assert cur.validate_expression(row, _types(cfg)) == typ.lower()                     # three columns
+    assert cur.validate_expression(dict(row, cursor_expression="updated_at"), _types(cfg)) == typ.lower()
+    with pytest.raises(ValueError, match="references 0 columns"):
+        cur.validate_expression(dict(row, cursor_expression="DATE '1900-01-01'"), _types(cfg))
+    with pytest.raises(ValueError, match="references 4 columns"):
+        cur.validate_expression(dict(row, cursor_expression="GREATEST(updated_at, created_at, closed_at, a)"), _types(cfg))
+    with pytest.raises(ValueError, match="mixes types") as mixed:
+        cur.validate_expression(row, _types(cfg, updated_at="int"))
+    assert "updated_at int" in str(mixed.value) and f"created_at {typ.lower()}" in str(mixed.value)   # names both
+    with pytest.raises(ValueError, match="'closed_at' .* is nullable"):
+        cur.validate_expression(row, _types(cfg, nullable=("closed_at",)))               # reject (default)
+    seed_only = dict(row, null_cursor_policy="seed_only")
+    assert cur.validate_expression(seed_only, _types(cfg, nullable=("closed_at",))) == typ.lower()
+    with pytest.raises(ValueError, match="rowversion .* one column"):
+        cur.validate_expression(dict(row, cursor_expression="GREATEST(a, b)", cursor_kind="rowversion"), _types(cfg))
+    with pytest.raises(ValueError, match="CAST.*only GREATEST and COALESCE"):
+        cur.validate_expression(dict(row, cursor_expression="CAST(updated_at AS DATE)"), _types(cfg))
+    assert cur.validate_expression(row) is None                                            # pure checks only, no types
+    with pytest.raises(ValueError, match="not found"):
+        cur.validate_expression(dict(row, cursor_expression="nope"), _types(cfg))
+
+
+def test_expression_columns_skip_literals_functions_and_keywords():
+    assert cur.expression_columns(THREE) == ["updated_at", "created_at", "closed_at"]
+    assert cur.expression_columns("COALESCE([it's], N'x''y', \"b\")") == ["it's", "b"]
+    assert cur.expression_columns("GREATEST(A, a)") == ["A"]
+
+
+def test_seed_only_increment_window_excludes_null_expression_rows(dialect):
+    cfg, typ = dialect
+    row = dict(cfg, cursor_expression=THREE, cursor_kind="db_timestamp", null_cursor_policy="seed_only")
+    where = cur.read_where(row, typ, "2026-01-01T10:00:00", "2026-01-01T11:00:00", 0)
+    rendered = cur._expr(row, typ)
+    assert where == f"{rendered} > {cur.literal(row, '2026-01-01T10:00:00', typ)} AND {rendered} <= {cur.literal(row, '2026-01-01T11:00:00', typ)}"
+    assert "COALESCE(updated_at, DATE '1900-01-01')" in rendered and "closed_at" in rendered
+    seed_sql = sa.for_cfg(row).select_sql(row)                                    # the seed reads every row
+    assert "WHERE" not in seed_sql.upper() and "closed_at >" not in seed_sql
+
+
+def test_sqlserver_greatest_renders_through_the_adapter_by_server_version():
+    row = dict(CFG, cursor_expression="GREATEST(a, b)")
+    assert cur._expr(row, "datetime2", server_version=16) == "GREATEST(a, b)"
+    assert cur._expr(row, "datetime2", server_version=15) == "CASE WHEN a >= b THEN a ELSE b END"
+    assert cur._expr(row, "datetime2") == "CASE WHEN a >= b THEN a ELSE b END"           # unknown version: the safe form
+    assert cur._expr(dict(row, cursor_expression="COALESCE(a, b)"), "datetime2") == "COALESCE(a, b)"
+    assert cur._expr(dict(row, cursor_expression="GREATEST(a, b) + GREATEST(a, b)"), "datetime2") == "GREATEST(a, b) + GREATEST(a, b)"
+    assert cur._expr(dict(ORA, cursor_expression="GREATEST(a, b)"), "DATE") == "GREATEST(a, b)"
+
+
+def test_column_type_validates_the_whole_expression(monkeypatch, dialect):
+    cfg, typ = dialect
+    import source_io
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    row = dict(cfg, cursor_expression=THREE, cursor_kind="db_timestamp")
+    rows = [{"column_name": c, "type_name": typ.upper(), "is_nullable": 0} for c in ("updated_at", "created_at", "closed_at")]
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows(rows))
+    assert cur.column_type(row) == typ.lower()
+    for c in ("updated_at", "created_at", "closed_at"):
+        assert c in cur.column_type_sql(row)
+    rows[2]["is_nullable"] = 1
+    with pytest.raises(ValueError, match="'closed_at' .* is nullable"):
+        cur.column_type(row)
+    assert cur.column_type(dict(row, null_cursor_policy="seed_only")) == typ.lower()

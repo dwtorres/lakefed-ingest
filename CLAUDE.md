@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 The repo holds a metadata-driven framework that ingests external databases into Databricks Delta
-tables, as one Databricks Asset Bundle (`lakefed_ingest_v2`, at the repo root: `databricks.yml`,
+tables, as one Databricks Asset Bundle (`lakefed_cursor`, at the repo root: `databricks.yml`,
 `resources/`, `src/lakefed_ingest/`, `tests/`). One job task per `task_collection`, in-process
 threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL
 Server, Oracle, PostgreSQL, MySQL) + load strategies (watermark cursor, full reload).
@@ -25,9 +25,10 @@ pytest tests/planner_test.py::test_name  # single test
 
 ### Deploy
 ```bash
+scripts/validate.sh -t <target> -p <profile>      # name test (no lakefed_ingest / edp names), then bundle validate
 databricks bundle deploy -t <target> -p <profile>
-databricks bundle run lakefed_ingest_setup -t <target> -p <profile>   # create the Lakebase schema (upgrades migrate on the next ingest run)
-databricks bundle run lakefed_ingest -t <target> -p <profile> --params task_collection=<name>
+databricks bundle run lakefed_cursor_setup -t <target> -p <profile>   # create the Lakebase schema (upgrades migrate on the next ingest run)
+databricks bundle run lakefed_cursor -t <target> -p <profile> --params task_collection=<name>
 ```
 
 ## The engine (repo root)
@@ -37,22 +38,25 @@ credentials (JSON `{user,password}`) from a secret scope named by `control.secre
 row with `use_remote_query`, `remote_query` through the UC connection in `src_connection` (no
 secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase_schema.md`.
 
-### Lakebase state (`src/lakefed_ingest/lakebase_schema.sql`, schema `lakefed_ingest`)
+### Lakebase state (`src/lakefed_ingest/lakebase_schema.sql`, schema `lakefed_cursor`)
 - `control` — one row per (source database, table): `task_collection`, `src_type` (source adapter:
   `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port` and `secret_key` (JDBC) or
   `src_connection` + `use_remote_query` (UC connection), `src_database`, `src_schema`,
   `src_table`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
   strategy: `cursor` (SQL Server, PostgreSQL; placeholder elsewhere) | `full`), partitioned-seed settings,
-  `cursor_column`, `jdbc_options` (JSON), `client_id` (optional: consolidated
-  sink shared by many source DBs; written to sink column `__client_id__`), `client_attrs` (JSON
-  {column: value}: identity columns written as STRING on every row), `write_mode` (`merge` only).
-  CHECK constraints enforce valid combos; a unique index allows one row per (sink, client_id).
-  The schema file still carries the CT, CDC and append columns until Phase 6 of
-  `specs/001-cursor-only-engine` drops them.
-- `checkpoint` — generic: `strategy` + `position` (text; JSON {col,type,value} for `cursor`), phase
-  (`seeding → incremental` for cursor, `loaded` for full), status, freshness.
+  `cursor_expression` (one SQL expression over 1 to 3 columns of one type, GREATEST / COALESCE only),
+  `cursor_kind` (`rowversion` | `db_timestamp` | `app_timestamp` | `identity`), `cursor_lookback_s`
+  (NULL = job parameter), `null_cursor_policy` (`reject` | `seed_only`), `delete_mode` (`none` |
+  `pk_snapshot`; `soft_column`, `full_compare` fail at plan), `delete_min_interval_s`, `jdbc_options`
+  (JSON), `client_id` (optional: consolidated sink shared by many source DBs; written to sink column
+  `__client_id__`), `client_attrs` (JSON {column: value}: identity columns written as STRING on every
+  row). CHECK constraints (`contracts/control_row.md`) enforce valid combos; a unique index allows one
+  row per (sink, client_id).
+- `checkpoint` — `strategy` + `position` (text; JSON {expr,kind,type,value} for `cursor`, see
+  `contracts/position.md`; a changed `expr` or `kind` reseeds), phase (`seeding → incremental` for
+  cursor, `loaded` for full), status, freshness, `last_delete_snapshot_at`.
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
-  (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
+  (default catalog `lakefed_cursor_lakebase`) for DBSQL monitoring.
 - DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
   when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
   transaction, split on `;` — no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be
@@ -64,7 +68,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   (docs/lakebase_schema.md, "Changing the schema").
 
 ### Jobs (`resources/`)
-- `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
+- `lakefed_cursor` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
   `task_collection`, `parallelism` (single budget of concurrent query units), `secret_scope`,
   `detection_chunk` (unused since Change Tracking left), `trust_server_certificate`,
   `max_seeds_per_run` (seed budget, 0 = none),
@@ -75,7 +79,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `cursor_lookback_s` (temporal cursor: seconds `lo` is pulled back; row `cursor_lookback_s` overrides),
   `cursor_skew_s` (temporal cursor: `hi` is capped at the source clock plus this), `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
-- `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
+- `lakefed_cursor_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
 

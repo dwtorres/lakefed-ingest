@@ -1,10 +1,9 @@
-# Databricks asset bundle for lakefed_ingest (default version): ingestion that sweeps many tables per
-# job task on cluster compute, with control / checkpoint / telemetry state in Lakebase.
-# The original task-orchestrated (DBSQL warehouse) version is a separate bundle in job_orchestration/.
+# Databricks asset bundle for lakefed_cursor: cursor-only ingestion that sweeps many tables per job
+# task on cluster compute, with control / checkpoint / telemetry state in Lakebase (schema lakefed_cursor).
+# Own names (constitution IX): no resource reuses a lakefed_ingest or edp name; scripts/validate.sh checks.
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
 bundle:
-  name: lakefed_ingest_v2
-  uuid: bcc77784-ecf3-4a61-9436-2f404328a013
+  name: lakefed_cursor
 
 include:
   - resources/*.yml
@@ -28,20 +27,20 @@ variables:
   # State (Lakebase) and credentials.
   lakebase_instance:
     description: Lakebase instance holding control, checkpoint, and telemetry state.
-    default: lakefed-ingest
+    default: lakefed-cursor
   lakebase_capacity:
     description: Lakebase instance size (CU_1, CU_2, CU_4 or CU_8). Size up for collections of hundreds of thousands of tables, or many collections sweeping at once.
     default: CU_1
   lakebase_database:
     description: Postgres database on the Lakebase instance.
-    default: lakefed_ingest
+    default: databricks_postgres
   lakebase_catalog:
     description: Unity Catalog catalog the Lakebase database is registered as (for DBSQL monitoring).
-    default: lakefed_ingest_lakebase
+    default: lakefed_cursor_lakebase
   secret_scope:
     description: Secret scope holding per-database source credentials (may be Azure Key Vault-backed).
-    default: lakefed_ingest
-  # Defaults of the ingestion job's tuning parameters (resources/lakefed_ingest.yml explains each); a
+    default: lakefed-cursor
+  # Defaults of the ingestion job's tuning parameters (resources/lakefed_cursor.yml explains each); a
   # run can still override them.
   parallelism:
     description: Units of query work running at once in one run.

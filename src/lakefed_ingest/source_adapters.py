@@ -151,7 +151,7 @@ class SourceAdapter:
                                                             | self.rowversion_types)))
 
     def _type_error(self, type_name, supported) -> str:
-        return (f"cursor_column type '{type_name}' is not supported for load_type 'cursor' on src_type "
+        return (f"cursor type '{type_name}' is not supported for load_type 'cursor' on src_type "
                 f"'{self.src_type}' (supported: {', '.join(supported)})")
 
     def max_text_sql(self, expr: str, type_name: str) -> str:
