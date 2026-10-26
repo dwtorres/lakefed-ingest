@@ -1,5 +1,7 @@
-"""Cursor (high-watermark) strategy, SQL Server: incremental reads on a monotonically increasing
-column (``control.cursor_column``), MERGEd into the Delta sink by PK.
+"""Cursor (high-watermark) strategy: incremental reads on a monotonically increasing column
+(``control.cursor_column``), MERGEd into the Delta sink by PK. Every dialect difference (type
+lookup, clock, text rendering, literals) is a ``SourceAdapter`` method; this module never branches on
+``src_type``.
 
 Per cycle, for a seeded table (checkpoint phase ``incremental``):
   1. ``hi`` = the column's current high watermark (one small source query);
@@ -10,8 +12,9 @@ Per cycle, for a seeded table (checkpoint phase ``incremental``):
 The seed captures ``hi`` BEFORE the full copy, so rows written during the seed are re-read by the
 first increment (no gap).
 
-Supported column types (SQL Server system type of ``cursor_column``), by kind:
-  * ``identity``: tinyint, smallint, int, bigint, decimal, numeric (identity keys / sequences). A
+Supported column types (``SourceAdapter.type_class_of`` of ``cursor_column``; SQL Server names shown,
+see each adapter for its own), by kind:
+  * ``identity`` (type class ``numeric``): tinyint, smallint, int, bigint, decimal, numeric (identity keys / sequences). A
     value is taken at insert, not at commit, so a late commit below a read ``hi`` is lost: the kind
     is inserts-only (``plan_increment`` says so) and reads exact bounds;
   * ``temporal``: date, smalldatetime, datetime, datetime2, datetimeoffset (an application-maintained
@@ -31,7 +34,7 @@ never moves backwards.
 
 Position (``checkpoint.position``, text) is JSON ``{"col", "type", "value"}``: the column and its
 type are recorded so a changed ``cursor_column`` re-seeds and every later cycle needs no type
-lookup. ``value`` is the SQL Server string form (ISO 8601 for temporal, decimal text otherwise).
+lookup. ``value`` is canonical source text (ISO 8601 for temporal, decimal text otherwise).
 
 Pure builders are unit-tested in tests/cursor_engine_test.py; source access reuses ``source_io``
 (one slot per query unit, lazy Spark imports) and sink writes reuse ``sink_writer``.
@@ -50,30 +53,18 @@ import sink_writer
 import source_adapters
 import source_io
 
-# SQL Server names (TYPE_NAME) and PostgreSQL names (information_schema.columns.data_type, which
-# never reports a bare 'timestamp' — that name stays SQL Server's rowversion alias).
-IDENTITY_TYPES = {"tinyint", "smallint", "int", "integer", "bigint", "decimal", "numeric"}
-TEMPORAL_TYPES = {"date", "smalldatetime", "datetime", "datetime2", "datetimeoffset",
-                  "timestamp without time zone", "timestamp with time zone"}
-ROWVERSION_TYPES = {"timestamp", "rowversion"}  # TYPE_NAME(system_type_id) reports 'timestamp'
-SUPPORTED_TYPES = IDENTITY_TYPES | TEMPORAL_TYPES | ROWVERSION_TYPES
-MILLISECOND_TYPES = {"datetime", "smalldatetime"}   # CONVERT(..., 126) takes at most 3 fractional digits
-
 _NUMERIC_VALUE = re.compile(r"^-?\d+(\.\d+)?$")
 _TEMPORAL_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,7})?)?)?([+-]\d{2}:\d{2}|Z)?$")
 _INTEGER_VALUE = re.compile(r"^-?\d+$")
+_VALUE_SHAPES = {"identity": (_NUMERIC_VALUE, "numeric"), "temporal": (_TEMPORAL_VALUE, "temporal"),
+                 "rowversion": (_INTEGER_VALUE, "rowversion")}
 
 
-def _kind(typ: str) -> str:
-    t = (typ or "").strip().lower()
-    if t in IDENTITY_TYPES:
-        return "identity"
-    if t in TEMPORAL_TYPES:
-        return "temporal"
-    if t in ROWVERSION_TYPES:
-        return "rowversion"
-    raise ValueError(f"cursor_column type '{typ}' is not supported for load_type 'cursor' "
-                     f"(supported: {', '.join(sorted(SUPPORTED_TYPES - {'rowversion'}))} / rowversion)")
+def _kind(cfg: dict, typ: str) -> str:
+    """Cursor kind of a source type (``SourceAdapter.type_class_of``): the ``numeric`` class is the
+    ``identity`` kind (inserts-only semantics), ``temporal`` and ``rowversion`` keep their names."""
+    cls = source_adapters.for_cfg(cfg).type_class_of(typ)
+    return "identity" if cls == "numeric" else cls
 
 
 # ---- position --------------------------------------------------------------------------------------
@@ -95,101 +86,47 @@ def decode_position(text: Optional[str]) -> Optional[dict]:
     return {"col": d["col"], "type": d["type"], "value": d.get("value")}
 
 
-# ---- SQL builders (pure) ---------------------------------------------------------------------------
-
-def _obj(cfg: dict) -> str:
-    return source_io.quote_nstr(f"{source_io.quote_ident(cfg['src_schema'])}.{source_io.quote_ident(cfg['src_table'])}")
-
-
-def _is_pg(cfg: dict) -> bool:
-    return source_adapters.for_cfg(cfg).src_type == source_adapters.POSTGRESQL
-
+# ---- SQL builders (pure; every dialect difference is a SourceAdapter method) ----------------------
 
 def _col(cfg: dict) -> str:
     """``cursor_column`` quoted for the source dialect."""
-    a = source_adapters.for_cfg(cfg)
-    return a.quote_ident(cfg["cursor_column"]) if _is_pg(cfg) else source_io.quote_ident(cfg["cursor_column"])
-
-
-def _pg_column_where(cfg: dict) -> str:
-    q = source_adapters.for_cfg(cfg).quote_str
-    return (f"FROM information_schema.columns WHERE table_schema = {q(cfg['src_schema'])} "
-            f"AND table_name = {q(cfg['src_table'])} AND column_name = {q(cfg['cursor_column'])}")
+    return source_adapters.for_cfg(cfg).quote_ident(cfg["cursor_column"])
 
 
 def column_type_sql(cfg: dict) -> str:
-    """System type name and nullability of ``cursor_column`` (no row when the column doesn't exist)."""
-    if _is_pg(cfg):
-        return f"SELECT data_type AS typ, (is_nullable = 'YES') AS nullable {_pg_column_where(cfg)}"
-    return ("SELECT TYPE_NAME(c.system_type_id) AS typ, c.is_nullable AS nullable FROM sys.columns c "
-            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {source_io.quote_nstr(cfg['cursor_column'])}")
+    """One row ``column_name``, ``type_name``, ``is_nullable`` (0/1) of ``cursor_column`` (no row when
+    the column doesn't exist)."""
+    return source_adapters.for_cfg(cfg).cursor_type_sql(cfg["src_schema"], cfg["src_table"], [cfg["cursor_column"]])
 
 
 def nullable_sql(cfg: dict) -> str:
     """Scalar subquery: 1 if ``cursor_column`` is nullable (checked on every run, not just at seed —
     a column can be altered to NULL after the table was seeded)."""
-    if _is_pg(cfg):
-        return f"(SELECT CASE WHEN is_nullable = 'YES' THEN 1 ELSE 0 END {_pg_column_where(cfg)})"
-    return ("(SELECT CAST(c.is_nullable AS INT) FROM sys.columns c "
-            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {source_io.quote_nstr(cfg['cursor_column'])})")
-
-
-_PG_ISO = "'YYYY-MM-DD\"T\"HH24:MI:SS.US'"
+    return f"(SELECT is_nullable FROM ({column_type_sql(cfg)}) t)"
 
 
 def high_watermark_sql(cfg: dict, typ: str) -> str:
     """One row ``hi``, ``nullable`` (and ``src_now`` for a temporal kind): the cursor column's high
-    watermark as source text (NULL on an empty table), its nullability, and the source clock in the
-    same rendering as ``hi`` (one query per run for all). rowversion is capped below
-    MIN_ACTIVE_ROWVERSION() so open transactions are never skipped. PostgreSQL emits ISO 8601 via
-    to_char; a timestamptz is rendered in UTC with an explicit offset so the literal round-trips
-    whatever the session time zone is."""
-    col = _col(cfg)
-    kind = _kind(typ)
-    mx = f"MAX({col})"
-    if _is_pg(cfg):
-        a = source_adapters.for_cfg(cfg)
-        table = a.table_ref(cfg['src_schema'], cfg['src_table'])
-        if kind == "identity":
-            render, clock = (lambda e: f"{e}::text"), None
-        elif "with time zone" in typ.lower():
-            render, clock = (lambda e: f"to_char({e} AT TIME ZONE 'UTC', {_PG_ISO}) || '+00:00'"), "now()"
-        else:
-            render, clock = (lambda e: f"to_char({e}, {_PG_ISO})"), "LOCALTIMESTAMP"
-    else:
-        table = source_io.quote_ident(cfg["src_schema"]) + "." + source_io.quote_ident(cfg["src_table"])
-        if kind == "identity":
-            render, clock = (lambda e: f"CONVERT(VARCHAR(64), {e})"), None
-        elif kind == "temporal":
-            render = lambda e: f"CONVERT(VARCHAR(64), {e}, 126)"
-            clock = "SYSDATETIMEOFFSET()" if typ.strip().lower() == "datetimeoffset" else "SYSDATETIME()"
-        else:
-            mar = "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
-            render, clock = (lambda e: f"CONVERT(VARCHAR(20), CASE WHEN CAST({e} AS BIGINT) < {mar} "
-                                       f"THEN CAST({e} AS BIGINT) ELSE {mar} - 1 END)"), None
-    src_now = f", {render(clock)} AS src_now" if kind == "temporal" else ""
-    return f"SELECT {render(mx)} AS hi, {nullable_sql(cfg)} AS nullable{src_now} FROM {table}"
+    watermark as canonical source text (NULL on an empty table), its nullability, and the source clock
+    in the same rendering as ``hi`` (one query per run for all). The adapter renders the text
+    (``max_text_sql``: ISO 8601 for temporal, decimal text otherwise; SQL Server caps a rowversion
+    below MIN_ACTIVE_ROWVERSION() so open transactions are never skipped)."""
+    a = source_adapters.for_cfg(cfg)
+    src_now = ""
+    if _kind(cfg, typ) == "temporal":
+        src_now = f", {a.cursor_text_sql(a.source_now_sql(typ), typ)} AS src_now"
+    return (f"SELECT {a.max_text_sql(_col(cfg), typ)} AS hi, {nullable_sql(cfg)} AS nullable{src_now} "
+            f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}")
 
 
-def literal(value: str, typ: str, pg: bool = False) -> str:
+def literal(cfg: dict, value: str, typ: str) -> str:
     """A typed source literal for a position value (validated — values come from our own
-    checkpoint, but are never spliced unchecked). ``pg``: PostgreSQL CAST form."""
-    kind = _kind(typ)
+    checkpoint, but are never spliced unchecked)."""
+    pattern, what = _VALUE_SHAPES[_kind(cfg, typ)]
     v = str(value).strip()
-    if kind == "identity":
-        if not _NUMERIC_VALUE.match(v):
-            raise ValueError(f"invalid numeric cursor position {value!r}")
-        return v
-    if kind == "temporal":
-        if not _TEMPORAL_VALUE.match(v):
-            raise ValueError(f"invalid temporal cursor position {value!r}")
-        v = _trim_fraction(v, typ)
-        if pg:
-            return f"CAST('{v}' AS {typ.strip().lower()})"
-        return f"CONVERT({typ.strip().lower()}, {source_io.quote_nstr(v)}, 126)"
-    if not _INTEGER_VALUE.match(v):
-        raise ValueError(f"invalid rowversion cursor position {value!r}")
-    return f"CAST(CAST({v} AS BIGINT) AS BINARY(8))"
+    if not pattern.match(v):
+        raise ValueError(f"invalid {what} cursor position {value!r}")
+    return source_adapters.for_cfg(cfg).cursor_literal(v, typ)
 
 
 def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str, lookback_s: int) -> str:
@@ -200,13 +137,13 @@ def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str, lookback_s: int)
     after a read whose ``hi`` is above it. The lower bound is pulled back by ``lookback_s`` for
     temporal kinds (the MERGE makes the re-read harmless); rowversion and identity stay exact (an
     identity is inserts-only: a late commit below ``hi`` is lost whatever the lookback)."""
-    col, pg = _col(cfg), _is_pg(cfg)
-    upper = f"{col} <= {literal(hi, typ, pg)}"
+    col = _col(cfg)
+    upper = f"{col} <= {literal(cfg, hi, typ)}"
     if lo is None:
         return upper
-    if _kind(typ) == "temporal":
-        lo = _minus_seconds(lo, lookback_s, typ)
-    return f"{col} > {literal(lo, typ, pg)} AND {upper}"
+    if _kind(cfg, typ) == "temporal":
+        lo = _minus_seconds(lo, lookback_s)
+    return f"{col} > {literal(cfg, lo, typ)} AND {upper}"
 
 
 def lookback_seconds(cfg: dict, default_s: int) -> int:
@@ -215,38 +152,31 @@ def lookback_seconds(cfg: dict, default_s: int) -> int:
     return default_s if row is None else int(row)
 
 
-def seed_position(typ: str, hi: Optional[str], seed_seconds: float) -> Optional[str]:
+def seed_position(cfg: dict, typ: str, hi: Optional[str], seed_seconds: float) -> Optional[str]:
     """The position to record after a seed. ``hi`` was captured before the copy; a temporal cursor
     can still gain rows BELOW ``hi`` that commit while the copy runs (their timestamp predates the
     capture), so the recorded position is pulled back by the seed's duration and the first increment
     re-reads that span. Numeric and rowversion keep ``hi``."""
-    if hi is None or _kind(typ) != "temporal":
+    if hi is None or _kind(cfg, typ) != "temporal":
         return hi
-    return _minus_seconds(hi, int(seed_seconds) + 1, typ)
+    return _minus_seconds(hi, int(seed_seconds) + 1)
 
 
-def _trim_fraction(value: str, typ: str) -> str:
-    """At most 3 fractional digits for datetime / smalldatetime, else 6 (``fromisoformat`` and
-    PostgreSQL take at most 6; a 100 ns loss on a bound that is already pulled back by minutes)."""
-    digits = 3 if (typ or "").strip().lower() in MILLISECOND_TYPES else 6
-    return re.sub(r"(\.\d{%d})\d+" % digits, r"\1", value)
-
-
-def _minus_seconds(value: str, seconds: int, typ: str = "") -> str:
+def _minus_seconds(value: str, seconds: int) -> str:
     """``value`` (ISO 8601, as the source returned it) minus ``seconds`` (negative: plus), in the same
-    ISO form, with the fraction trimmed for ``typ`` (``_trim_fraction``). A ``date`` column gains at
-    most one day from this (a date carries no commit order anyway)."""
+    ISO form with at most 6 fractional digits (``fromisoformat`` takes at most 6; a 100 ns loss on a
+    bound that is already pulled back by minutes; the adapter's literal trims further for its type).
+    A ``date`` column gains at most one day from this (a date carries no commit order anyway)."""
     v = str(value).strip()
     if not _TEMPORAL_VALUE.match(v):
         raise ValueError(f"invalid temporal cursor position {value!r}")
-    v = _trim_fraction(v, "").replace("Z", "+00:00")
-    return _trim_fraction((datetime.fromisoformat(v) - timedelta(seconds=seconds)).isoformat(), typ)
+    return (_parse("temporal", v) - timedelta(seconds=seconds)).isoformat()
 
 
 def _parse(kind: str, value: str):
     """A comparable Python value for a position / watermark text of ``kind``."""
     if kind == "temporal":
-        return datetime.fromisoformat(_trim_fraction(str(value).strip(), "").replace("Z", "+00:00"))
+        return datetime.fromisoformat(source_adapters.trim_fraction(str(value).strip(), 6).replace("Z", "+00:00"))
     return Decimal(str(value).strip())
 
 
@@ -266,19 +196,19 @@ def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
 # ---- source access ---------------------------------------------------------------------------------
 
 def column_type(cfg: dict, slots=None) -> str:
-    """The cursor column's SQL Server type; raises a clear error if missing, unsupported or nullable.
+    """The cursor column's source type name; raises a clear error if missing, unsupported or nullable.
 
     A nullable cursor column is refused: incremental reads select ``col > lo AND col <= hi``, so a
     row whose cursor value is NULL would never be read (the seed copies it, later changes to it
     would be silently missed)."""
     with source_io._unit(slots, cfg):
         row = source_io._read(source_io._spark(), cfg, column_type_sql(cfg)).first()
-    if row is None or row["typ"] is None:
+    if row is None or row["type_name"] is None:
         raise ValueError(f"cursor_column '{cfg['cursor_column']}' not found on "
                          f"{cfg['src_schema']}.{cfg['src_table']}")
-    typ = str(row["typ"]).lower()
-    _kind(typ)
-    _refuse_nullable(cfg, row["nullable"])
+    typ = str(row["type_name"]).lower()
+    _kind(cfg, typ)
+    _refuse_nullable(cfg, row["is_nullable"])
     return typ
 
 
@@ -300,9 +230,9 @@ def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Option
         return None, False
     _refuse_nullable(cfg, row["nullable"])
     hi = str(row["hi"])
-    if _kind(typ) != "temporal":
+    if _kind(cfg, typ) != "temporal":
         return hi, False
-    cap = _minus_seconds(str(row["src_now"]), -int(skew_s), typ)
+    cap = _minus_seconds(str(row["src_now"]), -int(skew_s))
     if _parse("temporal", hi) > _parse("temporal", cap):
         return cap, True
     return hi, False
@@ -328,7 +258,7 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
     return None
 
 
-def plan_increment(position: dict, hi: Optional[str]) -> Tuple[str, Optional[str], Optional[str]]:
+def plan_increment(cfg: dict, position: dict, hi: Optional[str]) -> Tuple[str, Optional[str], Optional[str]]:
     """('unchanged' | 'read', new position value, note). An empty source (hi NULL) means nothing to
     read; the position is kept (never moved to NULL). hi equal to the checkpoint is unchanged for
     identity and rowversion kinds; a temporal cursor still reads its lookback window, because a row
@@ -336,7 +266,7 @@ def plan_increment(position: dict, hi: Optional[str]) -> Tuple[str, Optional[str
     that row until its next change). The note is ``inserts_only`` for an identity cursor (the worker
     logs it once per run per table). A ``hi`` below the position is a source truncate or reload:
     the table fails and the position stays."""
-    kind = _kind(position.get("type"))
+    kind = _kind(cfg, position.get("type"))
     note = "inserts_only" if kind == "identity" else None
     value = position.get("value")
     if hi is None:

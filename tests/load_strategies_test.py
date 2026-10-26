@@ -21,7 +21,7 @@ def test_supported_is_cursor_and_full_only():
         assert not ls.supported("sqlserver", lt)
     assert ls.support_matrix() == {
         "sqlserver":  {"cursor": "yes",         "full": "yes"},
-        "oracle":     {"cursor": "placeholder", "full": "yes"},
+        "oracle":     {"cursor": "yes",         "full": "yes"},
         "postgresql": {"cursor": "yes",         "full": "yes"},
         "mysql":      {"cursor": "placeholder", "full": "yes"},
     }
@@ -37,12 +37,12 @@ def test_pk_requirements():
     assert ls.get_strategy("cursor").requires_pk and not ls.get_strategy("full").requires_pk
 
 
-def test_cursor_runs_on_sqlserver_and_postgres_with_placeholders_elsewhere():
+def test_cursor_runs_where_the_adapter_implements_it():
     assert ls.supported("sqlserver", "cursor") and ls.get_strategy("cursor").implemented
-    assert ls.supported("postgresql", "cursor")
-    for st in ("oracle", "mysql"):
-        assert ls.unsupported_reason(st, "cursor") == \
-            f"load_type 'cursor' is not implemented yet (src_type '{st}')"
+    assert ls.supported("oracle", "cursor") and ls.supported("postgresql", "cursor")
+    reason = ls.unsupported_reason("mysql", "cursor")
+    assert "load_type 'cursor' is not implemented for src_type 'mysql'" in reason
+    assert "MySqlAdapter" in reason and "NotImplementedError" in reason
 
 
 def test_cursor_position_round_trip():

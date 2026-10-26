@@ -8,9 +8,9 @@ only by the strategy that wrote it.
 =========  ============================================================  ==========================
 load_type  behaviour                                                     position
 =========  ============================================================  ==========================
-cursor     High-watermark column (SQL Server, PostgreSQL; placeholder      JSON {col, type, value}
-           elsewhere): seed, then (position, hi] reads upsert-MERGEd by
-           PK; no deletes
+cursor     High-watermark column (every adapter with cursor methods:        JSON {col, type, value}
+           SQL Server, Oracle, PostgreSQL): seed, then (position, hi]
+           reads upsert-MERGEd by PK; no deletes
 full       Reload the whole table every cycle (data-only atomic replace;  NULL (not resumable)
            partitioned tables use the staged swap). No PK required
 =========  ============================================================  ==========================
@@ -58,8 +58,8 @@ class FullStrategy(LoadStrategy):
 
 
 class CursorStrategy(LoadStrategy):
-    """Cursor (high-watermark) increments — implemented for SQL Server in ``cursor_engine``; other
-    adapters are placeholders (they need their own type lookup / high-watermark / literal SQL).
+    """Cursor (high-watermark) increments (``cursor_engine``) for every adapter that implements the
+    cursor methods of ``SourceAdapter`` (SQL Server, Oracle, PostgreSQL; MySQL raises).
 
     * control: ``cursor_column`` (monotonic: rowversion, identity, or an application-maintained
       updated_at) and ``primary_key`` (rows are MERGEd by PK; a DB constraint enforces both);
@@ -85,14 +85,16 @@ class CursorStrategy(LoadStrategy):
 
 _STRATEGIES = {s.name: s for s in (FullStrategy(), CursorStrategy())}
 
-# (src_type, load_type) pairs that run today. FULL works for every adapter; CURSOR runs on SQL
-# Server and PostgreSQL. PLACEHOLDER pairs are planned (clear "not implemented yet" error);
-# anything else is "not supported".
-SUPPORT = {
-    (sa.SQLSERVER, FULL), (sa.SQLSERVER, CURSOR),
-    (sa.ORACLE, FULL), (sa.POSTGRESQL, FULL), (sa.POSTGRESQL, CURSOR), (sa.MYSQL, FULL),
-}
-PLACEHOLDER = {(sa.ORACLE, CURSOR), (sa.MYSQL, CURSOR)}
+def _implements_cursor(adapter: sa.SourceAdapter) -> bool:
+    return type(adapter).cursor_type_sql is not sa.SourceAdapter._cursor_not_implemented
+
+
+# (src_type, load_type) pairs that run today. FULL works for every adapter; CURSOR runs where the
+# adapter implements the cursor methods. PLACEHOLDER pairs are planned (clear "not implemented"
+# error); anything else is "not supported".
+SUPPORT = {(st, FULL) for st in sa.SRC_TYPES} | {
+    (st, CURSOR) for st in sa.SRC_TYPES if _implements_cursor(sa.get_adapter(st))}
+PLACEHOLDER = {(st, CURSOR) for st in sa.SRC_TYPES} - SUPPORT
 
 
 def get_strategy(load_type: Optional[str]) -> LoadStrategy:
@@ -118,7 +120,10 @@ def unsupported_reason(src_type: Optional[str], load_type: Optional[str]) -> Opt
         return str(e)
     if (adapter.src_type, strategy.name) in SUPPORT:
         return None
-    if not strategy.implemented or (adapter.src_type, strategy.name) in PLACEHOLDER:
+    if (adapter.src_type, strategy.name) in PLACEHOLDER:
+        return (f"load_type '{strategy.name}' is not implemented for src_type '{adapter.src_type}': "
+                f"{type(adapter).__name__} raises NotImplementedError from its cursor methods")
+    if not strategy.implemented:
         return f"load_type '{strategy.name}' is not implemented yet (src_type '{adapter.src_type}')"
     ok = sorted(lt for st, lt in SUPPORT if st == adapter.src_type)
     return (f"load_type '{strategy.name}' is not supported for src_type '{adapter.src_type}' "

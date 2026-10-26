@@ -76,7 +76,7 @@ def ingest_one(plan, run_id, deps, attempt=0):
             rows_merged = seeded if isinstance(seeded, int) else None
             stage = "checkpoint"
             assert_lock_held()
-            hi = cursor_engine.seed_position(typ, hi, time.monotonic() - seed_started)  # temporal: pulled back by the seed duration
+            hi = cursor_engine.seed_position(cfg, typ, hi, time.monotonic() - seed_started)  # temporal: pulled back by the seed duration
             store.advance_checkpoint(cfg, position=cursor_engine.encode_position(cfg["cursor_column"], typ, hi),
                                      phase=ss.INCREMENTAL, detail=_detail("seed complete", alert),
                                      select_list=cfg["select_list"])
@@ -87,7 +87,7 @@ def ingest_one(plan, run_id, deps, attempt=0):
             stage = "read"
             hi, alert = cursor_engine.high_watermark(cfg, pos["type"], deps.params["cursor_skew_s"], slots=slots)  # BEFORE the read
             _log_alert(log, alert, db, schema, table)
-            decision, new_value, note = cursor_engine.plan_increment(pos, hi)
+            decision, new_value, note = cursor_engine.plan_increment(cfg, pos, hi)
             if note and attempt == 0:
                 log(f"[{note}] {db}.{schema}.{table}: an identity cursor captures inserts only")
             if decision == "read":

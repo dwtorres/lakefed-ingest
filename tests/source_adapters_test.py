@@ -120,3 +120,114 @@ def test_jdbc_options_cannot_override_framework_options():
 def test_remote_query_names_the_database_per_engine():
     assert [sa.get_adapter(t).remote_database_option for t in sa.SRC_TYPES] == [
         "database", "service_name", "database", "database"]      # sqlserver, oracle, postgresql, mysql
+
+
+# ---- cursor methods (contracts/source_adapter.md) ------------------------------------------------
+
+CURSOR_DIALECTS = [pytest.param("sqlserver", "datetime2", id="sqlserver"),
+                   pytest.param("oracle", "TIMESTAMP(6)", id="oracle")]
+CURSOR_METHODS = ("cursor_type_sql", "type_class_of", "source_now_sql", "max_batch_sql", "cursor_literal",
+                  "minus_seconds_sql", "greatest_expr", "server_version_sql", "pk_snapshot_sql",
+                  "cursor_text_sql", "max_text_sql")
+
+
+@pytest.mark.parametrize("src_type,typ", CURSOR_DIALECTS)
+def test_cursor_type_sql_lists_the_columns(src_type, typ):
+    sql = sa.get_adapter(src_type).cursor_type_sql("hr", "emp", ["upd", "o'c"])
+    assert "column_name" in sql and "AS type_name" in sql and "AS is_nullable" in sql
+    assert "o''c" in sql and sql.count("upd") == 1
+    assert ("sys.columns" in sql) == (src_type == "sqlserver") and ("all_tab_columns" in sql) == (src_type == "oracle")
+    assert "information_schema.columns" in sa.get_adapter("postgresql").cursor_type_sql("s", "t", ["c"])
+
+
+def test_type_class_of_per_dialect():
+    ss, ora = sa.get_adapter("sqlserver"), sa.get_adapter("oracle")
+    assert ss.type_class_of("rowversion") == ss.type_class_of("timestamp") == "rowversion"
+    assert ss.type_class_of("bigint") == "numeric" and ss.type_class_of(" DateTime2 ") == "temporal"
+    assert ora.type_class_of("NUMBER") == ora.type_class_of("NUMBER(10,0)") == ora.type_class_of("number(,0)") == "numeric"
+    assert ora.type_class_of("TIMESTAMP(6)") == ora.type_class_of("DATE") == "temporal"
+    assert ora.type_class_of("TIMESTAMP(6) WITH TIME ZONE") == "temporal"
+    pg = sa.get_adapter("postgresql")
+    assert pg.type_class_of("timestamp without time zone") == "temporal" and pg.type_class_of("integer") == "numeric"
+    for adapter, bad in ((ss, "float"), (ss, "nvarchar"), (ora, "NUMBER(10,2)"), (ora, "VARCHAR2"), (ora, "FLOAT"),
+                         (pg, "timestamp"), (pg, "real")):
+        with pytest.raises(ValueError, match="not supported for load_type 'cursor'"):
+            adapter.type_class_of(bad)
+
+
+def test_source_now_sql_matches_the_cursor_type():
+    ss, ora, pg = (sa.get_adapter(t) for t in ("sqlserver", "oracle", "postgresql"))
+    assert ss.source_now_sql("datetime2") == "SYSUTCDATETIME()"
+    assert "SYSUTCDATETIME()" in ss.source_now_sql("datetimeoffset")      # UTC, with an offset like the column
+    assert ss.source_now_sql("datetime") == ss.source_now_sql("smalldatetime") == "GETDATE()"
+    assert ora.source_now_sql("TIMESTAMP(6)") == ora.source_now_sql("timestamp(6) with time zone") == "SYSTIMESTAMP"
+    assert ora.source_now_sql("DATE") == "SYSDATE"
+    assert pg.source_now_sql("timestamp with time zone") == "now()"
+    with pytest.raises(ValueError):
+        ss.source_now_sql("int")
+
+
+@pytest.mark.parametrize("src_type,typ", CURSOR_DIALECTS)
+def test_max_batch_sql_one_scalar_subquery_per_table_plus_the_clock(src_type, typ):
+    a = sa.get_adapter(src_type)
+    sql = a.max_batch_sql([("c1", "hr", "emp", a.quote_ident("upd")), ("c2", "hr", "dept", a.quote_ident("upd"))], typ)
+    assert sql.startswith("SELECT (SELECT ") and sql.count("(SELECT ") == 2 and "MAX(" in sql
+    assert f"FROM {a.table_ref('hr', 'emp')})" in sql and "AS src_now" in sql
+    assert sql.endswith(" FROM DUAL") == (src_type == "oracle")
+    assert a.source_now_sql(typ) in sql
+
+
+def test_cursor_literals_per_dialect():
+    ss, ora, pg = (sa.get_adapter(t) for t in ("sqlserver", "oracle", "postgresql"))
+    assert ss.cursor_literal("42", "int") == "42"
+    assert ss.cursor_literal("2026-01-01T10:00:00.1234567", "datetime2") == "CONVERT(datetime2, N'2026-01-01T10:00:00.1234567', 126)"
+    assert ss.cursor_literal("2026-01-01T10:00:00.1234567", "datetime") == "CONVERT(datetime, N'2026-01-01T10:00:00.123', 126)"
+    assert ss.cursor_literal("2001", "timestamp") == "CAST(CAST(2001 AS BIGINT) AS BINARY(8))"
+    assert ora.cursor_literal("42", "NUMBER") == "42"
+    assert ora.cursor_literal("2026-01-01T10:00:00.1234567", "TIMESTAMP(6)") == \
+        "TO_TIMESTAMP('2026-01-01T10:00:00.123456', 'YYYY-MM-DD\"T\"HH24:MI:SS.FF6')"
+    assert ora.cursor_literal("2026-01-01T10:00:00+00:00", "TIMESTAMP(6) WITH TIME ZONE") == \
+        "TO_TIMESTAMP_TZ('2026-01-01T10:00:00.000000+00:00', 'YYYY-MM-DD\"T\"HH24:MI:SS.FF6TZH:TZM')"
+    assert ora.cursor_literal("2026-01-01", "DATE") == "TO_DATE('2026-01-01T00:00:00', 'YYYY-MM-DD\"T\"HH24:MI:SS')"
+    assert pg.cursor_literal("2026-01-01T10:00:00.1234567", "timestamp without time zone") == \
+        "CAST('2026-01-01T10:00:00.123456' AS timestamp without time zone)"
+
+
+def test_minus_seconds_sql_per_dialect():
+    assert sa.get_adapter("sqlserver").minus_seconds_sql("[u]", 600, "datetime2") == "DATEADD(SECOND, -600, [u])"
+    assert sa.get_adapter("oracle").minus_seconds_sql('"U"', 600, "DATE") == '"U" - NUMTODSINTERVAL(600, \'SECOND\')'
+    assert sa.get_adapter("postgresql").minus_seconds_sql('"u"', 600, "date") == "\"u\" - INTERVAL '600 seconds'"
+
+
+def test_greatest_expr_case_form_below_sqlserver_2022():
+    ss, ora = sa.get_adapter("sqlserver"), sa.get_adapter("oracle")
+    assert ss.greatest_expr(["a", "b"], "datetime2", 16) == "GREATEST(a, b)"
+    assert ss.greatest_expr(["a", "b"], "datetime2", 15) == "CASE WHEN a >= b THEN a ELSE b END"
+    assert ss.greatest_expr(["a", "b", "c"], "datetime2", None) == \
+        "CASE WHEN a >= b AND a >= c THEN a WHEN b >= c THEN b ELSE c END"      # unknown version: safe form
+    assert ss.greatest_expr(["a"], "datetime2", 15) == "a"
+    assert ora.greatest_expr(["a", "b", "c"], "DATE", None) == "GREATEST(a, b, c)"
+    assert sa.get_adapter("postgresql").greatest_expr(["a", "b"], "date", None) == "GREATEST(a, b)"
+
+
+def test_server_version_sql_only_for_sqlserver():
+    assert "SERVERPROPERTY('ProductMajorVersion')" in sa.get_adapter("sqlserver").server_version_sql()
+    assert sa.get_adapter("oracle").server_version_sql() is None
+    assert sa.get_adapter("postgresql").server_version_sql() is None
+
+
+@pytest.mark.parametrize("src_type,typ", CURSOR_DIALECTS)
+def test_pk_snapshot_sql_selects_the_pk(src_type, typ):
+    a = sa.get_adapter(src_type)
+    assert a.pk_snapshot_sql("hr", "emp", ["id", "ver"]) == \
+        f"SELECT {a.quote_ident('id')}, {a.quote_ident('ver')} FROM {a.table_ref('hr', 'emp')}"
+
+
+@pytest.mark.parametrize("method", CURSOR_METHODS)
+def test_mysql_raises_not_implemented_from_every_cursor_method(method):
+    args = {"cursor_type_sql": ("s", "t", ["c"]), "type_class_of": ("int",), "source_now_sql": ("datetime",),
+            "max_batch_sql": ([], "datetime"), "cursor_literal": ("1", "int"), "minus_seconds_sql": ("c", 1, "datetime"),
+            "greatest_expr": (["a"], "datetime", None), "server_version_sql": (), "pk_snapshot_sql": ("s", "t", ["c"]),
+            "cursor_text_sql": ("c", "int"), "max_text_sql": ("c", "int")}[method]
+    with pytest.raises(NotImplementedError, match="mysql"):
+        getattr(sa.get_adapter("mysql"), method)(*args)
