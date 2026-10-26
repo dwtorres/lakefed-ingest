@@ -536,3 +536,12 @@ def test_gap_10_merge_updates_only_changed_cursor():
     assert sw.sink_expr('"Updated At"', alias="tgt") == "tgt.`Updated At`"
     assert sw.sink_expr(" updated_at ", alias="s") == "s.`updated_at`"
     assert sw.sink_expr("COALESCE(a, N'DATE (x')", alias="s") == "COALESCE(s.`a`, N'DATE (x')"
+
+
+def test_gap_1_delete_missing_sql_anti_joins_the_pk_snapshot_scoped_to_the_client():
+    cfg = {"src_schema": "dbo", "src_table": "t", "select_list": "id, ver, v", "primary_key": "id, ver"}
+    assert sw.delete_missing_sql("c.s.t", "v", cfg) == (
+        "DELETE FROM c.s.t AS tgt WHERE NOT EXISTS (SELECT 1 FROM v AS s WHERE tgt.`id` = s.`id` AND tgt.`ver` = s.`ver`)")
+    assert sw.delete_missing_sql("c.s.t", "v", dict(cfg, client_id="t1")) == (
+        "DELETE FROM c.s.t AS tgt WHERE tgt.`__client_id__` = 't1' AND "
+        "NOT EXISTS (SELECT 1 FROM v AS s WHERE tgt.`id` = s.`id` AND tgt.`ver` = s.`ver`)")

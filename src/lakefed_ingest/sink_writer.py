@@ -189,6 +189,14 @@ def merge_on_cfg(cfg: dict) -> str:
     return f"{on} AND tgt.{client_predicate(cfg)}" if client_id(cfg) else on
 
 
+def delete_missing_sql(sink_fqn: str, view: str, cfg: dict) -> str:
+    """Delete the sink rows whose PK is absent from the PK snapshot in temp view ``view`` (research
+    R-08), only this client's rows for a consolidated sink (FR-028)."""
+    scope = f"tgt.{client_predicate(cfg)} AND " if client_id(cfg) else ""
+    return (f"DELETE FROM {sink_fqn} AS tgt WHERE {scope}NOT EXISTS "
+            f"(SELECT 1 FROM {view} AS s WHERE {merge_on(cfg['primary_key'])})")
+
+
 def create_sink_sql(sink_fqn: str, view: str, cfg: dict) -> str:
     """ONE atomic statement creating the sink from a 0-row view: type widening on, and — consolidated
     sink — liquid clustering on __client_id__. A single CTAS means a sink can never exist half-configured

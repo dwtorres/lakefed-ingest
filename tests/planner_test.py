@@ -247,3 +247,28 @@ def test_gap_10_bulk_rows_to_write_skips_fresh_quiet_tables():
     cps[2]["last_success_at"] = now - timedelta(hours=2)
     rows = [(1, _id_pos("100"), None), (2, _id_pos("100"), None)]
     assert planner.bulk_rows_to_write(rows, cps, 3600, now=now) == [rows[1]]
+
+
+# ---- deletes by PK snapshot (US5) --------------------------------------------------------------------
+
+def test_snapshot_due_only_for_pk_snapshot_past_the_interval_in_the_incremental_phase():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+    cfg = dict(_cur_cfg(), delete_mode="pk_snapshot", delete_min_interval_s=3600)
+    cp = dict(_cur_cp(), last_delete_snapshot_at=None)
+    assert planner.snapshot_due(cfg, cp, now=now)
+    assert planner.snapshot_due(cfg, dict(cp, last_delete_snapshot_at=now - timedelta(hours=2)), now=now)
+    assert not planner.snapshot_due(cfg, dict(cp, last_delete_snapshot_at=now - timedelta(minutes=10)), now=now)
+    assert not planner.snapshot_due(dict(cfg, delete_min_interval_s=None),
+                                    dict(cp, last_delete_snapshot_at=now - timedelta(hours=2)), now=now)   # 86400
+    assert not planner.snapshot_due(dict(cfg, delete_mode="none"), cp, now=now)
+    assert not planner.snapshot_due(cfg, dict(cp, phase=ss.SEEDING), now=now)
+    assert not planner.snapshot_due(cfg, None, now=now)
+
+
+def test_quiet_table_with_a_due_snapshot_goes_to_the_worker_with_hi():
+    cfg = dict(_cfg(1, "d1", "t", col="id_seq", kind="identity"), delete_mode="pk_snapshot")
+    cps = _id_cps((1,), last_delete_snapshot_at=None)
+    plans = planner.route_tables([cfg], cps)
+    plans, unchanged = planner.apply_captured(plans, cps, {1: ("100", False)})
+    assert unchanged == [] and plans[0]["hi"] == ("100", False)

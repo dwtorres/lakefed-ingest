@@ -8,6 +8,7 @@
 * ``retry_plan``: the next attempt of a table after a transient failure, from its fresh checkpoint.
 * ``apply_captured``: the batched ``hi`` (``cursor_engine.capture_batch``) splits cursor plans into
   unchanged rows (one bulk checkpoint write, no source read) and reads that carry ``hi``.
+* ``snapshot_due``: whether a table's PK snapshot (delete_mode pk_snapshot) runs this cycle.
 * ``apply_seed_budget`` and ``bulk_rows_to_write``: scale controls.
 """
 
@@ -148,13 +149,30 @@ def apply_captured(plans: List[dict], checkpoints: Dict[int, dict], captured: Di
         except ValueError:
             kept.append(plan)
             continue
-        if decision == "read" or alert:
+        if decision == "read" or alert or snapshot_due(plan["cfg"], plan.get("cp")):
             kept.append(dict(plan, hi=(hi, alert)))
             continue
         cp = checkpoints[cid]
         grown = ss.select_list_added_columns(plan["cfg"]["select_list"], cp.get("select_list"))
         unchanged.append((cid, cp["position"], plan["cfg"]["select_list"] if grown else None))
     return kept, unchanged
+
+
+DEFAULT_DELETE_INTERVAL_S = 86400
+
+
+def snapshot_due(cfg: dict, cp: Optional[dict], now=None) -> bool:
+    """True when the table's PK snapshot runs this cycle (FR-029): ``delete_mode`` pk_snapshot, phase
+    incremental, and ``last_delete_snapshot_at`` NULL or at least ``delete_min_interval_s`` (NULL:
+    one day) ago."""
+    if str(cfg.get("delete_mode") or "none").lower() != "pk_snapshot" or not cp or cp.get("phase") != ss.INCREMENTAL:
+        return False
+    last = cp.get("last_delete_snapshot_at")
+    if last is None:
+        return True
+    interval = cfg.get("delete_min_interval_s")
+    interval = DEFAULT_DELETE_INTERVAL_S if interval is None else int(interval)
+    return ((now or datetime.now(timezone.utc)) - last).total_seconds() >= interval
 
 
 # ---- scale controls -----------------------------------------------------------------------------------

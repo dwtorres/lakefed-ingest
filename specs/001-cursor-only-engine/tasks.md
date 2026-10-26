@@ -208,15 +208,15 @@ Single project. Package `src/lakefed_ingest/`, tests `tests/`, bundle `databrick
 
 **Independent Test**: `pytest tests/worker_test.py -k snapshot` passes.
 
-- [ ] T066 [P] [US5] Write `test_gap_1_pk_snapshot_deletes_missing_rows` and companion tests in `tests/worker_test.py`: with `delete_mode` `pk_snapshot`, phase `incremental`, and `last_delete_snapshot_at` older than `delete_min_interval_s`, the worker reads the PK snapshot after the increment, runs the delete, then calls `store.record_delete_snapshot`. Inside the interval it does no snapshot read. During phase `seeding` it skips the snapshot. With `delete_mode` `none` it never reads a snapshot. The delete runs after the increment merge and before the checkpoint advance of the snapshot time
-- [ ] T067 [P] [US5] Write a failing test in `tests/sink_writer_test.py`: `delete_missing_sql(sink_fqn, view, cfg)` returns `DELETE FROM <sink> WHERE <client predicate> AND NOT EXISTS (SELECT 1 FROM <view> WHERE <pk match>)`, with the client predicate present only when `client_id` is set
-- [ ] T068 [P] [US5] Write a failing test in `tests/source_io_test.py`: `read_pk_snapshot(cfg, deps)` selects only the primary key columns through `SourceAdapter.pk_snapshot_sql` and the `_read` path, and takes one slot from `deps.slots` and one permit from the per-source limiter
-- [ ] T069 [P] [US5] Write a failing test in `tests/state_store_test.py`: `record_delete_snapshot_sql()` updates `last_delete_snapshot_at = now()` for one `control_id`
-- [ ] T070 [US5] Add `delete_missing_sql` to `src/lakefed_ingest/sink_writer.py`. Make T067 pass (research R-08)
-- [ ] T071 [US5] Add `read_pk_snapshot` to `src/lakefed_ingest/source_io.py`. Make T068 pass (FR-030)
-- [ ] T072 [US5] Add `record_delete_snapshot` and `record_delete_snapshot_sql` to `src/lakefed_ingest/state_store.py`. Make T069 pass (FR-029)
-- [ ] T073 [US5] Add the snapshot step to `src/lakefed_ingest/worker.py` after the increment: condition on `delete_mode == "pk_snapshot"`, phase `incremental`, and interval passed (default 86400 when `delete_min_interval_s` is NULL). Wrap the delete in `sink_writer.with_write_retry`. Record one `ingest_event` with stage `snapshot`. Make T066 pass (FR-028)
-- [ ] T074 [US5] Run `pytest tests/worker_test.py -k snapshot` and `pytest tests`. Commit `feat(deletes): pk_snapshot delete mode`
+- [X] T066 [P] [US5] Write `test_gap_1_pk_snapshot_deletes_missing_rows` and companion tests in `tests/worker_test.py`: with `delete_mode` `pk_snapshot`, phase `incremental`, and `last_delete_snapshot_at` older than `delete_min_interval_s`, the worker reads the PK snapshot after the increment, runs the delete, then calls `store.record_delete_snapshot`. Inside the interval it does no snapshot read. During phase `seeding` it skips the snapshot. With `delete_mode` `none` it never reads a snapshot. The delete runs after the increment merge and before the checkpoint advance of the snapshot time
+- [X] T067 [P] [US5] Write a failing test in `tests/sink_writer_test.py`: `delete_missing_sql(sink_fqn, view, cfg)` returns `DELETE FROM <sink> WHERE <client predicate> AND NOT EXISTS (SELECT 1 FROM <view> WHERE <pk match>)`, with the client predicate present only when `client_id` is set
+- [X] T068 [P] [US5] Write a failing test in `tests/source_io_test.py`: `read_pk_snapshot(cfg, deps)` selects only the primary key columns through `SourceAdapter.pk_snapshot_sql` and the `_read` path, and takes one slot from `deps.slots` and one permit from the per-source limiter
+- [X] T069 [P] [US5] Write a failing test in `tests/state_store_test.py`: `record_delete_snapshot_sql()` updates `last_delete_snapshot_at = now()` for one `control_id`
+- [X] T070 [US5] Add `delete_missing_sql` to `src/lakefed_ingest/sink_writer.py`. Make T067 pass (research R-08)
+- [X] T071 [US5] Add `read_pk_snapshot` to `src/lakefed_ingest/source_io.py`. Make T068 pass (FR-030)
+- [X] T072 [US5] Add `record_delete_snapshot` and `record_delete_snapshot_sql` to `src/lakefed_ingest/state_store.py`. Make T069 pass (FR-029)
+- [X] T073 [US5] Add the snapshot step to `src/lakefed_ingest/worker.py` after the increment: condition on `delete_mode == "pk_snapshot"`, phase `incremental`, and interval passed (default 86400 when `delete_min_interval_s` is NULL). Wrap the delete in `sink_writer.with_write_retry`. Record one `ingest_event` with stage `snapshot`. Make T066 pass (FR-028)
+- [X] T074 [US5] Run `pytest tests/worker_test.py -k snapshot` and `pytest tests`. Commit `feat(deletes): pk_snapshot delete mode`
 
 **Checkpoint**: Source deletes reach the sink once per interval. Seeds and quiet intervals skip the snapshot.
 

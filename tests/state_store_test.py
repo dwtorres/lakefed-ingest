@@ -889,3 +889,11 @@ def test_gap_11_dead_columns_dropped():
         assert col not in ss.CONTROL_COLUMNS, col
     for col in ("ct_begin_version", "pending_position", "pending_run_id"):
         assert f"alter table lakefed_cursor.checkpoint drop column if exists {col}" in _DDL, col
+
+
+def test_record_delete_snapshot_sql_stamps_one_control_id():
+    sql = ss.record_delete_snapshot_sql()
+    assert sql.startswith(f"update {ss.CHECKPOINT_TABLE} set last_delete_snapshot_at = now()")
+    assert "where control_id = %s" in sql and sql.count("%s") == 1
+    conn = FakeConn(); ss.StateStore(conn).record_delete_snapshot(CFG)
+    assert conn.calls == [(sql, (7,))]

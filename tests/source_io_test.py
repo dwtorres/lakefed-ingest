@@ -208,3 +208,14 @@ def test_server_version_is_queried_once_per_source(monkeypatch):
     assert len(reads) == 1 and "ProductMajorVersion" in reads[0]
     assert sio.server_version(dict(a, src_host="h2")) == 15 and len(reads) == 2     # another server
     assert sio.server_version(dict(a, src_type="oracle")) is None and len(reads) == 2  # no version-dependent SQL
+
+
+def test_read_pk_snapshot_selects_only_the_pk_through_the_read_path(monkeypatch):
+    reads = []
+    monkeypatch.setattr(sio, "_read", lambda sp, cfg, q, **kw: reads.append((sp, cfg["id"], q)) or "df")
+    cfg = dict(_MERGE_CFG, src_type="sqlserver", primary_key="id, ver", select_list="id, ver, v, w")
+    assert sio.read_pk_snapshot("spark", cfg) == "df"
+    assert reads == [("spark", 1, "SELECT [id], [ver] FROM [dbo].[t]")]
+    ora = dict(cfg, src_type="oracle", src_schema="hr")
+    sio.read_pk_snapshot("spark", ora)
+    assert reads[-1][2] == 'SELECT "id", "ver" FROM "hr"."t"'

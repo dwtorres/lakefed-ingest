@@ -603,3 +603,22 @@ def test_capture_batch_failed_chunk_falls_back_to_one_query_per_table(monkeypatc
     assert seen == [(0, typ, 60), (1, typ, 60)]                       # the failed chunk, table by table
     assert out == {0: ("2026-01-01T09:00:00", False), 2: ("2026-01-01T10:00:00", False)}   # 1: the worker reads it
     assert len(queries) == 2 and any("t1" in line and "locked" in line for line in logged)
+
+
+# ---- US5: delete_missing holds one slot and one source permit around the PK read + DELETE -----------
+
+def test_delete_missing_reads_pk_snapshot_under_one_unit_and_drops_the_view(monkeypatch, dialect):
+    import parallel
+    import source_io
+    cfg, _ = dialect
+    cfg = dict(cfg, id=7, src_type=cfg.get("src_type", "sqlserver"), src_host="h", src_database="d")
+    limiter = parallel.SourceLimiter({source_io.source_key(cfg): 2})
+    slots = parallel.WorkSlots(4, sources=limiter)
+    spark = _Spark(result=_Result({"num_affected_rows": 2}))
+    held = []
+    monkeypatch.setattr(source_io, "_read", lambda sp, c, q, **kw: held.append((slots.in_flight, dict(limiter.peak))) or _DF(sp, q))
+    assert cur.delete_missing(spark, cfg, "c.s.t", slots=slots) == 2
+    assert held == [(1, {source_io.source_key(cfg): 1})] and slots.in_flight == 0
+    assert len(spark.statements) == 1 and spark.statements[0].startswith("DELETE FROM c.s.t AS tgt WHERE NOT EXISTS")
+    assert "pk_snapshot_" in spark.statements[0] and spark.views == {}
+    assert "updated_at" not in list(held and spark.statements[0]) and spark.statements[0].count("`id`") == 2

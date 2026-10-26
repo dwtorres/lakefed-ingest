@@ -235,6 +235,13 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
 _server_versions: dict = {}   # source_key -> major version (None: no SQL depends on it)
 
 
+def read_pk_snapshot(spark, cfg: dict):
+    """Every primary key of the source table (``SourceAdapter.pk_snapshot_sql``), lazily, through the
+    same read path as any other query (FR-030). The caller holds the unit around its consumption."""
+    a = source_adapters.for_cfg(cfg)
+    return _read(spark, cfg, a.pk_snapshot_sql(cfg["src_schema"], cfg["src_table"], _split(cfg["primary_key"])))
+
+
 def server_version(cfg: dict, slots=None) -> Optional[int]:
     """The source's major version (``SourceAdapter.server_version_sql``), queried once per source and
     kept for the process; None when the adapter has no SQL that depends on it."""

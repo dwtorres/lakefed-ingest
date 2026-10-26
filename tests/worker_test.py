@@ -207,3 +207,73 @@ def test_plan_with_captured_hi_performs_no_max_read(deps, fakes, calls):
     names = _names(calls)
     assert "high_watermark" not in names and names.index("merge") < names.index("advance")
     assert [c for c in calls if c[0] == "advance"][0][1] == worker.cursor_engine.encode_position("mod", "identity", "int", "42")
+
+
+# ---- US5: deletes by PK snapshot (gap 1, FR-028 to FR-030) -------------------------------------------
+from datetime import datetime, timedelta, timezone
+
+
+def _snap_plan(route="cursor", last=None, interval=3600, mode="pk_snapshot", hi=None):
+    cfg = dict(_cfg(), delete_mode=mode, delete_min_interval_s=interval)
+    cp = {"phase": "seeding" if route == "cursor_seed" else "incremental", "last_delete_snapshot_at": last}
+    plan = {"route": route, "cfg": cfg, "cp": cp,
+            "position": {"expr": "mod", "kind": "identity", "type": "int", "value": "10"}}
+    if hi is not None:
+        plan["hi"] = (hi, False)
+    return plan
+
+
+@pytest.fixture
+def snapshot(monkeypatch, fakes, calls):
+    state = {"fail": False}
+
+    def delete_missing(spark, cfg, sink, slots=None):
+        calls.append(("delete_missing", cfg["id"]))
+        if state["fail"]:
+            raise RuntimeError("delete failed")
+        return 2
+    monkeypatch.setattr(worker.cursor_engine, "delete_missing", delete_missing, raising=False)
+    monkeypatch.setattr(FakeStore, "record_delete_snapshot",
+                        lambda self, cfg: self.calls.append(("record_delete_snapshot", cfg["id"])), raising=False)
+    return state
+
+
+def test_gap_1_pk_snapshot_deletes_missing_rows(deps, snapshot, calls):
+    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    assert worker.ingest_one(_snap_plan(last=old), run_id=1, deps=deps) == "incremented"
+    names = _names(calls)
+    # after the increment merge and its advance; the snapshot time is recorded after the delete commits
+    assert (names.index("merge") < names.index("advance") < names.index("delete_missing")
+            < names.index("record_delete_snapshot"))
+    assert names[-1] == "event_finish" and calls[-1][1] == "ok" and calls[-1][2]["stage"] == "snapshot"
+
+
+def test_snapshot_runs_on_a_quiet_table_too(deps, snapshot, calls):
+    # deletes move no cursor: a table whose hi left the position where it is still snapshots when due
+    assert worker.ingest_one(_snap_plan(last=None, hi="10"), run_id=1, deps=deps) == "unchanged"
+    assert ("delete_missing", 7) in calls and ("record_delete_snapshot", 7) in calls
+
+
+def test_snapshot_skipped_inside_the_interval_and_defaults_to_a_day(deps, snapshot, calls):
+    recent = datetime.now(timezone.utc) - timedelta(minutes=10)
+    worker.ingest_one(_snap_plan(last=recent), run_id=1, deps=deps)
+    worker.ingest_one(_snap_plan(last=datetime.now(timezone.utc) - timedelta(hours=2), interval=None), run_id=1, deps=deps)
+    assert "delete_missing" not in _names(calls)
+    worker.ingest_one(_snap_plan(last=datetime.now(timezone.utc) - timedelta(hours=25), interval=None), run_id=1, deps=deps)
+    assert _names(calls).count("delete_missing") == 1
+
+
+def test_snapshot_skipped_while_seeding_and_with_delete_mode_none(deps, snapshot, calls):
+    worker.ingest_one(_snap_plan(route="cursor_seed"), run_id=1, deps=deps)
+    worker.ingest_one(_snap_plan(mode="none"), run_id=1, deps=deps)
+    assert "delete_missing" not in _names(calls)
+
+
+def test_failed_delete_fails_the_table_and_records_no_snapshot_time(deps, snapshot, calls):
+    snapshot["fail"] = True
+    with pytest.raises(RuntimeError, match="delete failed"):
+        worker.ingest_one(_snap_plan(), run_id=1, deps=deps)
+    names = _names(calls)
+    assert "advance" in names and "record_delete_snapshot" not in names     # the increment stands
+    finish = [c for c in calls if c[0] == "event_finish"][0]
+    assert finish[1] == "failed" and finish[2]["stage"] == "snapshot"

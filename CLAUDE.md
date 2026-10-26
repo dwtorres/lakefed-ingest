@@ -95,15 +95,18 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 3. Per-table worker: full reload (`load_strategies.FullStrategy` → `sink_writer.seed`), cursor seed
    (capture the high watermark before the seed; partitioned seed via staging + atomic swap), reseed
    enqueue, or cursor window read `(position, hi]` + idempotent PK MERGE (schema evolution; a matched
-   row is updated only when its cursor expression differs) then checkpoint advance.
+   row is updated only when its cursor expression differs) then checkpoint advance. Then, with
+   `delete_mode` `pk_snapshot` and `planner.snapshot_due` (phase incremental, `delete_min_interval_s`
+   passed, NULL = one day): read every source primary key, delete the sink rows absent from it
+   (client-scoped, `cursor_engine.delete_missing`), record `last_delete_snapshot_at`.
    With `table_retries` > 0, a transient source failure is retried in the run (`table_retry.with_retries`;
    the next attempt from `planner.retry_plan` on the fresh checkpoint).
 
 ### Modules
 | File | Purpose |
 |---|---|
-| `src/lakefed_ingest/source_io.py` | Source reads (Spark JDBC, or `remote_query` through a UC connection): credentials, URL, the query unit (`_read`, `_unit`, `source_key`) |
-| `src/lakefed_ingest/sink_writer.py` | Sink writes: MERGE / INSERT text, consolidated sinks (`client_id`, `client_attrs`), sink DDL, seed (plain or partitioned), write-conflict retry |
+| `src/lakefed_ingest/source_io.py` | Source reads (Spark JDBC, or `remote_query` through a UC connection): credentials, URL, the query unit (`_read`, `_unit`, `source_key`), the PK snapshot read |
+| `src/lakefed_ingest/sink_writer.py` | Sink writes: MERGE / INSERT / DELETE text, consolidated sinks (`client_id`, `client_attrs`), sink DDL, seed (plain or partitioned), write-conflict retry |
 | `src/lakefed_ingest/worker.py` | Per-table worker (`ingest_one(plan, run_id, deps, attempt)`): routes `full` / `cursor_seed` / `cursor` / `schema_reseed`, telemetry, and the checkpoint advance after the sink commit (`tests/worker_test.py`); `_replan` for retries |
 | `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL, cursor methods (type lookup and class, source clock, text rendering, typed literals, lookback, batched MAX, GREATEST form; MySQL raises) |

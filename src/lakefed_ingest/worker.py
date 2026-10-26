@@ -11,7 +11,9 @@ decided by the planner:
                      (a temporal `hi` is capped at the source clock plus
                      cursor_skew_s; logged as alert=max_above_clock); unchanged if equal to the
                      checkpoint, else read (position - lookback, hi] + upsert MERGE by PK, advance
-                     to `hi`. An identity cursor logs `inserts_only` once per run per table
+                     to `hi`. An identity cursor logs `inserts_only` once per run per table. Then,
+                     when planner.snapshot_due (delete_mode pk_snapshot, interval passed): read every
+                     source PK, delete the sink rows absent from it (client-scoped), record the time
   schema_reseed    - control.select_list gained columns vs the recorded one, or the cursor_expression
                      / cursor_kind changed (plan["reason"]): enqueue a reseed
   (retry)          - table_retries: the same route again on the fresh checkpoint
@@ -114,6 +116,12 @@ def ingest_one(plan, run_id, deps, attempt=0):
             store.advance_checkpoint(cfg, position=cursor_engine.encode_position(pos["expr"], pos["kind"], pos["type"], new_value),
                                      detail=_detail(None, alert), select_list=cfg["select_list"])
             v_to = new_value
+            if planner.snapshot_due(cfg, cp):   # deletes move no cursor: a quiet table snapshots too
+                stage = "snapshot"
+                assert_lock_held()
+                deleted = cursor_engine.delete_missing(spark, cfg, sink, slots=slots)
+                store.record_delete_snapshot(cfg)   # after the DELETE committed
+                log(f"[snapshot] {db}.{schema}.{table}: deleted {deleted} rows absent from the source")
         else:  # schema_reseed
             stage = "checkpoint"
             assert_lock_held()

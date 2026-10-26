@@ -242,6 +242,11 @@ def bulk_advance_unchanged_sql() -> str:
     )
 
 
+def record_delete_snapshot_sql() -> str:
+    """Stamp the PK snapshot time of one table (delete_mode pk_snapshot, FR-029). Param: control_id."""
+    return f"update {CHECKPOINT_TABLE} set last_delete_snapshot_at = now(), updated_at = now() where control_id = %s"
+
+
 def set_status_sql() -> str:
     """Update only status/detail (failure isolation / quarantine), keyed by control_id. A new row
     (failure before the first checkpoint) records the row's strategy; an existing row keeps its own.
@@ -664,6 +669,11 @@ class StateStore:
         with self._cursor() as cur:
             cur.executemany(bulk_advance_unchanged_sql(), params)
         return len(params)
+
+    def record_delete_snapshot(self, cfg: dict) -> None:
+        """Call ONLY after the snapshot's DELETE committed."""
+        with self._cursor() as cur:
+            cur.execute(record_delete_snapshot_sql(), (int(cfg["id"]),))
 
     def set_status(self, cfg: dict, status, detail=None):
         with self._cursor() as cur:

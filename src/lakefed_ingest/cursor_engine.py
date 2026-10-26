@@ -28,7 +28,8 @@ see each adapter for its own), by kind:
     never skipped. Exact bounds.
 Float / real / string columns are rejected (lossy or not reliably ordered).
 
-Limits (by design of a watermark): deletes are not captured (use a periodic ``full``);
+Limits (by design of a watermark): deletes are not captured, except by ``delete_mode``
+``pk_snapshot`` (``delete_missing``: all source keys read once per ``delete_min_interval_s``);
 updates are captured only if they move the cursor column (``rowversion`` always does, an identity
 never does). A ``hi`` below the position (a source truncate or reload) fails the table; the position
 never moves backwards.
@@ -404,6 +405,25 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
             finally:
                 spark.catalog.dropTempView(view)
     result = sink_writer.with_write_retry(once, what=f"merge {sink_fqn}")
+    if result is not None and "num_affected_rows" in result.asDict():
+        return int(result["num_affected_rows"] or 0)
+    return None
+
+
+def delete_missing(spark, cfg: dict, sink_fqn: str, slots=None) -> Optional[int]:
+    """Delete-mode ``pk_snapshot`` (FR-028): read every source primary key and delete the sink rows
+    (this client's, when ``client_id`` is set) that have none — ONE source read feeding one DELETE,
+    under one slot and one source permit like any read. Returns rows deleted from the Delta metrics
+    (None if unavailable)."""
+    def once():
+        with source_io._unit(slots, cfg):
+            view = f"pk_snapshot_{uuid.uuid4().hex}"
+            source_io.read_pk_snapshot(spark, cfg).createOrReplaceTempView(view)
+            try:
+                return spark.sql(sink_writer.delete_missing_sql(sink_fqn, view, cfg)).first()
+            finally:
+                spark.catalog.dropTempView(view)
+    result = sink_writer.with_write_retry(once, what=f"delete {sink_fqn}")
     if result is not None and "num_affected_rows" in result.asDict():
         return int(result["num_affected_rows"] or 0)
     return None
