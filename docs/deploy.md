@@ -103,7 +103,7 @@ databricks bundle run lakefed_cursor_setup -t dev   # idempotent
    `External authorization failed ... blocked by Databricks IP ACL`.
 2. **Postgres role.** The identity the jobs run as must be a Postgres role on the Lakebase instance
    (the deployer is one; add a role for a service principal if jobs run as one).
-3. **Source credentials.** One secret per source database: JSON `{"user": "...", "password": "..."}`.
+3. **Source credentials.** One secret per source database: JSON `{"user": "...", "password": "..."}` (`auth_mode` `sql`). SQL Server also takes `auth_mode` `ntlm` (adds `domain`) or `aad_sp` (`client_id`, `client_secret`, `tenant_id`).
    The scope may be Azure Key Vault-backed — AKV secret names allow only letters, digits, and dashes.
    Each control row names its secret in `secret_key`. A row can instead read through an existing
    Unity Catalog connection, which holds the credentials: set `src_connection` to its name and

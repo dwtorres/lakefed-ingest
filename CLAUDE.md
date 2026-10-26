@@ -34,7 +34,9 @@ databricks bundle run lakefed_cursor -t <target> -p <profile> --params task_coll
 ## The engine (repo root)
 
 Warehouse-free: everything runs on cluster compute. Source reads use Spark JDBC with per-database
-credentials (JSON `{user,password}`) from a secret scope named by `control.secret_key`; or, for a
+credentials (JSON `{auth_mode, ...}`: `sql` `{user,password}`, `ntlm` adds `domain`, `aad_sp`
+`{client_id,client_secret,tenant_id}`, SQL Server only; absent = `sql`) from a secret scope named by
+`control.secret_key`; or, for a
 row with `use_remote_query`, `remote_query` through the UC connection in `src_connection` (no
 secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase_schema.md`.
 

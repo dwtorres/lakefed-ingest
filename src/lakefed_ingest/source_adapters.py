@@ -41,6 +41,13 @@ SQLSERVER, ORACLE, POSTGRESQL, MYSQL = "sqlserver", "oracle", "postgresql", "mys
 # credentials, driver, and the query itself are owned by the framework.
 _RESERVED_OPTIONS = {"url", "user", "password", "driver", "query", "dbtable"}
 
+# Secret JSON per source database (contracts/secret_json.md): required fields per ``auth_mode``, and
+# the fields whose value must never reach a log line, an error, or a telemetry row.
+AUTH_FIELDS = {"sql": ("user", "password"), "ntlm": ("user", "password", "domain"),
+               "aad_sp": ("client_id", "client_secret", "tenant_id")}
+AUTH_MODES = tuple(AUTH_FIELDS)
+SECRET_FIELDS = ("password", "client_secret")
+
 
 def _split(csv: Optional[str]) -> List[str]:
     return [c.strip() for c in (csv or "").split(",") if c.strip()]
@@ -81,6 +88,15 @@ class SourceAdapter:
     def read_options(self, cfg: dict) -> Dict[str, str]:
         """Adapter defaults overlaid with the control row's ``jdbc_options``."""
         return {**self.default_options, **parse_jdbc_options(cfg.get("jdbc_options"))}
+
+    def auth_options(self, creds: dict) -> Dict[str, str]:
+        """Spark JDBC options for the parsed secret (``source_io._extract_creds``). Every engine takes
+        ``sql``; only SQL Server takes ``ntlm`` and ``aad_sp``. Raises before any connect, naming no
+        secret value."""
+        if creds["auth_mode"] != "sql":
+            raise NotImplementedError(
+                f"src_type '{self.src_type}' supports auth_mode sql only, not {creds['auth_mode']}")
+        return {"user": creds["user"], "password": creds["password"]}
 
     # ---- quoting / literals ---------------------------------------------------------------
     def quote_ident(self, name: str) -> str:
@@ -198,6 +214,16 @@ class SqlServerAdapter(SourceAdapter):
             f"jdbc:sqlserver://{host}:{int(port)};databaseName={database};encrypt=true;"
             f"trustServerCertificate={'true' if trust_cert else 'false'}"
         )
+
+    def auth_options(self, creds):
+        mode = creds["auth_mode"]
+        if mode == "ntlm":
+            return {"user": creds["user"], "password": creds["password"], "domain": creds["domain"],
+                    "authenticationScheme": "NTLM", "integratedSecurity": "true"}
+        if mode == "aad_sp":   # shortcut: tenant_id unused; add it to user as <client_id>@<tenant_id> if the driver needs it (R-09)
+            return {"authentication": "ActiveDirectoryServicePrincipal", "user": creds["client_id"],
+                    "password": creds["client_secret"]}
+        return super().auth_options(creds)
 
     def quote_ident(self, name):
         return "[" + str(name).replace("]", "]]") + "]"

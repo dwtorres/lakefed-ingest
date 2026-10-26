@@ -105,7 +105,7 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 | `src_type` | Source adapter: `sqlserver` \| `oracle` \| `postgresql` \| `mysql` |
 | `src_host`, `src_port` | Source server; NULL port = the engine's default |
 | `src_database`, `src_schema`, `src_table` | Source table (Oracle: `src_database` is the service name) |
-| `secret_key` | Secret (in the job's secret scope) holding JSON `{"user", "password"}` for this database |
+| `secret_key` | Secret (in the job's secret scope) holding the secret JSON for this database: `{"user", "password"}`, or with `auth_mode` `ntlm` or `aad_sp` on SQL Server |
 | `use_remote_query` | `true`: read through the Unity Catalog connection in `src_connection` (`remote_query`) instead of Spark JDBC; `src_host`, `src_port` and `secret_key` aren't used then. Default `false` |
 | `src_connection` | The connection read through when `use_remote_query` is `true`. Otherwise only a fallback for the host when `src_host` is NULL |
 | `jdbc_options` | Optional JSON object of extra Spark JDBC read options |

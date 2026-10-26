@@ -233,3 +233,24 @@ def test_mysql_raises_not_implemented_from_every_cursor_method(method):
             "cursor_text_sql": ("c", "int"), "max_text_sql": ("c", "int")}[method]
     with pytest.raises(NotImplementedError, match="mysql"):
         getattr(sa.get_adapter("mysql"), method)(*args)
+
+
+# ---- US7: auth_options per secret auth_mode (contracts/secret_json.md) -------------------------------
+def test_sqlserver_auth_options_per_mode():
+    ss = sa.get_adapter("sqlserver")
+    assert ss.auth_options({"auth_mode": "sql", "user": "u", "password": "p"}) == {"user": "u", "password": "p"}
+    assert ss.auth_options({"auth_mode": "ntlm", "user": "u", "password": "p", "domain": "CORP"}) == {
+        "user": "u", "password": "p", "domain": "CORP", "authenticationScheme": "NTLM", "integratedSecurity": "true"}
+    assert ss.auth_options({"auth_mode": "aad_sp", "client_id": "app", "client_secret": "cs", "tenant_id": "t"}) == {
+        "authentication": "ActiveDirectoryServicePrincipal", "user": "app", "password": "cs"}
+
+
+@pytest.mark.parametrize("src_type", ["oracle", "postgresql", "mysql"])
+def test_other_adapters_accept_sql_only(src_type):
+    a = sa.get_adapter(src_type)
+    assert a.auth_options({"auth_mode": "sql", "user": "u", "password": "p"}) == {"user": "u", "password": "p"}
+    for mode in ("ntlm", "aad_sp"):
+        with pytest.raises(NotImplementedError, match=f"{src_type}.*{mode}") as e:
+            a.auth_options({"auth_mode": mode, "user": "u", "password": "p", "domain": "d",
+                            "client_id": "c", "client_secret": "cs", "tenant_id": "t"})
+        assert "cs" not in str(e.value).replace("aad_sp", "")

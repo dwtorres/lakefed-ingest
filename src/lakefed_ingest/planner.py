@@ -20,6 +20,7 @@ from typing import Optional, Dict, List, Tuple
 import cursor_engine
 import load_strategies as ls
 import sink_writer
+import source_adapters
 import source_io
 import state_store as ss
 
@@ -61,6 +62,9 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
         return f"delete_mode {delete_mode} is not implemented: use none or pk_snapshot"
     if delete_mode not in ("none", "pk_snapshot"):
         return f"unknown delete_mode {cfg.get('delete_mode')!r}: use none or pk_snapshot"
+    auth_mode = cfg.get("auth_mode")   # from the secret (source_io.secret_auth_mode), when the caller read it
+    if auth_mode and auth_mode != "sql" and source_adapters.for_cfg(cfg).src_type != source_adapters.SQLSERVER:
+        return f"auth_mode {auth_mode} needs src_type sqlserver, not {source_adapters.for_cfg(cfg).src_type}"
     if source_io.uses_remote_query(cfg) and not cfg.get("src_connection"):
         return "use_remote_query reads through the Unity Catalog connection in src_connection, which is not set"
     try:

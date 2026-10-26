@@ -8,7 +8,8 @@ Connection (per control row ``cfg``):
   * host and port: ``cfg['src_host']`` and ``cfg['src_port']``, else the UC connection named in
     ``cfg['src_connection']``, else the secret's own host field, else env ``LAKEFED_SQL_HOST``.
   * port default: the adapter's default port.
-  * credentials: secret ``scope``/``key`` holding JSON ``{user, password}``. The scope is env
+  * credentials: secret ``scope``/``key`` holding the secret JSON of contracts/secret_json.md
+    (``auth_mode`` sql, ntlm, or aad_sp; absent means sql). The scope is env
     ``LAKEFED_SQL_SECRET_SCOPE`` (default ``lakefed-cursor``). The key is ``cfg['secret_key']``,
     else env ``LAKEFED_SQL_SECRET_KEY``, else legacy ``f"{src_connection}_json"``. Credentials are
     cached per (scope, key).
@@ -42,9 +43,6 @@ _SQLSERVER = source_adapters.get_adapter(source_adapters.SQLSERVER)
 
 
 _USER_KEYS = ("user", "username", "userName", "login", "uid")
-
-
-_PWD_KEYS = ("password", "pwd", "passwd")
 
 
 _HOST_KEYS = ("host", "server", "dsn")
@@ -119,22 +117,60 @@ def jdbc_url(host: str, port: int, database: str, trust_cert: bool, src_type: st
 
 
 _lock = threading.Lock()
-_creds_cache: dict = {}    # (scope, key) -> (user, password, host-from-secret)
+_creds_cache: dict = {}    # (scope, key) -> parsed secret (_extract_creds)
 _uc_host_cache: dict = {}  # legacy: UC connection name -> (host, port)
-_config_cache: dict = {}   # config_cache_key(...) -> {host, port, user, password}
+_config_cache: dict = {}   # config_cache_key(...) -> {host, port, options}
 
 
-def _extract_creds(blob):
-    creds = json.loads(blob) if isinstance(blob, str) else dict(blob)
+def _extract_creds(blob) -> dict:
+    """The secret JSON as ``{auth_mode, host, <required fields of the mode>}`` (contracts/secret_json.md).
+    A missing ``auth_mode`` means ``sql``; legacy shapes (alternate user key names, one nested object)
+    still parse. Fails before any connect; the message names fields, never values."""
+    raw = json.loads(blob) if isinstance(blob, str) else dict(blob)
+    mode = str(raw.get("auth_mode") or "sql").strip().lower()
+    if mode not in source_adapters.AUTH_FIELDS:
+        raise ValueError(f"unknown auth_mode in the source credential secret: "
+                         f"use one of {', '.join(source_adapters.AUTH_MODES)}")
+    aliases = {"user": _USER_KEYS, "host": _HOST_KEYS}
 
-    def pick(d, keys):
-        return next((d[k] for k in keys if isinstance(d.get(k), str)), None)
+    def pick(d, field):
+        return next((d[k] for k in aliases.get(field, (field,)) if isinstance(d.get(k), str) and d[k]), None)
 
-    for cand in [creds] + [v for v in creds.values() if isinstance(v, dict)]:
-        user, pwd = pick(cand, _USER_KEYS), pick(cand, _PWD_KEYS)
-        if user and pwd:
-            return user, pwd, pick(cand, _HOST_KEYS)
-    raise ValueError("could not find user/password fields in the source credential secret")
+    for cand in [raw] + [v for v in raw.values() if isinstance(v, dict)]:
+        creds = {f: pick(cand, f) for f in source_adapters.AUTH_FIELDS[mode]}
+        if all(creds.values()):
+            return dict(creds, auth_mode=mode, host=pick(cand, "host"))
+    missing = [f for f in source_adapters.AUTH_FIELDS[mode] if not pick(raw, f)]
+    raise ValueError(f"the source credential secret (auth_mode {mode}) is missing {', '.join(missing)}")
+
+
+def redact(text: str, creds: Optional[dict]) -> str:
+    """``text`` with every secret value of ``creds`` replaced by ``***`` (FR-036)."""
+    for value in (v for v in ((creds or {}).get(k) for k in source_adapters.SECRET_FIELDS) if v):
+        text = text.replace(value, "***")
+    return text
+
+
+def known_creds(cfg: dict) -> Optional[dict]:
+    """The row's parsed secret if a read already loaded it (the source of a connect error's values);
+    None for a remote_query row or before the first read."""
+    try:
+        ref = secret_ref(cfg)
+    except ValueError:
+        return None
+    with _lock:
+        return _creds_cache.get(ref)
+
+
+def secret_auth_mode(cfg: dict) -> Optional[str]:
+    """The row's ``auth_mode`` for ``planner.config_error``; None when the row reads through a
+    connection or the secret cannot be read (the table then fails at its first read)."""
+    if uses_remote_query(cfg):
+        return None
+    try:
+        return _creds(*secret_ref(cfg))["auth_mode"]
+    except Exception:
+        return None
 
 
 def _creds(scope: str, key: str):
@@ -161,9 +197,11 @@ def _uc_host(conn_name: str):
 
 
 def _jdbc_config(cfg: dict) -> dict:
-    """Resolve {host, port, user, password} for this control row (cached per host/port/secret)."""
+    """Resolve {host, port, options} for this control row (cached per host/port/secret); ``options``
+    are the adapter's auth options for the secret's ``auth_mode``."""
     scope, key = secret_ref(cfg)
-    user, pwd, secret_host = _creds(scope, key)
+    creds = _creds(scope, key)
+    secret_host = creds["host"]
     host, port = cfg.get("src_host"), cfg.get("src_port")
     if not host and cfg.get("src_connection"):
         host, uc_port = _uc_host(cfg["src_connection"])
@@ -175,7 +213,8 @@ def _jdbc_config(cfg: dict) -> dict:
     ck = config_cache_key(host, port, scope, key)
     with _lock:
         if ck not in _config_cache:
-            _config_cache[ck] = {"host": host, "port": port, "user": user, "password": pwd}
+            _config_cache[ck] = {"host": host, "port": port,
+                                 "options": source_adapters.for_cfg(cfg).auth_options(creds)}
         return _config_cache[ck]
 
 
@@ -224,8 +263,7 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         .option("url", adapter.jdbc_url(conf["host"], conf["port"], cfg["src_database"],
                                         trust_server_certificate()))
         .option("query", query)
-        .option("user", conf["user"])
-        .option("password", conf["password"])
+        .options(**conf["options"])
         .option("driver", adapter.driver)
         .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()

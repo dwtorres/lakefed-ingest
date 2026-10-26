@@ -4,8 +4,11 @@ import pytest
 import source_io as sio
 
 
+_SQL_CREDS = {"auth_mode": "sql", "user": "u", "password": "p", "host": "secret-host"}
+
+
 def _resolve(monkeypatch, cfg, env_host=None):
-    monkeypatch.setattr(sio, "_creds", lambda scope, key: ("u", "p", "secret-host"))
+    monkeypatch.setattr(sio, "_creds", lambda scope, key: _SQL_CREDS)
     monkeypatch.setattr(sio, "_uc_host", lambda name: ("uc-host", 1500))
     sio._config_cache.clear()
     if env_host is None:
@@ -120,7 +123,7 @@ def test_jdbc_config_secret_host_last_resort(monkeypatch):
 
 
 def test_jdbc_config_no_host_raises(monkeypatch):
-    monkeypatch.setattr(sio, "_creds", lambda scope, key: ("u", "p", None))
+    monkeypatch.setattr(sio, "_creds", lambda scope, key: dict(_SQL_CREDS, host=None))
     sio._config_cache.clear()
     monkeypatch.delenv("LAKEFED_SQL_HOST", raising=False)
     import pytest
@@ -134,7 +137,7 @@ def test_quoting_doubles_closing_bracket_and_quote():
 
 
 def test_read_uses_the_rows_adapter_url_driver_and_options(monkeypatch):
-    monkeypatch.setattr(sio, "_creds", lambda scope, key: ("u", "p", None))
+    monkeypatch.setattr(sio, "_creds", lambda scope, key: dict(_SQL_CREDS, host=None))
     monkeypatch.setenv("LAKEFED_SQL_TRUST_SERVER_CERT", "false")
     sio._config_cache.clear()
     spark = type("S", (), {"read": property(lambda self: _Reader())})()
@@ -219,3 +222,50 @@ def test_read_pk_snapshot_selects_only_the_pk_through_the_read_path(monkeypatch)
     ora = dict(cfg, src_type="oracle", src_schema="hr")
     sio.read_pk_snapshot("spark", ora)
     assert reads[-1][2] == 'SELECT "id", "ver" FROM "hr"."t"'
+
+
+# ---- US7: auth modes in the secret JSON (contracts/secret_json.md, FR-034 to FR-036) -------------------
+SECRET_VALUE, CLIENT_SECRET_VALUE = "p4ss-Value-9", "cs-Value-77"
+
+
+def test_extract_creds_without_mode_is_sql():
+    creds = sio._extract_creds({"user": "svc", "password": SECRET_VALUE})
+    assert creds["auth_mode"] == "sql"
+    assert (creds["user"], creds["password"]) == ("svc", SECRET_VALUE)
+
+
+def test_extract_creds_ntlm_needs_domain():
+    with pytest.raises(ValueError, match="domain") as e:
+        sio._extract_creds('{"auth_mode": "ntlm", "user": "svc", "password": "%s"}' % SECRET_VALUE)
+    assert SECRET_VALUE not in str(e.value)
+    creds = sio._extract_creds({"auth_mode": "ntlm", "user": "svc", "password": SECRET_VALUE, "domain": "CORP"})
+    assert (creds["auth_mode"], creds["domain"]) == ("ntlm", "CORP")
+
+
+def test_extract_creds_aad_sp_needs_tenant_id():
+    with pytest.raises(ValueError, match="tenant_id") as e:
+        sio._extract_creds({"auth_mode": "aad_sp", "client_id": "app", "client_secret": CLIENT_SECRET_VALUE})
+    assert CLIENT_SECRET_VALUE not in str(e.value)
+
+
+def test_extract_creds_unknown_mode_lists_the_modes_and_hides_values():
+    with pytest.raises(ValueError, match="sql.*ntlm.*aad_sp") as e:
+        sio._extract_creds({"auth_mode": "kerberos", "user": "svc", "password": SECRET_VALUE,
+                            "client_secret": CLIENT_SECRET_VALUE})
+    assert SECRET_VALUE not in str(e.value) and CLIENT_SECRET_VALUE not in str(e.value)
+
+
+def test_redact_hides_every_secret_value():
+    creds = {"auth_mode": "aad_sp", "client_id": "app", "client_secret": CLIENT_SECRET_VALUE,
+             "tenant_id": "t", "password": SECRET_VALUE}
+    text = sio.redact(f"login failed for {SECRET_VALUE} / {CLIENT_SECRET_VALUE}", creds)
+    assert SECRET_VALUE not in text and CLIENT_SECRET_VALUE not in text and "login failed" in text
+    assert sio.redact("plain", None) == "plain"
+
+
+def test_jdbc_config_carries_the_adapter_auth_options(monkeypatch):
+    monkeypatch.setattr(sio, "_creds", lambda scope, key: {"auth_mode": "ntlm", "user": "u", "password": "p",
+                                                           "domain": "CORP", "host": None})
+    sio._config_cache.clear()
+    conf = sio._jdbc_config({"id": 1, "secret_key": "k", "src_host": "h1"})
+    assert conf["options"]["authenticationScheme"] == "NTLM" and conf["options"]["domain"] == "CORP"

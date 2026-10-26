@@ -272,3 +272,14 @@ def test_quiet_table_with_a_due_snapshot_goes_to_the_worker_with_hi():
     plans = planner.route_tables([cfg], cps)
     plans, unchanged = planner.apply_captured(plans, cps, {1: ("100", False)})
     assert unchanged == [] and plans[0]["hi"] == ("100", False)
+
+
+def test_config_error_rejects_windows_and_entra_auth_off_sqlserver():
+    ok = _cfg(1, "d1", "t")
+    assert planner.config_error(dict(ok, auth_mode="ntlm")) is None
+    assert planner.config_error(dict(ok, src_type="sqlserver", auth_mode="aad_sp")) is None
+    for src_type in ("oracle", "postgresql"):
+        for mode in ("ntlm", "aad_sp"):
+            reason = planner.config_error(dict(ok, src_type=src_type, auth_mode=mode))
+            assert mode in reason and src_type in reason and "sqlserver" in reason
+        assert planner.config_error(dict(ok, src_type=src_type, auth_mode="sql")) is None

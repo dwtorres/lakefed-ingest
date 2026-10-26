@@ -32,6 +32,7 @@ import cursor_engine
 import load_strategies
 import planner
 import sink_writer
+import source_io
 import state_store as ss
 import table_retry
 
@@ -131,7 +132,7 @@ def ingest_one(plan, run_id, deps, attempt=0):
             outcome = "reseed_enqueued"
 
     except Exception as e:
-        err = table_retry.describe(e)
+        err = source_io.redact(table_retry.describe(e), source_io.known_creds(cfg))
         pool = _pools_label(cfg, action, slots)
         delay = deps.retry_policy.claim(cfg, e, attempt)   # None: fail now, as without retries
         try:

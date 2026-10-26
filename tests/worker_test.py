@@ -277,3 +277,25 @@ def test_failed_delete_fails_the_table_and_records_no_snapshot_time(deps, snapsh
     assert "advance" in names and "record_delete_snapshot" not in names     # the increment stands
     finish = [c for c in calls if c[0] == "event_finish"][0]
     assert finish[1] == "failed" and finish[2]["stage"] == "snapshot"
+
+
+# ---- US7: no secret value reaches a log line or an event (FR-036) -----------------------------------
+def test_connect_error_text_is_redacted_before_log_and_event(deps, fakes, calls, monkeypatch):
+    import source_io
+    logged = []
+    deps.log = logged.append
+    secret, client_secret = "p4ss-Value-9", "cs-Value-77"
+    plan = dict(PLANS["cursor"][0], cfg=dict(_cfg(), secret_key="k"))
+    monkeypatch.setitem(source_io._creds_cache, source_io.secret_ref(plan["cfg"]),
+                        {"auth_mode": "aad_sp", "client_id": "app", "client_secret": client_secret,
+                         "tenant_id": "t", "password": secret})
+
+    def boom(cfg, typ, *a, **kw):
+        raise RuntimeError(f"Login failed: user=app password={secret} secret={client_secret}")
+    monkeypatch.setattr(worker.cursor_engine, "high_watermark", boom)
+    with pytest.raises(RuntimeError):
+        worker.ingest_one(plan, run_id=1, deps=deps)
+    finish = [c for c in calls if c[0] == "event_finish"][0]
+    assert "Login failed" in finish[2]["error"]
+    for text in [finish[2]["error"]] + logged:
+        assert secret not in text and client_secret not in text
