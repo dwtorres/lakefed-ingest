@@ -1,6 +1,7 @@
 """Source adapters: everything that depends on the SOURCE DATABASE ENGINE (``control.src_type``).
 
-The engine (``ct_engine.py``) and the partitioned seed (``partitions.py``) are written once against
+The engine (``source_io.py``, ``sink_writer.py``, ``cursor_engine.py``) and the partitioned seed
+(``partitions.py``) are written once against
 this interface; an adapter supplies the dialect-specific pieces:
 
 * the JDBC URL, driver class, and default Spark JDBC read options (e.g. fetch size), and the
@@ -9,8 +10,7 @@ this interface; an adapter supplies the dialect-specific pieces:
 * the queries a load strategy needs: plain ``SELECT`` of the select_list, table size in MB and
   MIN/MAX bounds (partitioned seed).
 
-Change-Tracking SQL (CHANGETABLE, retention guard, batched detection) stays in ``ct_engine`` and is
-SQL Server-only; ``load_strategies.supported`` gates which (src_type, load_type) pairs can run.
+``load_strategies.supported`` gates which (src_type, load_type) pairs can run.
 
 Driver availability on Databricks Runtime (the sweep uses Spark JDBC on the cluster):
 

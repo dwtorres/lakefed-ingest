@@ -49,15 +49,6 @@ variables:
   trust_server_certificate:
     description: Trust the source's TLS certificate without validating it (production false).
     default: "true"
-  snapshot_isolation:
-    description: Read SQL Server changes under SNAPSHOT isolation (needs ALLOW_SNAPSHOT_ISOLATION ON).
-    default: "false"
-  reseed_on_new_columns:
-    description: Reseed a table whose select_list gained columns (false carries on from the checkpoint).
-    default: "true"
-  append_batch_size:
-    description: Append sinks with client_id, tables per batched append ("1" = per table).
-    default: "1"
   max_seeds_per_run:
     description: Seeds per run ("0" = no limit).
     default: "0"

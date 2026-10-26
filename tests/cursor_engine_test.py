@@ -137,23 +137,25 @@ class _Rows:
 
 
 def test_column_type_lookup_errors_clearly(monkeypatch):
-    import ct_engine
-    monkeypatch.setattr(ct_engine, "_spark", lambda: None)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([]))
+    import sink_writer
+    import source_io
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([]))
     with pytest.raises(ValueError, match="cursor_column 'updated_at' not found on dbo.orders"):
         cur.column_type(CFG)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "float", "nullable": False}]))
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "float", "nullable": False}]))
     with pytest.raises(ValueError, match="not supported"):
         cur.column_type(CFG)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "DateTime2", "nullable": False}]))
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "DateTime2", "nullable": False}]))
     assert cur.column_type(CFG) == "datetime2"
 
 
 def test_nullable_cursor_column_is_refused(monkeypatch):
     # A NULL cursor value is never > lo, so such rows would be silently missed by every increment.
-    import ct_engine
-    monkeypatch.setattr(ct_engine, "_spark", lambda: None)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "datetime2", "nullable": True}]))
+    import sink_writer
+    import source_io
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "datetime2", "nullable": True}]))
     with pytest.raises(ValueError, match="is nullable"):
         cur.column_type(CFG)
     assert "c.is_nullable AS nullable" in cur.column_type_sql(CFG)
@@ -198,11 +200,12 @@ class _DF:
 
 
 def _merge(monkeypatch, spark, lo="10", hi="20", cfg=CFG):
-    import ct_engine
+    import sink_writer
+    import source_io
     queries = []
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: (queries.append(q), _DF(sp, q))[1])
-    monkeypatch.setattr(ct_engine, "_lit", lambda v: type("L", (), {"alias": lambda s_, n: f"lit({v}) AS {n}"})())
-    monkeypatch.setattr(ct_engine, "WRITE_RETRY_BASE_S", 0.0)
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: (queries.append(q), _DF(sp, q))[1])
+    monkeypatch.setattr(sink_writer, "_lit", lambda v: type("L", (), {"alias": lambda s_, n: f"lit({v}) AS {n}"})())
+    monkeypatch.setattr(sink_writer, "WRITE_RETRY_BASE_S", 0.0)
     return cur.read_and_merge(spark, cfg, "c.s.t", "int", lo, hi), queries
 
 
@@ -264,11 +267,12 @@ def test_consolidated_cursor_read_is_tagged_and_merged_on_client(monkeypatch):
 
 def test_every_run_rechecks_nullability(monkeypatch):
     # A column altered to NULL after the seed is caught by the steady-state run's watermark query.
-    import ct_engine
-    monkeypatch.setattr(ct_engine, "_spark", lambda: None)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 0}]))
+    import sink_writer
+    import source_io
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 0}]))
     assert cur.high_watermark(CFG, "int") == "20"
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 1}]))
+    monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 1}]))
     with pytest.raises(ValueError, match="is nullable"):
         cur.high_watermark(CFG, "int")
     assert "c.is_nullable" in cur.nullable_sql(CFG) and "N'updated_at'" in cur.nullable_sql(CFG)

@@ -12,10 +12,6 @@ of waiting for the next run. Off unless job parameter ``table_retries`` is above
   one; the wrapper waits (holding no slot), re-plans the table from its checkpoint
   (``planner.retry_plan``) and runs it again.
 
-A retry never appends blind: in append mode the next attempt first checks the sink for this run's
-rows of the table (``planner.retry_plan``, ``ct_engine.append_committed``), so an append whose
-commit landed before its statement failed is not written twice.
-
 Pure Python apart from reading a Java exception's causes through py4j when one is attached;
 unit-tested in tests/table_retry_test.py.
 """
@@ -30,7 +26,7 @@ import time
 from collections import Counter
 from typing import Callable, Dict, List, Optional
 
-import ct_engine
+import source_io
 
 PER_SOURCE = int(os.environ.get("LAKEFED_TABLE_RETRY_PER_SOURCE", "5"))
 BASE_S = float(os.environ.get("LAKEFED_TABLE_RETRY_BASE_S", "10"))
@@ -42,15 +38,13 @@ TRANSIENT, PERMANENT = "transient", "permanent"
 # Never retried, whatever else the error says: the run must stop writing, or another path owns it.
 _NEVER = (
     "collection lock lost",            # the sweep lost its lock: the next sweep redoes the table
-    ct_engine.RETENTION_LAPSED_MARKER,  # CT retention passed the checkpoint: the worker reseeds
     "SPARK_JOB_CANCELLED", "Job aborted due to cancellation", "OutOfMemoryError", "DRIVER_OOM",
 )
 # Permanent: the same attempt would fail again. Checked before the transient rules, because Spark
 # wraps a refused login in the same FAILED_JDBC.CONNECTION error as a dropped connection.
 _PERMANENT = (
     "Login failed for user", "Cannot open database", "Invalid object name", "Invalid column name",
-    "permission was denied", "VIEW CHANGE TRACKING permission",
-    ct_engine.CT_NOT_ENABLED_MSG, ct_engine.CT_TABLE_NOT_ENABLED_MSG,
+    "permission was denied",
     "TABLE_OR_VIEW_NOT_FOUND", "UNRESOLVED_COLUMN", "DELTA_FAILED_TO_MERGE_FIELDS", "CAST_INVALID_INPUT",
     "DATATYPE_MISMATCH", "PKIX path building failed", "UnknownHostException",
     # Oracle, PostgreSQL, MySQL: a refused login, a missing object, a missing privilege.
@@ -193,14 +187,14 @@ class RetryPolicy:
 
     * ``retries``: extra attempts per table.
     * ``budget``: retries in the whole run; once spent, failures fail at once.
-    * ``per_source``: failed retries on one source server (``ct_engine.source_key``) before that
+    * ``per_source``: failed retries on one source server (``source_io.source_key``) before that
       source stops retrying for the rest of the run. Retries that succeed don't count, so a blip that
       fails many of a server's tables at once is retried in full. An outage that fails them all at
       the same moment gets retries before any has failed: the run's ``budget`` bounds those."""
 
     def __init__(self, retries: int = 0, budget: int = DEFAULT_BUDGET, per_source: int = None,
                  base_s: float = None, max_s: float = None, rand=random.random,
-                 source_of: Callable[[dict], str] = ct_engine.source_key):
+                 source_of: Callable[[dict], str] = source_io.source_key):
         self.retries, self.budget = max(0, int(retries or 0)), max(0, int(budget or 0))
         self.per_source = PER_SOURCE if per_source is None else int(per_source)
         self.base_s, self.max_s, self.rand, self.source_of = base_s, max_s, rand, source_of

@@ -19,7 +19,7 @@ Supported column types (SQL Server system type of ``cursor_column``):
     never skipped.
 Float / real / string columns are rejected (lossy or not reliably ordered).
 
-Limits (by design of a watermark): deletes are not captured (use ``ct``, or a periodic ``full``);
+Limits (by design of a watermark): deletes are not captured (use a periodic ``full``);
 updates are captured only if they move the cursor column (``rowversion`` always does, an identity
 never does); for non-rowversion columns, a transaction that commits a value BELOW an already-read
 ``hi`` after the read is missed — the reason ``rowversion`` is recommended.
@@ -28,8 +28,8 @@ Position (``checkpoint.position``, text) is JSON ``{"col", "type", "value"}``: t
 type are recorded so a changed ``cursor_column`` re-seeds and every later cycle needs no type
 lookup. ``value`` is the SQL Server string form (ISO 8601 for temporal, decimal text otherwise).
 
-Pure builders are unit-tested in tests/cursor_engine_test.py; source access reuses ``ct_engine``'s
-JDBC helpers (one slot per query unit, lazy Spark imports).
+Pure builders are unit-tested in tests/cursor_engine_test.py; source access reuses ``source_io``
+(one slot per query unit, lazy Spark imports) and sink writes reuse ``sink_writer``.
 """
 
 from __future__ import annotations
@@ -41,8 +41,9 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
-import ct_engine
+import sink_writer
 import source_adapters
+import source_io
 
 # SQL Server names (TYPE_NAME) and PostgreSQL names (information_schema.columns.data_type, which
 # never reports a bare 'timestamp' — that name stays SQL Server's rowversion alias).
@@ -91,7 +92,7 @@ def decode_position(text: Optional[str]) -> Optional[dict]:
 # ---- SQL builders (pure) ---------------------------------------------------------------------------
 
 def _obj(cfg: dict) -> str:
-    return ct_engine.quote_nstr(f"{ct_engine.quote_ident(cfg['src_schema'])}.{ct_engine.quote_ident(cfg['src_table'])}")
+    return source_io.quote_nstr(f"{source_io.quote_ident(cfg['src_schema'])}.{source_io.quote_ident(cfg['src_table'])}")
 
 
 def _is_pg(cfg: dict) -> bool:
@@ -101,7 +102,7 @@ def _is_pg(cfg: dict) -> bool:
 def _col(cfg: dict) -> str:
     """``cursor_column`` quoted for the source dialect."""
     a = source_adapters.for_cfg(cfg)
-    return a.quote_ident(cfg["cursor_column"]) if _is_pg(cfg) else ct_engine.quote_ident(cfg["cursor_column"])
+    return a.quote_ident(cfg["cursor_column"]) if _is_pg(cfg) else source_io.quote_ident(cfg["cursor_column"])
 
 
 def _pg_column_where(cfg: dict) -> str:
@@ -115,7 +116,7 @@ def column_type_sql(cfg: dict) -> str:
     if _is_pg(cfg):
         return f"SELECT data_type AS typ, (is_nullable = 'YES') AS nullable {_pg_column_where(cfg)}"
     return ("SELECT TYPE_NAME(c.system_type_id) AS typ, c.is_nullable AS nullable FROM sys.columns c "
-            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])}")
+            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {source_io.quote_nstr(cfg['cursor_column'])}")
 
 
 def nullable_sql(cfg: dict) -> str:
@@ -124,7 +125,7 @@ def nullable_sql(cfg: dict) -> str:
     if _is_pg(cfg):
         return f"(SELECT CASE WHEN is_nullable = 'YES' THEN 1 ELSE 0 END {_pg_column_where(cfg)})"
     return ("(SELECT CAST(c.is_nullable AS INT) FROM sys.columns c "
-            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])})")
+            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {source_io.quote_nstr(cfg['cursor_column'])})")
 
 
 _PG_ISO = "'YYYY-MM-DD\"T\"HH24:MI:SS.US'"
@@ -154,7 +155,7 @@ def high_watermark_sql(cfg: dict, typ: str) -> str:
     else:
         mx, mar = f"CAST(MAX({col}) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
         expr = f"CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END)"
-    table = ct_engine.quote_ident(cfg["src_schema"]) + "." + ct_engine.quote_ident(cfg["src_table"])
+    table = source_io.quote_ident(cfg["src_schema"]) + "." + source_io.quote_ident(cfg["src_table"])
     return f"SELECT {expr} AS hi, {nullable_sql(cfg)} AS nullable FROM {table}"
 
 
@@ -172,7 +173,7 @@ def literal(value: str, typ: str, pg: bool = False) -> str:
             raise ValueError(f"invalid temporal cursor position {value!r}")
         if pg:
             return f"CAST('{v}' AS {typ.strip().lower()})"
-        return f"CONVERT({typ.strip().lower()}, {ct_engine.quote_nstr(v)}, 126)"
+        return f"CONVERT({typ.strip().lower()}, {source_io.quote_nstr(v)}, 126)"
     if not _INTEGER_VALUE.match(v):
         raise ValueError(f"invalid rowversion cursor position {value!r}")
     return f"CAST(CAST({v} AS BIGINT) AS BINARY(8))"
@@ -222,13 +223,13 @@ def _minus_seconds(value: str, seconds: int) -> str:
 def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     """Idempotent upsert MERGE by PK — (__client_id__, PK) for a consolidated sink — with schema
     evolution. A watermark read carries no deletes."""
-    sl, keys = ", ".join(ct_engine.write_columns(cfg)), ", ".join(ct_engine.merge_keys(cfg))
+    sl, keys = ", ".join(sink_writer.write_columns(cfg)), ", ".join(sink_writer.merge_keys(cfg))
     return (
         f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s "
-        f"ON {ct_engine.merge_on_cfg(cfg)} "
-        f"WHEN MATCHED THEN UPDATE SET {ct_engine.merge_set(sl, keys)} "
-        f"WHEN NOT MATCHED THEN INSERT ({ct_engine.merge_insert_cols(sl)}) "
-        f"VALUES ({ct_engine.merge_insert_vals(sl)})"
+        f"ON {sink_writer.merge_on_cfg(cfg)} "
+        f"WHEN MATCHED THEN UPDATE SET {sink_writer.merge_set(sl, keys)} "
+        f"WHEN NOT MATCHED THEN INSERT ({sink_writer.merge_insert_cols(sl)}) "
+        f"VALUES ({sink_writer.merge_insert_vals(sl)})"
     )
 
 
@@ -240,8 +241,8 @@ def column_type(cfg: dict, slots=None) -> str:
     A nullable cursor column is refused: incremental reads select ``col > lo AND col <= hi``, so a
     row whose cursor value is NULL would never be read (the seed copies it, later changes to it
     would be silently missed)."""
-    with ct_engine._unit(slots, cfg):
-        row = ct_engine._read(ct_engine._spark(), cfg, column_type_sql(cfg)).first()
+    with source_io._unit(slots, cfg):
+        row = source_io._read(source_io._spark(), cfg, column_type_sql(cfg)).first()
     if row is None or row["typ"] is None:
         raise ValueError(f"cursor_column '{cfg['cursor_column']}' not found on "
                          f"{cfg['src_schema']}.{cfg['src_table']}")
@@ -259,8 +260,8 @@ def _refuse_nullable(cfg: dict, nullable) -> None:
 
 
 def high_watermark(cfg: dict, typ: str, slots=None) -> Optional[str]:
-    with ct_engine._unit(slots, cfg):
-        row = ct_engine._read(ct_engine._spark(), cfg, high_watermark_sql(cfg, typ)).first()
+    with source_io._unit(slots, cfg):
+        row = source_io._read(source_io._spark(), cfg, high_watermark_sql(cfg, typ)).first()
     if row is not None:
         _refuse_nullable(cfg, row["nullable"])
     return None if row is None or row["hi"] is None else str(row["hi"])
@@ -272,15 +273,15 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
     ``.cache()``/``count()``). Returns rows affected from the MERGE metrics (None if unavailable)."""
     query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi))
     def once():
-        with ct_engine._unit(slots, cfg):
-            df = ct_engine._tag(ct_engine._read(spark, cfg, query), cfg)
+        with source_io._unit(slots, cfg):
+            df = sink_writer._tag(source_io._read(spark, cfg, query), cfg)
             view = f"cursor_staged_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
                 return spark.sql(upsert_merge_sql(cfg, sink_fqn, view)).first()
             finally:
                 spark.catalog.dropTempView(view)
-    result = ct_engine.with_write_retry(once, what=f"merge {sink_fqn}")
+    result = sink_writer.with_write_retry(once, what=f"merge {sink_fqn}")
     if result is not None and "num_affected_rows" in result.asDict():
         return int(result["num_affected_rows"] or 0)
     return None

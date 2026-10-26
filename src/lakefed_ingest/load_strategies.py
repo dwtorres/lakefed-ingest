@@ -8,14 +8,11 @@ only by the strategy that wrote it.
 =========  ============================================================  ==========================
 load_type  behaviour                                                     position
 =========  ============================================================  ==========================
-ct         SQL Server Change Tracking: seed, then CHANGETABLE increments  CT version (decimal text)
-           MERGEd by PK; skip-no-change per source database
+cursor     High-watermark column (SQL Server, PostgreSQL; placeholder      JSON {col, type, value}
+           elsewhere): seed, then (position, hi] reads upsert-MERGEd by
+           PK; no deletes
 full       Reload the whole table every cycle (data-only atomic replace;  NULL (not resumable)
            partitioned tables use the staged swap). No PK required
-cursor     High-watermark column (SQL Server; placeholder elsewhere): seed,  JSON {col, type, value}
-           then (position, hi] reads upsert-MERGEd by PK; no deletes
-cdc        PLACEHOLDER — log-based CDC (e.g. SQL Server CDC, Postgres     engine LSN / SCN (text)
-           logical decoding, Oracle LogMiner, MySQL binlog)
 =========  ============================================================  ==========================
 
 ``supported(src_type, load_type)`` is the support matrix the planner enforces: a control row whose
@@ -30,8 +27,8 @@ from typing import Optional
 
 import source_adapters as sa
 
-CT, FULL, CURSOR, CDC = "ct", "full", "cursor", "cdc"
-LOAD_TYPES = (CT, CDC, CURSOR, FULL)
+FULL, CURSOR = "full", "cursor"
+LOAD_TYPES = (CURSOR, FULL)
 
 
 class LoadStrategy:
@@ -46,36 +43,18 @@ class LoadStrategy:
         return text
 
 
-class CtStrategy(LoadStrategy):
-    """SQL Server Change Tracking. The engine lives in ``ct_engine`` (seed, batched detection,
-    CHANGETABLE read + MERGE, retention guard); the sweep routes each table per cycle via
-    ``planner.detect_group``. Position = the database CT version the sink is consistent with."""
-
-    name = CT
-    requires_pk = True
-    implemented = True
-
-    def encode_position(self, value):
-        return None if value is None else str(int(value))
-
-    def decode_position(self, text):
-        return 0 if text is None or str(text).strip() == "" else int(text)
-
-
 class FullStrategy(LoadStrategy):
     """Full reload every cycle: one JDBC read streams into a data-only ``INSERT OVERWRITE`` (or the
     staged, atomic partitioned swap when ``load_partitioned``). The table definition (id, grants,
-    clustering, properties) is preserved. No PK and no position. With ``write_mode`` append, each
-    cycle's read is appended as a snapshot instead (operation 'S', written by ingest run ``run_id``)."""
+    clustering, properties) is preserved. No PK and no position."""
 
     name = FULL
     implemented = True
 
-    def load(self, spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None, run_id=None):
-        import ct_engine
-        ct_engine.ensure_sink_table(spark, cfg, sink_fqn, slots=slots)
-        return ct_engine.seed(spark, cfg, sink_fqn, slots=slots, executor=executor, guard=guard,
-                              run_id=run_id)
+    def load(self, spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None):
+        import sink_writer
+        sink_writer.ensure_sink_table(spark, cfg, sink_fqn, slots=slots)
+        return sink_writer.seed(spark, cfg, sink_fqn, slots=slots, executor=executor, guard=guard)
 
 
 class CursorStrategy(LoadStrategy):
@@ -89,7 +68,7 @@ class CursorStrategy(LoadStrategy):
       upsert-MERGE by PK, then advance to hi' (at-least-once; the MERGE is idempotent);
     * position = JSON ``{col, type, value}`` (``cursor_engine.encode_position``) — a changed
       ``cursor_column`` re-seeds;
-    * deletes are NOT captured (use ``ct``, or a periodic ``full``).
+    * deletes are NOT captured (use a periodic ``full``).
     """
 
     name = CURSOR
@@ -104,42 +83,21 @@ class CursorStrategy(LoadStrategy):
         return cursor_engine.decode_position(text)
 
 
-class CdcStrategy(LoadStrategy):
-    """PLACEHOLDER — log-based CDC (inserts, updates AND deletes from the engine's change log).
-    Contract for the implementation:
+_STRATEGIES = {s.name: s for s in (FullStrategy(), CursorStrategy())}
 
-    * control: ``cdc_capture_instance`` (SQL Server CDC capture instance / Postgres slot+publication /
-      Oracle or MySQL equivalent) and ``primary_key``;
-    * seed at a consistent log position (captured BEFORE the seed), checkpoint position = that LSN/SCN
-      encoded as text;
-    * each cycle: read changes in (position, current] — one source read — MERGE I/U/D by PK keeping
-      the LAST change per key, advance position only after the MERGE commits;
-    * a position older than the log's retention -> reseed (same contract as CT's retention guard).
-    """
-
-    name = CDC
-    requires_pk = True
-
-    def load(self, *_, **__):
-        raise NotImplementedError("load_type 'cdc' is not implemented yet")
-
-
-_STRATEGIES = {s.name: s for s in (CtStrategy(), FullStrategy(), CursorStrategy(), CdcStrategy())}
-
-# (src_type, load_type) pairs that run today. CT is SQL Server-only by definition; FULL works for
-# every adapter; CURSOR runs on SQL Server and PostgreSQL. PLACEHOLDER pairs are planned (clear "not
-# implemented yet" error); anything else is "not supported". CDC is a placeholder everywhere.
+# (src_type, load_type) pairs that run today. FULL works for every adapter; CURSOR runs on SQL
+# Server and PostgreSQL. PLACEHOLDER pairs are planned (clear "not implemented yet" error);
+# anything else is "not supported".
 SUPPORT = {
-    (sa.SQLSERVER, CT), (sa.SQLSERVER, FULL), (sa.SQLSERVER, CURSOR),
+    (sa.SQLSERVER, FULL), (sa.SQLSERVER, CURSOR),
     (sa.ORACLE, FULL), (sa.POSTGRESQL, FULL), (sa.POSTGRESQL, CURSOR), (sa.MYSQL, FULL),
 }
-PLACEHOLDER = {(sa.ORACLE, CURSOR), (sa.MYSQL, CURSOR)} | {
-    (st, CDC) for st in sa.SRC_TYPES}
+PLACEHOLDER = {(sa.ORACLE, CURSOR), (sa.MYSQL, CURSOR)}
 
 
 def get_strategy(load_type: Optional[str]) -> LoadStrategy:
-    """Strategy for ``control.load_type`` (NULL/empty -> ct, the column default)."""
-    key = (load_type or CT).strip().lower()
+    """Strategy for ``control.load_type`` (NULL/empty -> cursor, the column default)."""
+    key = (load_type or CURSOR).strip().lower()
     try:
         return _STRATEGIES[key]
     except KeyError:

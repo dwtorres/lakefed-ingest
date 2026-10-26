@@ -61,9 +61,6 @@ resources:
               parallelism: "{{job.parameters.parallelism}}"
               secret_scope: "{{job.parameters.secret_scope}}"
               trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
-              snapshot_isolation: "{{job.parameters.snapshot_isolation}}"
-              reseed_on_new_columns: "{{job.parameters.reseed_on_new_columns}}"
-              append_batch_size: "{{job.parameters.append_batch_size}}"
               max_seeds_per_run: "{{job.parameters.max_seeds_per_run}}"
               freshness_interval_s: "{{job.parameters.freshness_interval_s}}"
               detection_chunk: "{{job.parameters.detection_chunk}}"
@@ -109,20 +106,6 @@ resources:
         # PostgreSQL sslmode verify-full vs require, MySQL sslMode VERIFY_IDENTITY vs REQUIRED).
         - name: trust_server_certificate
           default: ${var.trust_server_certificate}
-        # Read changes under SNAPSHOT isolation: consistent change rows, but every source database
-        # needs ALLOW_SNAPSHOT_ISOLATION ON (otherwise reads fail with SQL Server error 3952).
-        - name: snapshot_isolation
-          default: ${var.snapshot_isolation}
-        # "false": a table whose select_list gained columns carries on from its checkpoint instead of
-        # reseeding (rows written before stay NULL in the new columns), e.g. for append sinks, whose
-        # history needn't be backfilled with a full snapshot of every table that gained a column.
-        - name: reseed_on_new_columns
-          default: ${var.reseed_on_new_columns}
-        # Append sinks with client_id: up to this many tables appending to the same sink are read in
-        # one Spark job (a task per source database) and written in one Delta commit. "1" = per table.
-        # A batch holds one `parallelism` slot per table, so raise parallelism with it.
-        - name: append_batch_size
-          default: ${var.append_batch_size}
         # Onboarding at scale: at most this many seeds per run; the rest seed in later runs, while the
         # tables already seeded keep getting their increments. "0" = no limit.
         - name: max_seeds_per_run

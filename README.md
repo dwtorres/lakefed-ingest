@@ -1,36 +1,12 @@
 # Lakehouse Federation Ingestion Framework
 
-Metadata-driven ingestion from external databases into Delta tables on Databricks. This repo holds
-two versions:
-
-| | **Default version** (repo root) | **Job orchestration version** ([`job_orchestration/`](job_orchestration/README.md)) |
-|---|---|---|
-| Orchestration | One job task ingests a whole `task_collection` in-process (thread pool + Spark FAIR scheduler pools) | Jobs `for_each` tasks: one task run per table / partition |
-| Compute | Job cluster only — no SQL warehouse | SQL warehouse + notebooks |
-| Metadata / state | Lakebase (Postgres): control, checkpoints, reseed queue, telemetry | Delta control table |
-| Source access | Spark JDBC with per-database credentials from a secret scope, or `remote_query` through a UC connection per row | Lakehouse Federation / `remote_query` via UC connections |
-| Load types | SQL Server Change Tracking (`ct`) and watermark `cursor`, each with full / partitioned seed; `full` reload (partitioned or not) for every source. `cdc` and non-SQL Server `cursor` are placeholders | Full, watermark incremental, partitioned full |
-| Sources | SQL Server (`ct`, `cursor`, `full`); Oracle, PostgreSQL, MySQL (`full`) | SQL Server, Oracle, PostgreSQL, Redshift, Synapse, IBM Db2 LUW |
-| Bundle | `lakefed_ingest_v2` | `lakefed_ingest` |
-
-The job orchestration version remains supported. Use it when you want warehouse-only compute,
-watermark-based incremental loads from a source other than SQL Server, or a source the default
-version doesn't support yet. Use the default version when you have many source databases or tables
-(thousands to hundreds of thousands), per-database credentials, want many source databases
-consolidated into shared tables, or need Change Tracking (incremental loads without a reliable
-watermark column, deletes included).
-
-> **Upgrading from an earlier release (deploy-path change).** The original version moved from the
-> repo root to [`job_orchestration/`](job_orchestration/README.md), unchanged and with the same bundle
-> name and uuid, so deploying it **from `job_orchestration/`** updates your existing jobs in place.
-> The repo root is now the default version, a different bundle (`lakefed_ingest_v2`): a
-> `databricks bundle deploy` run from the root — including CI or scripts written for the old layout —
-> doesn't touch your existing jobs, but creates the default version's resources, including a
-> billable Lakebase instance. Update deploy automation to `cd job_orchestration` first. If you
-> deployed a preview of the default version, follow
-> [Upgrading a preview deployment](docs/deploy.md) before deploying either version.
-
-The rest of this README covers the default version.
+Metadata-driven ingestion from external databases into Delta tables on Databricks. One job task
+ingests a whole `task_collection` in-process (thread pool + Spark FAIR scheduler pools) on a job
+cluster, with no SQL warehouse. State (control, checkpoints, telemetry) lives in Lakebase
+(Postgres). Source reads use Spark JDBC with per-database credentials from a secret scope, or
+`remote_query` through a UC connection per row. Load types: watermark `cursor` (SQL Server,
+PostgreSQL; full or partitioned seed) and `full` reload (partitioned or not) for SQL Server, Oracle,
+PostgreSQL and MySQL. `cursor` on Oracle and MySQL is a placeholder. Bundle: `lakefed_ingest_v2`.
 
 ## Why one task per collection
 
@@ -57,8 +33,9 @@ src/lakefed_ingest/
   planner.py                       # strategy routing + skip-no-change planning (pure, unit-tested)
   source_adapters.py               # per-engine dialect: JDBC URL/driver, quoting, size/bounds/select SQL
   load_strategies.py               # per-load_type strategy + the (src_type, load_type) support matrix
-  ct_engine.py                     # source ops via Spark JDBC: CT versions, detection, read + MERGE, seed
-  batch_append.py                  # batched appends: many tables -> one sink, one job, one commit
+  source_io.py                     # source reads via Spark JDBC or remote_query: credentials, URL, the query unit
+  sink_writer.py                   # sink writes: MERGE / INSERT text, consolidated sinks, seeds, write retry
+  cursor_engine.py                 # cursor strategy: type lookup, high watermark, window read + MERGE
   parallel.py                      # thread pool + FAIR pools + the shared WorkSlots budget
   partitions.py                    # partitioned-seed planning
   state_store.py                   # Lakebase accessor: config, checkpoints, telemetry, locks
@@ -67,8 +44,7 @@ src/lakefed_ingest/
 notebooks/load_control_example.ipynb   # register tables in the Lakebase control table
 tools/source_profile.sql           # read-only SQL Server profiling script for sizing
 docs/deploy.md, docs/monitoring.md
-tests/                             # unit tests (no cluster), synthetic DB generator, validation harness
-job_orchestration/                 # the job orchestration version (its own bundle)
+tests/                             # unit tests (no cluster), synthetic DB generator
 ```
 
 ## How a run works
@@ -493,14 +469,10 @@ cluster size.
 ## Tests
 
 ```bash
-pytest                              # both versions (testpaths in pytest.ini)
-pytest tests                        # default version only
-pytest job_orchestration/tests      # job orchestration version only
+pytest                              # the same as pytest tests (testpaths in pytest.ini)
 ```
 
-Run `pytest` from the repo root (`pytest.ini` there sets the test paths for both versions). Unit
-tests need no cluster. `tests/validation_test.py` runs against a live SQL Server when the
-`LAKEFED_TEST_SQLSERVER_*` environment variables are set and is skipped otherwise.
+Run `pytest` from the repo root. Unit tests need no cluster.
 
 For a dev or test source, `tests/synthetic/` builds a SQL Server database with 1,800 CT-enabled
 tables, applies changes to it, and reconciles the sinks with the source; see
@@ -524,7 +496,6 @@ team will help on a best-effort basis.
 |---|---|---|---|
 | certifi | Mozilla CA bundle (live SQL Server validation tests) | MPL-2.0 | https://pypi.org/project/certifi/ |
 | databricks-sdk | Databricks SDK for Python | Apache-2.0 | https://pypi.org/project/databricks-sdk/ |
-| ibm_db | IBM Db2 driver (Db2 test data generator, job orchestration version) | Apache-2.0 | https://pypi.org/project/ibm-db/ |
 | Microsoft JDBC Driver for SQL Server | SQL Server JDBC driver (included in Databricks Runtime) | MIT | https://github.com/microsoft/mssql-jdbc |
 | MySQL Connector/J | MySQL JDBC driver (optional cluster library) | GPL-2.0 with Universal FOSS Exception | https://github.com/mysql/mysql-connector-j |
 | Oracle JDBC driver (ojdbc11) | Oracle JDBC driver (optional cluster library) | Oracle Free Use Terms and Conditions | https://www.oracle.com/downloads/licenses/oracle-free-license.html |
