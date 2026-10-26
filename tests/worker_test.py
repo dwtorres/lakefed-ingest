@@ -1,0 +1,148 @@
+"""worker.ingest_one with fakes: the sink write commits before the checkpoint advances."""
+from types import SimpleNamespace
+
+import pytest
+
+import table_retry
+import worker
+
+
+def _cfg():
+    return {"id": 7, "src_database": "db", "src_schema": "dbo", "src_table": "t", "load_type": "cursor",
+            "cursor_column": "mod", "select_list": None, "sink_catalog": "c", "sink_schema": "s",
+            "sink_table": "t"}
+
+
+class FakeStore:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def record_event_start(self, run_id, cfg, action, phase, pool):
+        self.calls.append(("event_start", action))
+        return 1
+
+    def record_event_finish(self, event_id, status, **kw):
+        self.calls.append(("event_finish", status, kw))
+
+    def advance_checkpoint(self, cfg, position=None, **kw):
+        self.calls.append(("advance", position, kw))
+
+    def enqueue_reseed(self, cfg, reason):
+        self.calls.append(("enqueue_reseed", reason))
+
+    def set_status(self, cfg, status, detail):
+        self.calls.append(("set_status", status))
+
+
+class FakeSlots:
+    def start_tracking(self):
+        pass
+
+    def tracked_pools(self):
+        return ["pool0"]
+
+
+@pytest.fixture
+def calls():
+    return []
+
+
+@pytest.fixture
+def deps(calls):
+    return SimpleNamespace(spark=object(), store=FakeStore(calls), slots=FakeSlots(), executor=None,
+                           log=lambda *a: None, params={"table_retries": 0}, guard=lambda: None,
+                           retry_policy=table_retry.RetryPolicy(retries=0, budget=0))
+
+
+@pytest.fixture
+def fakes(monkeypatch, calls):
+    """Fake the source/sink modules the worker calls; ``fail`` makes every write raise."""
+    state = {"fail": False}
+
+    def write(name):
+        def _w(*a, **kw):
+            calls.append((name,))
+            if state["fail"]:
+                raise RuntimeError("sink write failed")
+            return 3
+        return _w
+
+    def high_watermark(cfg, typ, slots=None):
+        calls.append(("high_watermark",))
+        return "42"
+
+    monkeypatch.setattr(worker, "sink_writer", SimpleNamespace(
+        sink_fqn=lambda cfg: "c.s.t", ensure_sink_table=lambda *a, **kw: None, seed=write("seed")))
+    monkeypatch.setattr(worker, "cursor_engine", SimpleNamespace(
+        column_type=lambda cfg, slots=None: "int", high_watermark=high_watermark,
+        seed_position=worker.cursor_engine.seed_position, encode_position=worker.cursor_engine.encode_position,
+        plan_increment=worker.cursor_engine.plan_increment, read_and_merge=write("merge")))
+    monkeypatch.setattr(worker, "load_strategies", SimpleNamespace(
+        get_strategy=lambda lt: SimpleNamespace(load=write("full_load"))))
+    return state
+
+
+PLANS = {
+    "cursor_seed": ({"route": "cursor_seed", "cfg": _cfg(), "cp": None}, "seed"),
+    "cursor": ({"route": "cursor", "cfg": _cfg(), "cp": {"phase": "incremental"},
+                "position": {"col": "mod", "type": "int", "value": "10"}}, "merge"),
+    "full": ({"route": "full", "cfg": dict(_cfg(), load_type="full"), "cp": None}, "full_load"),
+}
+
+
+def _names(calls):
+    return [c[0] for c in calls]
+
+
+@pytest.mark.parametrize("route", list(PLANS))
+def test_sink_write_precedes_checkpoint_advance(route, deps, fakes, calls):
+    plan, write = PLANS[route]
+    worker.ingest_one(plan, run_id=1, deps=deps)
+    names = _names(calls)
+    assert names.index(write) < names.index("advance")
+    assert names[-1] == "event_finish" and calls[-1][1] == "ok"
+
+
+@pytest.mark.parametrize("route", list(PLANS))
+def test_failed_write_leaves_checkpoint_untouched(route, deps, fakes, calls):
+    plan, _ = PLANS[route]
+    fakes["fail"] = True
+    with pytest.raises(RuntimeError):
+        worker.ingest_one(plan, run_id=1, deps=deps)
+    names = _names(calls)
+    assert "advance" not in names
+    assert ("set_status", "failed") in calls
+    assert [c for c in calls if c[0] == "event_finish"][0][1] == "failed"
+
+
+def test_schema_reseed_enqueues_reseed(deps, fakes, calls):
+    plan = {"route": "schema_reseed", "cfg": _cfg(), "cp": {"phase": "incremental"}, "added": ["x"]}
+    assert worker.ingest_one(plan, run_id=1, deps=deps) == "reseed_enqueued"
+    assert ("enqueue_reseed", "schema_change") in calls
+    assert "advance" not in _names(calls)
+
+
+def test_failure_before_any_write_records_failed_event_and_no_position(deps, fakes, calls, monkeypatch):
+    # Nothing can fail at stage "plan" inside the worker's try (the position is read before the event
+    # starts), so the earliest failure is the high-watermark read: failed event, no position, no advance.
+    def boom(cfg, typ, slots=None):
+        raise RuntimeError("source unreachable")
+    monkeypatch.setattr(worker.cursor_engine, "high_watermark", boom)
+    plan, _ = PLANS["cursor"]
+    with pytest.raises(RuntimeError):
+        worker.ingest_one(plan, run_id=1, deps=deps)
+    finish = [c for c in calls if c[0] == "event_finish"][0]
+    assert finish[1] == "failed"
+    assert finish[2]["stage"] == "read"
+    assert finish[2]["position_to"] is None
+    assert "advance" not in _names(calls)
+
+
+def test_cursor_seed_captures_hi_before_seed_and_advances_to_it(deps, fakes, calls):
+    plan, _ = PLANS["cursor_seed"]
+    assert worker.ingest_one(plan, run_id=1, deps=deps) == "seeded"
+    names = _names(calls)
+    assert names.index("high_watermark") < names.index("seed")
+    advance = [c for c in calls if c[0] == "advance"][0]
+    assert advance[1] == worker.cursor_engine.encode_position("mod", "int", "42")
+    assert advance[2]["phase"] == "incremental"

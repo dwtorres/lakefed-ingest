@@ -95,6 +95,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 |---|---|
 | `src/lakefed_ingest/source_io.py` | Source reads (Spark JDBC, or `remote_query` through a UC connection): credentials, URL, the query unit (`_read`, `_unit`, `source_key`) |
 | `src/lakefed_ingest/sink_writer.py` | Sink writes: MERGE / INSERT text, consolidated sinks (`client_id`, `client_attrs`), sink DDL, seed (plain or partitioned), write-conflict retry |
+| `src/lakefed_ingest/worker.py` | Per-table worker (`ingest_one(plan, run_id, deps, attempt)`): routes `full` / `cursor_seed` / `cursor` / `schema_reseed`, telemetry, and the checkpoint advance after the sink commit (`tests/worker_test.py`); `_replan` for retries |
 | `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |

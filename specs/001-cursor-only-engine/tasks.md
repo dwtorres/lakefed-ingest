@@ -74,10 +74,10 @@ Single project. Package `src/lakefed_ingest/`, tests `tests/`, bundle `databrick
 
 **Purpose**: Move the per-table worker into a tested module so the checkpoint-after-commit invariant has a unit test (FR-027, FR-037, Principle VI). Blocks every user story phase.
 
-- [ ] T013 Create `tests/worker_test.py` with a fake `deps` object (`spark`, `store`, `slots`, `executor`, `log`, `params`) and failing tests that assert: the sink write call precedes the checkpoint advance call for routes `cursor_seed`, `cursor`, and `full`. A failed sink write leaves the checkpoint untouched. The `schema_reseed` route enqueues a reseed. The `plan` failure route records a failed event and no position. The `cursor_seed` route captures `hi` through `cursor_engine.high_watermark` before the seed read and advances the position to that `hi`
-- [ ] T014 Create `src/lakefed_ingest/worker.py` from the notebook functions `ingest_one`, `_replan`, and `_pools_label` in `src/lakefed_ingest/ingest.ipynb`. Signature `ingest_one(plan, run_id, deps, attempt=0)` per research R-03. Make T013 pass
-- [ ] T015 Replace the worker cells in `src/lakefed_ingest/ingest.ipynb` with: build `deps`, bind `worker.ingest_one`, pass it to `parallel.run_parallel`. Keep `widget`, the advisory lock, `assert_lock_held`, the pool setup, the source share refresh, and the plan call
-- [ ] T016 Run `pytest tests` and `rg -n "def ingest_one" src/lakefed_ingest/ingest.ipynb`. Expect green, no grep output. Commit `refactor(worker): move per-table worker into worker.py`
+- [X] T013 Create `tests/worker_test.py` with a fake `deps` object (`spark`, `store`, `slots`, `executor`, `log`, `params`) and failing tests that assert: the sink write call precedes the checkpoint advance call for routes `cursor_seed`, `cursor`, and `full`. A failed sink write leaves the checkpoint untouched. The `schema_reseed` route enqueues a reseed. The `plan` failure route records a failed event and no position. The `cursor_seed` route captures `hi` through `cursor_engine.high_watermark` before the seed read and advances the position to that `hi`
+- [X] T014 Create `src/lakefed_ingest/worker.py` from the notebook functions `ingest_one`, `_replan`, and `_pools_label` in `src/lakefed_ingest/ingest.ipynb`. Signature `ingest_one(plan, run_id, deps, attempt=0)` per research R-03. Make T013 pass
+- [X] T015 Replace the worker cells in `src/lakefed_ingest/ingest.ipynb` with: build `deps`, bind `worker.ingest_one`, pass it to `parallel.run_parallel`. Keep `widget`, the advisory lock, `assert_lock_held`, the pool setup, the source share refresh, and the plan call
+- [X] T016 Run `pytest tests` and `rg -n "def ingest_one" src/lakefed_ingest/ingest.ipynb`. Expect green, no grep output. Commit `refactor(worker): move per-table worker into worker.py`
 
 **Checkpoint**: `worker_test.py` proves the ordering invariant. User story phases can start.
 
