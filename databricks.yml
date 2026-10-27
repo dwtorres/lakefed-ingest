@@ -84,6 +84,11 @@ targets:
     workspace:
       host: https://company-dev.cloud.databricks.com/
 
+  devtest:
+    # Live devtest workspace (quickstart.md, step 8). Same development mode as dev.
+    mode: development
+    workspace:
+      host: https://dbc-8e058692-373e.cloud.databricks.com
 
   prod:
     mode: production
