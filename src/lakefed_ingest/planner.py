@@ -1,14 +1,16 @@
 """Run planning: strategy routing. Pure and unit-testable (no Spark, no DB).
 
-* ``route_tables``: per control row, by its load strategy (``load_type``) and source adapter
-  (``src_type``). An unsupported pair, or a placeholder strategy, routes to ``unsupported``: the
-  row fails on its own with a clear message. ``full`` routes to ``full`` (reload every cycle).
-  ``cursor`` routes to ``cursor_seed``, ``schema_reseed`` or ``cursor`` (per-table high-watermark
-  increment).
+* ``config_error``: rejects a control row before any source read. A ``load_type`` other than
+  ``cursor`` or ``full``, an unsupported (``src_type``, ``load_type``) pair, a ``cursor`` row without
+  a primary key, an unknown ``cursor_kind``, a reserved ``delete_mode`` (``soft_column``,
+  ``full_compare``), a bad ``client_id``, a mixed sink, or ``auth_mode`` ``ntlm`` or ``aad_sp`` off
+  SQL Server. The row fails on its own at stage ``plan``.
+* ``route_tables``: per control row, by its load strategy and its checkpoint. ``full`` routes to
+  ``full``. ``cursor`` routes to ``cursor_seed``, ``schema_reseed``, or ``cursor``.
 * ``retry_plan``: the next attempt of a table after a transient failure, from its fresh checkpoint.
 * ``apply_captured``: the batched ``hi`` (``cursor_engine.capture_batch``) splits cursor plans into
   unchanged rows (one bulk checkpoint write, no source read) and reads that carry ``hi``.
-* ``snapshot_due``: whether a table's PK snapshot (delete_mode pk_snapshot) runs this cycle.
+* ``snapshot_due``: whether a table's PK snapshot (delete_mode ``pk_snapshot``) runs this cycle.
 * ``apply_seed_budget`` and ``bulk_rows_to_write``: scale controls.
 """
 

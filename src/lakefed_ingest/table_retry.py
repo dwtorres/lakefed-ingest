@@ -1,19 +1,20 @@
 """Table retries: a table whose load fails with a transient source error (a refused or dropped
-connection, a timeout, Azure SQL throttling) is tried again in the same run after a pause, instead
-of waiting for the next run. Off unless job parameter ``table_retries`` is above 0.
+connection, a timeout, Azure SQL throttling) is tried again in the same run after a pause. Off
+unless job parameter ``table_retries`` is above 0.
 
 * ``classify`` (pure): "transient" or "permanent". The rules that rule a retry out are checked
-  first and win; an error no rule recognises is permanent, so it fails as it always has.
+  first and win. An error no rule recognizes is permanent, so it fails as it always has.
 * ``RetryPolicy``: one run's limits, shared by its threads: attempts per table, a budget of retries
-  for the whole run, and a stop per source server after repeated failed retries, so a source outage
-  costs a few extra queries, not one per table. ``claim`` decides whether a failure is retried and
-  after how long; the pause doubles each time, with jitter.
+  for the whole run, and a stop per source server after repeated failed retries. ``claim`` decides
+  whether a failure is retried and after how long. The pause doubles each time, with jitter.
+  ``summary`` gives the totals for ``ingest_run.detail``.
 * ``with_retries``: wraps the per-table worker. The worker raises ``Retry`` when the policy granted
-  one; the wrapper waits (holding no slot), re-plans the table from its checkpoint
-  (``planner.retry_plan``) and runs it again.
+  one. The wrapper waits (holding no slot), re-plans the table from its checkpoint
+  (``planner.retry_plan``), and runs it again. Every write is idempotent, so a retry never
+  duplicates rows.
 
-Pure Python apart from reading a Java exception's causes through py4j when one is attached;
-unit-tested in tests/table_retry_test.py.
+Pure Python, apart from reading a Java exception's causes through py4j when one is attached.
+Unit-tested in tests/table_retry_test.py.
 """
 
 from __future__ import annotations

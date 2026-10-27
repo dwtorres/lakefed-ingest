@@ -1,23 +1,27 @@
-"""Lakebase state accessor for lakefed_cursor (control, checkpoints, telemetry).
+"""Lakebase state accessor for lakefed_cursor: control, checkpoints, telemetry, locks.
 
-The framework is strategy-agnostic: ``control.load_type`` selects a load strategy
-(``load_strategies``) and ``control.src_type`` a source adapter (``source_adapters``). Per ADR-0004,
-the per-(db,table) checkpoint and phase/status live in Lakebase (OLTP Postgres),
-alongside the cold `control` config. This module is imported by the cluster-side notebooks
-(ingest, apply_lakebase_schema), which own all writes to the hot store. Warehouse-free: everything
-runs on the cluster.
+``control.load_type`` selects a load strategy (``load_strategies``). ``control.src_type`` selects a
+source adapter (``source_adapters``). The per-table checkpoint and the telemetry live in Lakebase
+(Postgres), next to the ``control`` table. The cluster-side notebooks (ingest,
+apply_lakebase_schema) import this module and own all writes. No SQL warehouse is involved.
 
-Checkpoints are keyed by the control task id (``control.id``), not by db/schema/table, so
-same-named databases on different servers never share a checkpoint. A checkpoint is generic:
-``strategy`` names the strategy that wrote it and ``position`` (text) is that strategy's resume
-position (cursor: JSON {col, type, value}).
+A checkpoint is keyed by the control id (``control.id``), not by db/schema/table, so same-named
+databases on different servers never share one. ``strategy`` names the strategy that wrote it.
+``position`` (text) is that strategy's resume position: JSON {expr, kind, type, value} for
+``cursor``, NULL for ``full``. ``last_delete_snapshot_at`` records the last PK snapshot.
+
+``StateStore.migrate`` applies ``lakebase_schema.sql`` in one transaction when the database is
+behind ``SCHEMA_VERSION`` (2). ``RENAMES`` lists pending renames; it is empty. Per-run writes:
+``bulk_advance_unchanged`` stamps quiet tables in one statement, ``record_delete_snapshot`` records
+a PK snapshot, ``enqueue_reseed`` sets a table back to phase ``seeding``, ``close_abandoned_runs``
+closes the rows of a run that died.
 
 The pure decision helpers and SQL builders at the top have no database dependency and are
 unit-tested in tests/state_store_test.py. ``psycopg`` is imported lazily inside
-``StateStore.connect`` so the module (and its tests) load without the driver installed.
+``StateStore.connect``, so the module and its tests load without the driver.
 
-Naming: `control`, `checkpoint`, and the telemetry tables (`ingest_run`, `ingest_event`) are
-framework-level; the phases seeding/incremental belong to the cursor strategy, loaded to full.
+Naming: ``control``, ``checkpoint``, ``ingest_run``, and ``ingest_event`` are framework-level. The
+phases ``seeding`` and ``incremental`` belong to the cursor strategy, ``loaded`` to full.
 """
 
 from __future__ import annotations

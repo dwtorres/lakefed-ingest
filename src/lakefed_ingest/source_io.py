@@ -1,25 +1,30 @@
-"""Source reads: Spark JDBC or ``remote_query`` through a Unity Catalog connection.
+"""Source reads: Spark JDBC, or ``remote_query`` through a Unity Catalog connection.
 
-The row's source adapter (``source_adapters``, chosen by ``control.src_type``) gives the JDBC URL,
-the driver, the quoting and the SELECT text. This module resolves the connection and runs the
-query. ``sink_writer`` writes the result to Delta.
+The source adapter (``source_adapters``, chosen by ``control.src_type``) gives the JDBC URL, the
+driver, the quoting, and the SELECT text. This module resolves the connection and runs the query.
+``sink_writer`` writes the result to Delta.
 
-Connection (per control row ``cfg``):
-  * host and port: ``cfg['src_host']`` and ``cfg['src_port']``, else the UC connection named in
-    ``cfg['src_connection']``, else the secret's own host field, else env ``LAKEFED_SQL_HOST``.
-  * port default: the adapter's default port.
-  * credentials: secret ``scope``/``key`` holding the secret JSON of contracts/secret_json.md
-    (``auth_mode`` sql, ntlm, or aad_sp; absent means sql). The scope is env
-    ``LAKEFED_SQL_SECRET_SCOPE`` (default ``lakefed-cursor``). The key is ``cfg['secret_key']``,
-    else env ``LAKEFED_SQL_SECRET_KEY``, else legacy ``f"{src_connection}_json"``. Credentials are
-    cached per (scope, key).
-  * TLS: env ``LAKEFED_SQL_TRUST_SERVER_CERT`` (default ``true``), mapped per adapter.
-  * extra read options: adapter defaults plus ``cfg['jdbc_options']`` (JSON).
-  * ``cfg['use_remote_query']``: read through ``remote_query(<src_connection>, ...)`` instead. The
-    connection holds the credentials.
+Connection, per control row ``cfg``:
+
+* Host and port: ``cfg['src_host']`` and ``cfg['src_port']``, else the UC connection named in
+  ``cfg['src_connection']``, else the secret's own host field, else env ``LAKEFED_SQL_HOST``. The
+  port defaults to the adapter's default port.
+* Credentials: the secret JSON of contracts/secret_json.md in scope ``LAKEFED_SQL_SECRET_SCOPE``
+  (default ``lakefed-cursor``), key ``cfg['secret_key']``. ``auth_mode`` is ``sql`` (default),
+  ``ntlm``, or ``aad_sp``. ``_extract_creds`` names a missing field and never prints a value.
+  ``SourceAdapter.auth_options`` turns the fields into JDBC options. ``ntlm`` and ``aad_sp`` run on
+  SQL Server only. Credentials are cached per (scope, key).
+* TLS: env ``LAKEFED_SQL_TRUST_SERVER_CERT`` (default ``true``), mapped per adapter.
+* Extra read options: adapter defaults plus ``cfg['jdbc_options']`` (JSON).
+* ``cfg['use_remote_query']``: read through ``remote_query(<src_connection>, ...)`` instead. The
+  connection holds the credentials. The row reads no secret.
+
+``redact`` removes credential values from error text. ``server_version`` runs the adapter's version
+query once per source and caches it. ``read_pk_snapshot`` reads the primary key columns for the
+``pk_snapshot`` delete mode.
 
 Concurrency: a function that queries the source takes an optional ``slots``
-(``parallel.WorkSlots``) and holds ONE slot per unit of work. With ``slots=None`` work runs
+(``parallel.WorkSlots``) and holds one slot per unit of work. With ``slots=None`` work runs
 unthrottled.
 
 Heavy imports (pyspark, databricks.sdk) are lazy, so the pure helpers import without them.

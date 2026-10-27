@@ -1,12 +1,19 @@
-"""Sink writes: Delta DDL, MERGE text, seeds and full reloads, write-conflict retry.
+"""Sink writes: Delta DDL, MERGE and DELETE text, seeds and full reloads, write-conflict retry.
 
 Reads come from ``source_io``. Row counts come from Delta commit metrics, never from ``count()``
 on the source DataFrame. No ``.cache()``: Delta MERGE materializes a JDBC source itself.
 
+``merge_sql`` builds the upsert MERGE of a cursor increment. A matched row is updated only when its
+cursor expression differs (``sink_expr`` renders the expression per alias). ``delete_missing_sql``
+builds the anti-join DELETE of the ``pk_snapshot`` delete mode. ``seed`` copies a table, plain or
+partitioned through a staging table and one atomic swap. ``insert_overwrite_sql`` is the data-only
+replace of a full reload.
+
 Consolidated sinks (``control.client_id``): many source databases write one sink table. Every row
-carries the value in column ``__client_id__`` (``CLIENT_COLUMN``). MERGEs match on
-(__client_id__, PK). Seeds and full reloads replace only that client's rows. A row with
-client_id NULL owns its sink. Mixing the two on one sink is rejected.
+carries the value in column ``__client_id__`` (``CLIENT_COLUMN``). MERGEs and DELETEs match on
+(__client_id__, PK). Seeds and full reloads replace only that client's rows. A row with client_id
+NULL owns its sink. Mixing the two on one sink is rejected. ``client_attrs`` adds STRING identity
+columns to every row.
 
 Delta write conflicts retry the whole unit with exponential backoff and full jitter
 (``with_write_retry``). Writes are idempotent, so a re-read is safe.

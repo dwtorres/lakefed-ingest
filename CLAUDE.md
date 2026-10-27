@@ -6,7 +6,10 @@ The repo holds a metadata-driven framework that ingests external databases into 
 tables, as one Databricks Asset Bundle (`lakefed_cursor`, at the repo root: `databricks.yml`,
 `resources/`, `src/lakefed_ingest/`, `tests/`). One job task per `task_collection`, in-process
 threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL
-Server, Oracle, PostgreSQL, MySQL) + load strategies (watermark cursor, full reload).
+Server, Oracle, PostgreSQL, MySQL) + load strategies (`cursor`, `full`). Cursor-only: no SQL Server
+CT, no CDC, no append sinks. Lakebase schema `lakefed_cursor` (version 2), secret scope
+`lakefed-cursor`, jobs `lakefed_cursor` / `lakefed_cursor_setup`. No `lakefed_ingest` or `edp` name.
+Docs follow Simplified Technical English (constitution VIII, `tests/docs_test.py` checks the terms).
 
 ## Commands
 
@@ -19,7 +22,7 @@ pip install pytest            # unit tests need nothing else
 
 ### Run Tests
 ```bash
-pytest                                   # the same as pytest tests (pytest.ini testpaths)
+.venv/bin/pytest -rs tests               # zero skips required (a skip is a failure)
 pytest tests/planner_test.py::test_name  # single test
 ```
 
@@ -45,7 +48,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port` and `secret_key` (JDBC) or
   `src_connection` + `use_remote_query` (UC connection), `src_database`, `src_schema`,
   `src_table`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
-  strategy: `cursor` (SQL Server, PostgreSQL; placeholder elsewhere) | `full`), partitioned-seed settings,
+  strategy: `cursor` (SQL Server, Oracle, PostgreSQL; MySQL fails at plan) | `full`), partitioned-seed settings,
   `cursor_expression` (one SQL expression over 1 to 3 columns of one type, GREATEST / COALESCE only),
   `cursor_kind` (`rowversion` | `db_timestamp` | `app_timestamp` | `identity`), `cursor_lookback_s`
   (NULL = job parameter), `null_cursor_policy` (`reject` | `seed_only`), `delete_mode` (`none` |
@@ -72,9 +75,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 ### Jobs (`resources/`)
 - `lakefed_cursor` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
   `task_collection`, `parallelism` (single budget of concurrent query units), `secret_scope`,
-  `detection_chunk` (unused since Change Tracking left), `trust_server_certificate`,
+  `detection_chunk` (tables per batched `MAX` query), `trust_server_certificate`,
   `max_seeds_per_run` (seed budget, 0 = none),
-  `freshness_interval_s` (unused until the quiet-table bulk advance returns), `max_queries_per_source`
+  `freshness_interval_s` (skip the bulk advance for tables stamped inside this), `max_queries_per_source`
   (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
   shared advisory locks; `parallel.SourceLimiter`), `table_retries` (extra attempts per table after a
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
@@ -112,7 +115,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/worker.py` | Per-table worker (`ingest_one(plan, run_id, deps, attempt)`): routes `full` / `cursor_seed` / `cursor` / `schema_reseed`, telemetry, and the checkpoint advance after the sink commit (`tests/worker_test.py`); `_replan` for retries |
 | `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL, cursor methods (type lookup and class, source clock, text rendering, typed literals, lookback, batched MAX, GREATEST form; MySQL raises) |
-| `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
+| `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy (`cursor`, `full`), `supported()` matrix, `unsupported_reason` (MySQL cursor) |
 | `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy for every adapter with cursor methods (no `src_type` branch): type lookup, high watermark capped at the clock + skew (per table, or batched per source database: `capture_batch`), typed literals, (lo, hi] read + upsert MERGE with a cursor change predicate |
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (`apply_captured`, `bulk_rows_to_write`; no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
@@ -125,7 +128,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 ### Engineering rules
 - No `.cache()` / `.persist()`; read each source once per cycle (Delta MERGE materializes the JDBC
   source itself).
-- No SQL warehouse dependency in the default version.
+- No SQL warehouse dependency.
+- Live proof: SQL Server on hold (no source); Oracle pending the Phase 10 devtest run (`specs/001-cursor-only-engine/quickstart.md`).
 - Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE).
 - Every sink write must be client-scoped when `client_id` is set: tag rows (`sink_writer._tag`),
   write `write_columns(cfg)`, MERGE on `merge_keys(cfg)`, overwrite via

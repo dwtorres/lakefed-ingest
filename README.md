@@ -1,498 +1,411 @@
-# Lakehouse Federation Ingestion Framework
+# lakefed_cursor
 
-Metadata-driven ingestion from external databases into Delta tables on Databricks. One job task
-ingests a whole `task_collection` in-process (thread pool + Spark FAIR scheduler pools) on a job
-cluster, with no SQL warehouse. State (control, checkpoints, telemetry) lives in Lakebase
-(Postgres). Source reads use Spark JDBC with per-database credentials from a secret scope, or
-`remote_query` through a UC connection per row. Load types: watermark `cursor` (SQL Server,
-PostgreSQL; full or partitioned seed) and `full` reload (partitioned or not) for SQL Server, Oracle,
-PostgreSQL and MySQL. `cursor` on Oracle and MySQL is a placeholder. Bundle: `lakefed_cursor`.
+`lakefed_cursor` copies tables from external databases into Delta tables on Databricks. A control
+row in Lakebase describes each source table. One job task ingests a whole `task_collection` with a
+thread pool on a job cluster. No SQL warehouse is needed.
+
+The engine supports two load types. `cursor` reads the rows above a high watermark and merges them
+by primary key. `full` reloads the whole table on every run. SQL Server CT and CDC are not
+supported. Sources: SQL Server, Oracle, PostgreSQL, MySQL. `cursor` runs on SQL Server, Oracle and
+PostgreSQL. `cursor` on MySQL fails at plan time.
+
+Names: bundle `lakefed_cursor`, jobs `lakefed_cursor` and `lakefed_cursor_setup`, Lakebase schema
+`lakefed_cursor` (schema version 2), secret scope `lakefed-cursor`, UC catalog
+`lakefed_cursor_lakebase`. No resource reuses a `lakefed_ingest` or `edp` name. The deploy gate,
+`scripts/validate.sh`, fails on such a name.
 
 ## Why one task per collection
 
-A workspace allows at most **2,000 concurrent task runs** and **10,000 run-submits per hour**, so a
-task-per-table design stalls at 10^5–10^6 tables on a 15–20 minute cadence. The default version
-collapses a whole `task_collection` into **one** job task that iterates its tables with a thread
-pool and Spark FAIR scheduler pools. Throughput is then bounded by cluster compute, not by job-run
-count. Per-table failures are isolated and recorded in Lakebase.
+A workspace allows 2,000 concurrent task runs and 10,000 run submits per hour. A task per table
+stalls at that limit. One task per `task_collection` runs its tables in-process with a thread pool
+and Spark FAIR scheduler pools. Throughput is then bound by cluster compute. A table failure is
+isolated and recorded in Lakebase.
 
-**Scaling.** Shard tables into `task_collection`s sized to what one cluster can ingest within the
-cadence window, and run collections concurrently (one run per collection, each on its own job
-cluster). A per-collection Lakebase advisory lock makes a duplicate run of the same collection exit
-as `skipped`.
+To scale, shard tables into collections that one cluster ingests inside the cadence window. Run
+collections concurrently, one run per collection on its own job cluster. A per-collection Lakebase
+advisory lock makes a duplicate run of the same collection exit as `skipped`.
 
 ## Layout
 
 ```
-databricks.yml                     # bundle lakefed_cursor
+databricks.yml                     # bundle lakefed_cursor, variables, targets
+scripts/validate.sh                # deploy gate: name test, then bundle validate
 resources/
   lakefed_cursor.yml               # ingestion job: one run ingests a task_collection
-  lakefed_cursor_setup.yml         # Lakebase instance + UC catalog, secret scope, schema job
+  lakefed_cursor_setup.yml         # Lakebase instance, UC catalog, secret scope, schema job
 src/lakefed_ingest/
   ingest.ipynb                     # the ingestion notebook: plan, then fan out per table
-  planner.py                       # strategy routing + skip-no-change planning (pure, unit-tested)
-  source_adapters.py               # per-engine dialect: JDBC URL/driver, quoting, size/bounds/select SQL
-  load_strategies.py               # per-load_type strategy + the (src_type, load_type) support matrix
-  source_io.py                     # source reads via Spark JDBC or remote_query: credentials, URL, the query unit
-  sink_writer.py                   # sink writes: MERGE / INSERT text, consolidated sinks, seeds, write retry
-  cursor_engine.py                 # cursor strategy: type lookup, high watermark, window read + MERGE
-  parallel.py                      # thread pool + FAIR pools + the shared WorkSlots budget
+  planner.py                       # route each control row; apply the batched capture (pure)
+  worker.py                        # per-table worker: read, write, checkpoint, telemetry
+  cursor_engine.py                 # cursor strategy: expression check, high watermark, window read
+  source_adapters.py               # per-engine dialect: URL, driver, quoting, literals, cursor SQL
+  load_strategies.py               # load types cursor and full; the support matrix
+  source_io.py                     # source reads: Spark JDBC or remote_query; credentials
+  sink_writer.py                   # sink writes: MERGE, seed, full reload, delete, write retry
+  parallel.py                      # thread pool, FAIR pools, WorkSlots budget, SourceLimiter
   partitions.py                    # partitioned-seed planning
-  state_store.py                   # Lakebase accessor: config, checkpoints, telemetry, locks
-  lakebase_schema.sql              # Postgres DDL + idempotent migrations
-  apply_lakebase_schema.ipynb      # applies / migrates lakebase_schema.sql
-notebooks/load_control_example.ipynb   # register tables in the Lakebase control table
-tools/source_profile.sql           # read-only SQL Server profiling script for sizing
-docs/deploy.md, docs/monitoring.md
-tests/                             # unit tests (no cluster), synthetic DB generator
+  table_retry.py                   # table retries after a transient source error
+  state_store.py                   # Lakebase accessor: control, checkpoints, telemetry, locks
+  lakebase_schema.sql              # Postgres DDL, idempotent, schema version 2
+  apply_lakebase_schema.ipynb      # applies the DDL
+notebooks/load_control_example.ipynb   # insert control rows
+tools/source_profile.sql           # read-only SQL Server profiling script
+docs/deploy.md, docs/monitoring.md, docs/lakebase_schema.md
+specs/001-cursor-only-engine/      # spec, plan, contracts, quickstart
+tests/                             # unit tests, no cluster; synthetic SQL Server database
 ```
 
 ## How a run works
 
-Each run of the `lakefed_cursor` job ingests one `task_collection`:
+One run of job `lakefed_cursor` ingests one `task_collection`.
 
-1. **Plan.** Load the collection's control rows and checkpoints from Lakebase (one query each) and
-   route every table by its load strategy: `full` tables reload; `ct` tables seed, reseed (schema
-   change), or become change-detection candidates. A row whose (`src_type`, `load_type`) pair isn't
-   supported fails on its own at stage `plan` with a clear message.
-2. **Skip unchanged tables** (see below). Unchanged tables get their checkpoint advanced in one bulk
-   Lakebase update — no source reads, no MERGEs, no empty Delta commits.
-3. **Fan out.** Seeds, reseeds, and changed tables run in parallel. Each change set is read once
-   from `CHANGETABLE(CHANGES ...)` and applied with an idempotent primary-key MERGE (deletes
-   included), or appended to an [append sink](#append-sinks-optional); the checkpoint advances only
-   after the write commits.
-4. **Record.** Per-table events and a run summary are written to Lakebase telemetry.
+1. The run takes the collection lock in Lakebase. A duplicate run exits as `skipped`.
+2. The planner loads the control rows and checkpoints and routes each table. `full` reloads.
+   `cursor` seeds, reseeds, or increments. A row with an unsupported (`src_type`, `load_type`) pair
+   fails at stage `plan`.
+3. One batched `MAX` query per source database captures the high watermark `hi` of every seeded
+   cursor table. Tables with `hi` equal to the checkpoint are quiet. Their checkpoints advance in one
+   Lakebase write. No source read and no Delta commit happens for them.
+4. Seeds, reseeds, reloads and changed tables run in parallel. Each worker reads once, writes to
+   Delta, and then advances the checkpoint.
+5. The run writes per-table events and a run summary to Lakebase telemetry.
 
-### Sources and load strategies
+### Sources and load types
 
-`control.src_type` selects a **source adapter** (`source_adapters.py`: JDBC URL and driver, quoting,
-literals, and the SELECT / size / bounds queries) and `control.load_type` a **load strategy**
-(`load_strategies.py`). Supported today:
+`control.src_type` selects a source adapter in `source_adapters.py`. `control.load_type` selects a
+load strategy in `load_strategies.py`.
 
-| `src_type` | `ct` | `full` | `cursor` | `cdc` |
-|---|---|---|---|---|
-| `sqlserver` | yes | yes | yes | placeholder |
-| `oracle` | — | yes | placeholder | placeholder |
-| `postgresql` | — | yes | placeholder | placeholder |
-| `mysql` | — | yes | placeholder | placeholder |
+| `src_type` | `cursor` | `full` |
+|---|---|---|
+| `sqlserver` | yes | yes |
+| `oracle` | yes | yes |
+| `postgresql` | yes | yes |
+| `mysql` | no, fails at plan | yes |
 
-- **`cursor`** (SQL Server) reads rows above a high watermark — see
-  [Cursor (watermark) tables](#cursor-watermark-tables).
-- **`full`** reloads the whole table every run: one JDBC read into a data-only `INSERT OVERWRITE`
-  (the table id, grants, clustering and properties are kept), or the staged partitioned swap when
-  `load_partitioned`. No primary key needed. The checkpoint records `strategy = 'full'`, phase
-  `loaded`, and no position.
-- **Drivers.** The SQL Server and PostgreSQL JDBC drivers ship with Databricks Runtime. Oracle and
-  MySQL need a cluster library — see the commented `libraries` entries in
-  `resources/lakefed_cursor.yml`.
-- **Per-engine notes.** Oracle: `src_database` is the service name, `src_schema` the owner, and
-  identifiers are quoted, so use the stored (usually upper-case) names; the partitioned seed's size
-  comes from `ALL_TABLES` statistics (no extra privileges). MySQL: `src_schema` is the database.
-- **`jdbc_options`** (JSON object, optional) adds Spark JDBC read options per row, e.g.
-  `{"fetchsize": "50000"}`. Connection, credential, driver and query options can't be overridden.
-- **Reading through a Unity Catalog connection** (optional). A row with `use_remote_query = true`
-  reads through the connection named in `src_connection`, with `remote_query` on the same job
-  cluster, instead of Spark JDBC. The connection holds the credentials, so the row needs no
-  `secret_key`, `src_host` or `src_port`. It needs Databricks Runtime 18.3 or later (the job runs
-  `18.x`), and the identity the job runs as needs `USE CONNECTION` on the connection and, because
-  the job cluster is dedicated (single user), `MANAGE` too. The read options (adapter defaults and
-  `jdbc_options`) become `remote_query` options, such as `fetchsize`; one it doesn't support fails
-  the read. A change read's retention guard is part of its query. `snapshot_isolation` can't apply
-  without a session statement, so the planner refuses it for such `ct` rows (with
-  `READ_COMMITTED_SNAPSHOT ON` on the database, each read is consistent on its own). Spark JDBC and
-  `remote_query` map source types separately, so keep each sink's rows on one of the two.
+- `full` reads the table once into a data-only `INSERT OVERWRITE`. The table id, grants and
+  properties stay. With `load_partitioned` the reload uses the staged swap. No primary key is
+  needed. The checkpoint records `strategy = 'full'`, phase `loaded`, and no position.
+- Drivers: Databricks Runtime ships the SQL Server and PostgreSQL JDBC drivers. Oracle and MySQL
+  need a cluster library. See the `libraries` comments in `resources/lakefed_cursor.yml`.
+- Oracle: `src_database` is the service name. `src_schema` is the owner. Identifiers are quoted, so
+  use the stored upper-case names. The partitioned seed sizes the table from `ALL_TABLES`.
+- MySQL: `src_schema` is the database.
+- `jdbc_options` is an optional JSON object of extra Spark JDBC read options, for example
+  `{"fetchsize": "50000"}`. Connection, credential, driver and query options cannot be overridden.
+- A row with `use_remote_query = true` reads through the Unity Catalog connection in
+  `src_connection` with `remote_query`. The connection holds the credentials. The row needs no
+  `secret_key`, `src_host` or `src_port`. The job identity needs `USE CONNECTION` and `MANAGE` on
+  the connection. `remote_query` needs Databricks Runtime 18.3 or later. Keep each sink on one read
+  path, because Spark JDBC and `remote_query` map source types differently.
 
-Checkpoints are generic: `checkpoint.strategy` names the strategy that wrote the row and
-`checkpoint.position` (text) is its resume position — for `ct`, the database CT version; for
-`cursor`, JSON `{"col", "type", "value"}` (the watermark column, its SQL Server type, and the value).
+### Credentials
 
-### Per-table state (Change Tracking)
+One secret per source database lives in scope `lakefed-cursor`. `control.secret_key` names it. The
+value is JSON. `auth_mode` selects the shape. A missing `auth_mode` means `sql`.
 
-`checkpoint.phase` moves `seeding → incremental`.
+| `auth_mode` | Fields | Engine |
+|---|---|---|
+| `sql` | `user`, `password` | all |
+| `ntlm` | `user`, `password`, `domain` | `sqlserver` |
+| `aad_sp` | `client_id`, `client_secret`, `tenant_id` | `sqlserver` |
 
-- **seeding:** capture `V0 = CHANGE_TRACKING_CURRENT_VERSION()` *before* the seed, copy the table,
-  then checkpoint `{V0, incremental}`. The first incremental run replays everything that changed
-  during the seed, so there is no gap.
-- **incremental:** read changes since the checkpoint, MERGE, advance. If the checkpoint falls below Change
-  Tracking's minimum valid version (retention lapsed), the table is queued for a reseed.
-- **Change reads** stop at the version captured before detection, which the checkpoint then advances
-  to: a change committed later waits for the next run instead of being read twice. Under the default
-  READ COMMITTED, the change table and the base table are read at slightly different times; a change
-  whose row was deleted in between is skipped (its delete arrives next run). Job parameter
-  `snapshot_isolation = "true"` reads both as of one point in time instead (needs
-  `ALLOW_SNAPSHOT_ISOLATION ON` on every source database).
+A missing field fails the table before any connect attempt. The message names the field, never the
+value. `ntlm` or `aad_sp` on a source other than SQL Server fails at plan time. Log lines and
+telemetry never contain a password or a client secret. See
+`specs/001-cursor-only-engine/contracts/secret_json.md`.
 
-Delivery is at-least-once (checkpoint advances post-commit) and the MERGE is idempotent, so there
-are no gaps and no duplicates.
+### Cursor tables
 
-### Cursor (watermark) tables
+A cursor table has a primary key and one cursor expression. `cursor_expression` is one SQL
+expression in the source dialect over one to three columns of one type. Fold several columns with
+`GREATEST` over `COALESCE` inputs:
 
-For tables without Change Tracking, `load_type = 'cursor'` follows a monotonically increasing
-column, `cursor_column` (a PK is required — increments are MERGEd by it):
+```sql
+GREATEST(COALESCE(UPDATED_AT, DATE '1900-01-01'), COALESCE(CREATED_AT, DATE '1900-01-01'))
+```
 
-- **Seed:** capture the column's high watermark `hi` *before* the full copy (partitioned when
-  `load_partitioned`), then checkpoint `hi`. Rows written during the seed are re-read next run.
-  For a temporal cursor the checkpoint is `hi` minus the seed duration, so rows that committed
-  during a long seed with an older timestamp are inside the first increment window.
-- **Temporal overlap:** a timestamp is assigned when a row is written, not when it commits, so a
-  row can commit after a read whose `hi` is above it. For temporal cursors every increment starts
-  `cursor_lookback_s` seconds (job parameter, default 3600; a control row's `cursor_lookback_s`
-  overrides it) below the checkpoint, and runs even when `hi` did not move. `hi` is capped at the
-  source clock plus `cursor_skew_s` (default 300), so a row stamped in the future cannot pin the
-  window; the run logs `alert=max_above_clock`. The MERGE makes the re-read harmless. Identity and
-  `rowversion` cursors read exact bounds; an identity cursor is inserts-only (logged once per run).
-  A `hi` below the checkpoint (source truncate or reload) fails the table; the position never moves
-  backwards. Runs on SQL Server and PostgreSQL (`information_schema` type lookup; a
-  `timestamp with time zone` watermark is rendered in UTC).
-- **Each run:** one small query reads the current `hi`. Equal to the checkpoint → unchanged (no
-  read, no MERGE). Otherwise read `cursor_column > checkpoint AND cursor_column <= hi` once, upsert
-  it by PK, then advance the checkpoint to `hi`.
-- **Column types:** `rowversion` (recommended), integer / `decimal` / `numeric` (identity keys), and
-  `date` / `datetime` / `datetime2` / `smalldatetime` / `datetimeoffset` (an `updated_at` the
-  application maintains). Float, real and string columns are rejected.
-- **Limits — choose the column accordingly:**
-  - Deletes are never captured. Use `ct` where deletes matter, or a periodic `full` reload.
-  - Updates are captured only if they move the column: `rowversion` always does, an identity never
-    does (inserts only), and an `updated_at` only if every writer sets it.
-  - A transaction that commits a value *below* an already-read watermark after the read is missed.
-    `rowversion` avoids this: the watermark is capped below `MIN_ACTIVE_ROWVERSION()`, so rows from
-    still-open transactions wait for the next run.
-- The column must be `NOT NULL`: a row with a NULL value is never `> checkpoint`, so increments
-  would silently miss it. A nullable `cursor_column` fails the table with a clear error, checked on
-  every run (a column altered to NULL after the seed is caught too).
-- Changing `cursor_column` re-seeds the table; adding columns to `select_list` reseeds it, as for
-  `ct`. Nothing is `.cache()`d; Delta MERGE materializes the JDBC source
-once (`materializeSource=auto`).
+`cursor_kind` names the clock of the expression.
 
-### Skip-no-change
+| `cursor_kind` | Meaning | Reads |
+|---|---|---|
+| `rowversion` | one SQL Server `rowversion` column | exact bounds. `hi` is capped below `MIN_ACTIVE_ROWVERSION()` |
+| `db_timestamp` | a timestamp the database sets | lookback window |
+| `app_timestamp` | a timestamp the application sets | lookback window |
+| `identity` | an identity or sequence number | exact bounds. Inserts only |
 
-Most tables in a large estate don't change between runs. Change Tracking versions are per
-database, so detection is grouped by source database:
+The engine checks the expression before any source read. The check fails a table in four cases:
 
-- **Per-database fast exit.** One small query reads the database's current CT version and every
-  table's CT state. If every checkpoint is already at that version, the whole database is
-  unchanged after that one query.
-- **Batched detection.** Otherwise one `EXISTS`-style query per chunk of tables
-  (`detection_chunk`, default 200) classifies each table as changed, unchanged, or needing reseed.
-  The version is captured *before* detection, so changes after it are picked up next run.
-- **Chunk fallback.** If a detection chunk fails, its tables take the per-table path instead of
-  being guessed at. A database that fails entirely (unreachable, auth) has its tables recorded as
-  failed at stage `detect`; other databases continue.
-- **Read-time retention guard.** Retention can lapse between planning and a table's read in a long
-  run. The change read carries a session guard that makes SQL Server raise if the checkpoint is no
-  longer valid; the table is queued for a reseed instead of silently missing changes.
-- **CT disabled / versions reset.** If Change Tracking is disabled on a database, its tables fail
-  with a clear error (never treated as unchanged). Per-table CT status is read once per database
-  per run (one metadata query, before the fast exit), so it is checked on quiet databases too:
-  - A table with CT turned off is queued for a reseed. The seed then refuses to run (stage `read`,
-    clear error) every run until CT is enabled on the table again, and then reseeds.
-  - A table whose CT `begin_version` differs from the one recorded at seed time (CT turned off and
-    back on between runs) is queued for a reseed (reason `ct_reenabled`).
-  - A checkpoint ahead of the database's current version (restore) routes the table to a reseed.
-  - **Limitation:** if CT is turned off and back on while the database's CT version still equals
-    the table's original `begin_version` (no tracked commit anywhere in the database since CT was
-    first enabled), the toggle leaves no trace in SQL Server metadata. Checkpoints created before
-    `ct_begin_version` existed record it the first time they're seen, so a toggle before that
-    upgrade isn't detected either. After CT maintenance like this, force a reseed:
-    `update lakefed_cursor.checkpoint set phase = 'seeding' where control_id in (...);`
+- The expression has zero or more than three columns.
+- The expression uses a function other than `GREATEST` or `COALESCE`.
+- The columns have different types.
+- An input column is nullable and `null_cursor_policy` is `reject`.
 
-### Partitioned seed (large tables)
+If an input column is nullable, set `null_cursor_policy = 'seed_only'`. The seed then copies a row
+with a NULL expression. No increment reads that row again.
 
-Set `load_partitioned = true`, `partition_col` (numeric, date, or datetime — usually an integer PK)
-and `partition_size_mb`. The seed computes `num_partitions = max(size_mb / partition_size_mb, 2)`
-and reads range predicates in parallel (NULLs in the first partition) into a staging table. Only
-when every partition succeeds is the target replaced from staging in one atomic Delta commit, so
-grants, row filters, and lineage are kept and readers never see a partial table. A failed seed
-leaves the target untouched; the next attempt rebuilds staging.
+**Seed.** The worker captures `hi` before the full copy. If `load_partitioned` is set, the copy is
+partitioned. The checkpoint then records `hi` and phase `incremental`. The first
+increment reads the rows written during the seed again.
 
-### Consolidated sinks (optional)
+**Increment.** The window is `expression > lo AND expression <= hi`. For a temporal kind, `lo` is
+the checkpoint minus `cursor_lookback_s` seconds. The job parameter gives the default, 3600. The
+control row column `cursor_lookback_s` overrides it. A late commit can land inside the lookback window. For this reason a temporal increment
+always runs, also for an unchanged `hi`. For `identity` and `rowversion`,
+`lo` is the checkpoint. The read is one source query. An upsert MERGE by primary key applies it. If the cursor
+expression of a matched row did not change, the MERGE does not update the row. The checkpoint advances to `hi` after
+the MERGE commits.
 
-By default each control row owns its sink table — typically one schema per source database. To
-avoid one table per client per source table, set `control.client_id` and point the rows of many
-source databases at the **same** sink (e.g. every client's `dbo.orders` → `main.bronze.orders`):
+**Skew.** A temporal `hi` is capped at the source clock plus `cursor_skew_s` seconds, default 300.
+One row stamped in the future cannot pin the window. The run logs `alert=max_above_clock` and
+writes it to the checkpoint detail.
 
-- Every row written carries the row's `client_id` value in the column `__client_id__` (a
-  reserved-looking name, so it can't clash with a real source column such as `client_id`); the sink
-  is created with liquid clustering on it. To query it as `client_id`, use a view
-  (`SELECT __client_id__ AS client_id, ...`).
-- MERGEs match on (`__client_id__`, PK), so clients with the same key values never touch each other's
-  rows, and a CT delete removes only that client's row.
-- Seeds and full reloads replace only that client's rows
-  (`INSERT WITH SCHEMA EVOLUTION INTO <sink> BY NAME REPLACE WHERE __client_id__ = '<id>' ...`). A
-  partitioned seed stages in a per-client table, so clients can seed the same sink at once.
-- Schema drift between clients is absorbed by schema evolution: a column one client has and
-  another lacks is added to the sink and is NULL for the others.
-- Checkpoints stay per control row, so each client's CT version / watermark is independent.
-- `client_id` is per row, so consolidated and dedicated sinks can coexist (for different sink
-  tables). It must match `^[A-Za-z0-9_.:-]{1,128}$`, and `__client_id__` must not be in `select_list`.
+**Identity.** An identity value is taken at insert time, not at commit time. A late commit below a
+read `hi` is lost. The kind is inserts-only. The run logs the note `inserts_only` once per table.
 
-**Guards.** A unique index allows one row per (sink, `client_id`) — one row per dedicated sink.
-A sink claimed by a dedicated row *and* consolidated rows fails those rows at stage `plan`, and a
-write into an existing sink whose mode doesn't match (a dedicated row into a table with a
-`__client_id__` column, or the reverse; a merge row into an append sink, or the reverse) fails that
-table, so no row can overwrite another's data.
+**Reseed.** A changed `cursor_expression` or `cursor_kind` reseeds the table. Added columns in
+`select_list` reseed the table. The position holds the expression text, so the engine detects the
+change on the next run.
 
-**Write conflicts.** Clients (or jobs) writing the same sink at once can hit Delta concurrency
-conflicts. A conflict retries the whole unit (re-read + write) with exponential backoff and full
-jitter: 6 attempts, 1 s base, 60 s cap (env `LAKEFED_WRITE_RETRY_ATTEMPTS`, `_BASE_S`, `_MAX_S`). No
-slot is held while waiting. Retries are logged (`[retry]`); if they become frequent, stagger the
-collections writing the same sinks.
+**Failure.** A `hi` below the checkpoint fails the table. The position never moves backwards. This
+happens after a source truncate or reload.
 
-### Append sinks (optional)
+Supported column types by class:
 
-With `control.write_mode = 'append'` (load types `ct` and `full`), the sink is a change log rather
-than a copy of the source table: nothing in it is updated or deleted, and every write adds rows
-with four extra columns:
+- numeric: integer, `decimal`, `numeric`, Oracle `NUMBER` with scale 0
+- temporal: `date`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset`, Oracle `DATE` and `TIMESTAMP`, PostgreSQL `timestamp`
+- rowversion: SQL Server `rowversion`
 
-| Column | Value |
+Float, real and string columns are rejected. A SQL Server
+`datetime` literal carries three fractional digits. SQL Server below 2022 has no `GREATEST`, so the
+adapter renders a `CASE` form.
+
+### Deletes
+
+A cursor never captures a delete. `delete_mode` adds one.
+
+| `delete_mode` | Behavior |
 |---|---|
-| `__change_op` | `I`, `U` or `D` for a Change Tracking change; `S` for a snapshot row (a seed, a reseed, or a `full` load) |
-| `__change_version` | A change's commit version (`SYS_CHANGE_VERSION`); for a seed, the CT version captured before it; NULL for a `full` load |
-| `__extracted_at` | When the rows were read |
-| `__run_id` | The `ingest_run` that wrote them |
+| `none` | default. Deleted source rows stay in the sink |
+| `pk_snapshot` | after an increment, read every source primary key and delete the sink rows absent from it |
+| `soft_column`, `full_compare` | reserved. Fail at plan time |
 
-- A change row has the key from the change table and the other columns from the base table; a
-  delete has only the key. Change Tracking returns the net change per key since the checkpoint, so
-  a row updated several times between runs appears once, at its latest version.
-- A seed or reseed appends the whole table as `S` rows: a complete snapshot of that client's table
-  at one version. A reseed follows lapsed retention, CT turned off and on, or a version reset
-  (changes that couldn't be read), so downstream, a key missing from a later snapshot was deleted.
-  A `full` load appends a snapshot every run, so the sink grows by the table's size each run (fine
-  for small tables and views; use merge mode for large ones). Treat each (`__client_id__`,
-  `__run_id`) set of `S` rows as one snapshot.
-- With `client_id`, many source databases append to one sink, created with liquid clustering on
-  `__client_id__`. `client_attrs` adds identity columns: a JSON object such as
-  `{"tenant_name": "Acme", "source_server": "sql01"}`, written as STRING columns on every row
-  (merge sinks accept them too). Names are letters, digits and `_`, and must not collide with
-  `select_list`.
-- **No duplicates.** An append isn't idempotent the way a MERGE is. Before each `ct` append (a
-  change set or a seed) the run records on the checkpoint the position the append reaches and its
-  `run_id`; the checkpoint advance clears them. If a run stops in between, the next run looks in the sink for that client's
-  rows with that `__run_id`: found, the append committed and the checkpoint advances (outcome
-  `recovered`); not found, the table reads again from its checkpoint.
-- Downstream (for example SCD2 or a current-state view), order a key's rows by `__change_version`.
+If `last_delete_snapshot_at` is NULL or older than `delete_min_interval_s` seconds, the snapshot
+runs. A NULL interval means 86400. The snapshot is client-scoped on a consolidated sink. It runs at stage
+`snapshot` and records `last_delete_snapshot_at`.
 
-**Batched appends.** With many source databases per sink, most of a run is per-table overhead: a
-Spark job and a Delta commit for a few changed rows. Set the job parameter `append_batch_size`
-(default `1`, off) to batch them: changed tables, seeds and `full` loads of append rows with a
-`client_id` (not partitioned) that write the same sink are read together (one JDBC query per source
-database, unioned by name, as one Spark job with a task per database) and appended in one Delta
-commit. A batch holds one `parallelism` slot per table it reads, so raise `parallelism` with it
-(source queries run on the executors, so their cores bound how many run at once). Change batches
-run first, seed batches last. If a batch fails, the run first checks the sink for rows the batch
-committed anyway, then splits the rest in halves and retries; a table that fails on its own takes
-the per-table path, so it fails exactly as it would without batching. A batched table's
-`ingest_event` row is written when its batch finishes, with `pool` = `batch<size>` and no row count
-(the batch total is in the job output).
+### Quiet tables
 
-### Concurrency
+Most tables do not change between runs. One batched `MAX` query per source database and cursor type
+reads `hi` for `detection_chunk` tables at once, default 200. The query also reads the source clock
+for temporal types. A failed chunk falls back to one `MAX` per table. The run records one
+`ingest_event` with action `capture` per source database. Quiet tables advance in one bulk Lakebase
+write. `freshness_interval_s` skips that write for tables stamped more recently than this many
+seconds.
 
-The job's `parallelism` parameter is the maximum number of units of query work running at once in
-a run: a change read + MERGE, a seed, one partition of a partitioned seed, a small source query, or
-the staging swap. Each unit holds one slot of a shared budget and its own FAIR pool. A thread never
-holds a slot while waiting on other work, so nested fan-out can't deadlock. The budget is per run;
-concurrent runs of different collections each have their own.
+### Partitioned seed
 
-**Per-source cap.** Concurrent runs whose collections read the same server add up, so a source can
-get many runs' `parallelism` at once. Set `max_queries_per_source` (default `0`, off) to cap the
-queries on one source across every run that shares the Lakebase database. A source is a UC connection
-(rows with `use_remote_query`) or a JDBC host and port. Each run holds a shared Lakebase advisory lock
-per source it reads, on its collection-lock connection (released with it), and takes an equal share
-of the cap: the cap divided by the runs holding that source's lock, at least 1 (so when more runs
-read a source than the cap allows, the total is one query per run). Shares are recounted
-every 15 seconds, so the total can pass the cap for up to 15 seconds after a run starts, until the
-other runs shrink their shares; a share a run doesn't use isn't lent to the others. A unit that
-queries a source takes one of its permits before its slot (a batch takes one per read; a batch
-bigger than the share runs alone on that source). Requests for a source are admitted in arrival
-order. The job output and `ingest_run.detail` list each source's share and the most permits in use
-(`source_caps`). With the cap, `parallelism` can be sized for the compute and the cap for the source.
+Set `load_partitioned = true`, `partition_col` and `partition_size_mb`. `partition_col` is numeric,
+date or datetime, often the integer primary key. The seed computes
+`num_partitions = max(size_mb / partition_size_mb, 2)` and reads range predicates in parallel into a
+staging table. NULL values land in the first partition. When every partition succeeds, one atomic
+Delta commit replaces the target from staging. Grants, row filters and lineage stay. A failed seed
+leaves the target unchanged.
 
-**Compute.** The ingestion job runs on a job cluster (DBR 18, single user,
-`spark.scheduler.mode=FAIR`) sized by the `node_type_id`, `driver_node_type_id`, and `num_workers`
-bundle variables. It is driver-bound (per-table MERGE planning and Delta commits), so size the
-driver first.
+### Consolidated sinks
+
+By default each control row owns its sink table. To share one sink across many source databases,
+set `control.client_id` on each row and point them at the same sink.
+
+- Every row carries the `client_id` value in the sink column `__client_id__`. The sink is created
+  with liquid clustering on it.
+- The MERGE matches on `__client_id__` and the primary key. The delete snapshot deletes only that
+  client's rows.
+- Seeds and full reloads replace only that client's rows with `REPLACE WHERE __client_id__ = ...`.
+  A partitioned seed stages in a per-client table.
+- Schema evolution absorbs column drift between clients.
+- Checkpoints stay per control row.
+- `client_id` must match `^[A-Za-z0-9_.:-]{1,128}$`. `__client_id__` must not be in `select_list`.
+- `client_attrs` is an optional JSON object `{column: value}`. The engine writes each value as a
+  STRING column on every row.
+
+A unique index allows one row per (sink, `client_id`). A sink with a dedicated row and consolidated
+rows fails those rows at stage `plan`.
+
+Concurrent writers can hit a Delta conflict. A conflict retries the whole unit with exponential
+backoff and full jitter. Defaults: 6 attempts, 1 s base, 60 s cap. Environment variables
+`LAKEFED_WRITE_RETRY_ATTEMPTS`, `LAKEFED_WRITE_RETRY_BASE_S` and `LAKEFED_WRITE_RETRY_MAX_S` change
+them.
 
 ### Table retries
 
-By default a table that fails waits for the next run. Set the job parameter `table_retries` (default
-`0`, off) to try it again in the same run when the failure is a transient source error: a refused or
-dropped connection, a timeout, or Azure SQL throttling (`table_retry.py`). Errors that would fail again
-(a missing table, a denied permission, a schema error, a failed login when Spark passes on its cause)
-and errors it doesn't recognise fail at once, as without retries.
+Set job parameter `table_retries` above 0 to retry a table in the same run after a transient source
+error. Transient errors are a refused or dropped connection, a timeout, or Azure SQL throttling.
+Permanent errors fail at once. An unknown error is permanent.
 
-- **Pauses** double with each attempt, with jitter: 5 to 10 s, then 10 to 20 s, up to 2 minutes
-  (environment variables `LAKEFED_TABLE_RETRY_BASE_S`, default `10`, and `LAKEFED_TABLE_RETRY_MAX_S`,
-  default `120`). A waiting table holds no `parallelism` slot.
-- **Limits:** `table_retry_budget` (default `20`) retries in the whole run, and a source server stops
-  retrying for the rest of the run after 5 failed retries (`LAKEFED_TABLE_RETRY_PER_SOURCE`); retries
-  that succeed don't count, so a short blip is retried in full. An outage that fails a server's tables
-  all at once gets at most the budget's retries before any of them fails. Either way a source outage
-  costs a few extra queries, not one per table. Retries take slots and per-source
-  permits like any other work, so `parallelism` and `max_queries_per_source` still hold.
-- **No duplicates:** in merge mode every write is idempotent. In append mode the next attempt first
-  checks the sink for this run's rows of the table and appends again only when there are none, so an
-  append whose commit landed before its statement failed is never written twice.
-- **Records:** each attempt is its own `ingest_event` row: `retried` (with the error and the stage),
-  then `ok` or `failed`, with `retry_count`. The run's `detail` has the totals (`table_retries`). See
-  [monitoring.md](docs/monitoring.md).
+- The pause doubles with each attempt, with jitter. Defaults: 10 s base, 120 s cap. Environment
+  variables `LAKEFED_TABLE_RETRY_BASE_S` and `LAKEFED_TABLE_RETRY_MAX_S` change them. A waiting
+  table holds no slot.
+- `table_retry_budget` caps the retries of one run, default 20. A source server stops retrying for
+  the rest of the run after 5 failed retries. Environment variable `LAKEFED_TABLE_RETRY_PER_SOURCE`
+  changes it.
+- Each attempt is one `ingest_event` row. A retried attempt ends as `retried`. `retry_count`
+  numbers the attempts. The run `detail` holds the totals under `table_retries`.
+- The next attempt is planned from the fresh checkpoint. Every write is idempotent, so a retry
+  never duplicates rows.
 
-### Large estates
+### Concurrency
 
-Job parameters for estates of thousands of databases and millions of tables (defaults keep the
-behavior described above). Each defaults to the bundle variable of the same name, so a target can
-set them:
+`parallelism` is the one concurrency budget of a run. It counts units of query work: a cursor read
+plus MERGE, a seed, one partition, one small source query, the staging swap. Default 32.
+`max_queries_per_source` caps the concurrent queries per source server across every run. Each run
+takes its share, the cap divided by the runs reading the server, at least 1. 0 means no cap.
 
-| Parameter | Default | Effect |
+### Job parameters
+
+Each tuning parameter defaults to the bundle variable of the same name in `databricks.yml`. A
+target can set the variable. A run can override the parameter.
+
+| Parameter | Default | Meaning |
 |---|---|---|
-| `max_seeds_per_run` | `0` (no limit) | At most this many seeds per run; the rest seed in later runs. Onboarding then takes several bounded runs, and tables already seeded keep getting their increments in each. Seeds whose last attempt failed go last |
-| `freshness_interval_s` | `0` | Unchanged tables whose checkpoint is already current are written to Lakebase only when `last_success_at` is older than this. Nearly every table is quiet nearly every run, so this removes most of a run's Lakebase writes; `last_success_at` is then up to this stale |
-| `append_batch_size` | `1` (off) | [Batched appends](#append-sinks-optional) for append sinks with `client_id` |
-| `detection_chunk` | `200` | Tables per change-detection query. Set it to at least the tables per database, so a changed database costs one detection query |
-
-Each run loads its collection's control rows into the driver (repeated values such as
-`select_list` are shared, but each row is still a Python dict), so prefer more, smaller collections
-over a few huge ones: for example a few hundred thousand tables each.
+| `task_collection` | `example_cohort` | the collection this run ingests |
+| `db_instance` | `lakefed-cursor` | Lakebase instance |
+| `db_name` | `databricks_postgres` | Lakebase database |
+| `secret_scope` | `lakefed-cursor` | scope of the source secrets |
+| `parallelism` | `32` | concurrent query units |
+| `trust_server_certificate` | `true` | trust the source TLS certificate without validation |
+| `cursor_lookback_s` | `3600` | lookback for temporal cursors. The control row overrides it |
+| `cursor_skew_s` | `300` | seconds `hi` can exceed the source clock |
+| `detection_chunk` | `200` | tables per batched `MAX` query |
+| `max_seeds_per_run` | `0` | seeds per run. 0 means no limit |
+| `freshness_interval_s` | `0` | skip the bulk advance for tables stamped inside this many seconds |
+| `max_queries_per_source` | `0` | concurrent queries per source server across runs. 0 means no cap |
+| `table_retries` | `0` | extra attempts per table. 0 means off |
+| `table_retry_budget` | `20` | retries per run |
 
 ## Metadata (Lakebase)
 
-All metadata lives in Lakebase (`src/lakefed_ingest/lakebase_schema.sql`), schema `lakefed_ingest`:
+All state lives in Lakebase schema `lakefed_cursor`. File `src/lakefed_ingest/lakebase_schema.sql`
+holds the DDL.
 
 | Table | Holds |
 |---|---|
-| `control` | One row per (source database, table): source, credentials key, keys, sink, `task_collection` |
-| `checkpoint` | Hot per-table state: strategy, position (CT version for `ct`, watermark for `cursor`), phase, status, freshness |
-| `reseed_queue` | Tables queued for a reseed and why |
-| `ingest_run`, `ingest_event` | Run- and table-level telemetry |
+| `control` | one row per (source database, table): source, secret key, sink, cursor, deletes |
+| `checkpoint` | per-table state: strategy, position, phase, status, freshness, last delete snapshot |
+| `ingest_run`, `ingest_event` | run and table telemetry |
+| `schema_version` | the schema versions applied |
 
-Column-level reference, a diagram, and the checkpoint lifecycle: [docs/lakebase_schema.md](docs/lakebase_schema.md).
+Column reference and the checkpoint lifecycle: [docs/lakebase_schema.md](docs/lakebase_schema.md).
 
-Upgrading from an earlier deploy: pull and deploy. The database records its schema version
-(`schema_version`); the first ingestion run whose code needs a newer one migrates the schema before it
-starts, in one transaction, while runs of other collections wait for it. If the migration fails (for
-example, existing rows break a new constraint), nothing changes and the run fails with the cause; fix
-it and re-run. Running `lakefed_cursor_setup` after deploying migrates ahead of the first run instead,
-and the migration needs the schema's owner (the deployer, unless the jobs run as someone else). From an
-early deploy, the migration renames `ct_checkpoint` → `checkpoint` (`ct_version` → `position`),
-`sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and `ingest_event.ct_version_from/to` →
-`position_from/to` in place; data is kept. It also renames the checkpoint phase `cdc` to `incremental`
-(history included); a run still going on the older code then has its checkpoint writes rejected, and
-the next run picks those tables up. This only reaches the existing data if the bundle points to the
-existing instance and database. Preview deployments used
-different names and a different bundle, so follow
-[Upgrading a preview deployment](docs/deploy.md#1-add-a-target) first; the defaults would create a new,
-empty instance.
+The position is JSON `{"expr", "kind", "type", "value"}`. `expr` is the expression text at the
+last seed. `kind` is the `cursor_kind`. `type` is the source type of the expression result. `value`
+is digits for numeric, ISO 8601 for temporal, a decimal integer for rowversion. See
+`specs/001-cursor-only-engine/contracts/position.md`.
 
-The migration also creates the one-row-per-sink unique index. If existing control rows already write
-the same sink, it fails with `could not create unique index "control_sink_client_uq"`; those rows
-were overwriting each other's data. Find them, point each at its own sink (or set `client_id` to
-consolidate), and re-run:
+The database records its schema version. The first run whose code needs a newer version applies the
+DDL in one transaction before it starts. Job `lakefed_cursor_setup` applies it ahead of a run. The
+migration needs the schema owner. No data migrates from a `lakefed_ingest` deployment.
 
-```sql
-select lower(sink_catalog), lower(sink_schema), lower(sink_table), array_agg(id order by id)
-from lakefed_cursor.control group by 1, 2, 3
-having count(*) filter (where client_id is null) > 1;
-```
-
-The Lakebase database is registered in Unity Catalog (default catalog `lakefed_cursor_lakebase`),
-so control and telemetry tables can be queried from DBSQL. See [docs/monitoring.md](docs/monitoring.md).
+The Lakebase database is registered in Unity Catalog as `lakefed_cursor_lakebase`. Query the
+tables from DBSQL. See [docs/monitoring.md](docs/monitoring.md).
 
 ### Control rows
 
-Key columns: `task_collection`, `src_type`, `src_host` / `src_port` (NULL port = the engine
-default) and `secret_key`, or `src_connection` with `use_remote_query` (see
-[Sources and load strategies](#sources-and-load-strategies)), `src_database`, `src_schema`,
-`src_table`, `primary_key` (comma-separated;
-required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` isn't supported),
-`sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
-optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
-(consolidated sinks), `write_mode` (`merge` | `append`, see [Append sinks](#append-sinks-optional)),
-`client_attrs` (identity columns, JSON), and `jdbc_options`.
-`cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
-`ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
+Key columns by group:
 
-**Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
-sink and reseeds that table so historical rows are backfilled. With the job parameter
-`reseed_on_new_columns = "false"` the table carries on from its checkpoint instead: the column is
-added and is NULL on rows written before (useful for append sinks, where a reseed appends a full
-snapshot of every table that gained the column). New sinks get
-`delta.enableTypeWidening`; for older sinks run
+- grouping: `task_collection`, `task_enabled`, `tier`, `priority`
+- source: `src_type`, `src_host`, `src_port`, `secret_key`, `src_connection`, `use_remote_query`, `src_database`, `src_schema`, `src_table`, `jdbc_options`
+- read: `primary_key`, `select_list`, `load_type`, `load_partitioned`, `partition_col`, `partition_size_mb`
+- sink: `sink_catalog`, `sink_schema`, `sink_table`, `client_id`, `client_attrs`
+- cursor: `cursor_expression`, `cursor_kind`, `cursor_lookback_s`, `null_cursor_policy`
+- deletes: `delete_mode`, `delete_min_interval_s`
+
+`load_type` defaults to `cursor`. A `cursor` row needs `primary_key`, `cursor_expression` and
+`cursor_kind`. A `full` row has no cursor columns. CHECK constraints reject other combinations. See
+`specs/001-cursor-only-engine/contracts/control_row.md` and `notebooks/load_control_example.ipynb`.
+
+Writes use schema evolution. A column added to `select_list` is added to the sink, and the table
+reseeds. New sinks get `delta.enableTypeWidening`. For an older sink run
 `ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`.
 
 ## Prerequisites
 
 | Prerequisite | How |
 |---|---|
-| Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_cursor_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
-| Schema + migrations | `lakefed_cursor_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
-| Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
-| Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
-| Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE` |
-| Cluster → source network path (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Customer networking |
-| `ct` source tables: CT enabled + primary key, `CHANGE_RETENTION` longer than the seed time (snapshot isolation is not required) | Source-side configuration |
-| Oracle / MySQL sources: JDBC driver library on the job cluster | Uncomment it in `resources/lakefed_cursor.yml` |
+| Lakebase instance, database, UC catalog | bundle resources in `resources/lakefed_cursor_setup.yml`, or adopt existing ones with `bundle deployment bind` |
+| Schema | job `lakefed_cursor_setup`. An upgrade migrates on the next run |
+| Lakebase auth | SDK-minted OAuth token at run time. The run identity must be a Postgres role on the instance |
+| Cluster to Lakebase network path, port 5432 | the workspace IP access list must allow cluster egress, or use Private Link |
+| Source credentials | one JSON secret per source database in scope `lakefed-cursor`, or a UC connection for `use_remote_query` rows |
+| Cluster to source network path | SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306 |
+| Oracle or MySQL JDBC driver | uncomment the library in `resources/lakefed_cursor.yml` |
 
-No SQL warehouse is needed, and UC connections only for rows that read through one.
-
-> Deploying `lakefed_cursor_setup.yml` **creates a billable Lakebase instance** unless you bind an
-> existing one.
+WARNING: a deploy of `lakefed_cursor_setup.yml` creates a billable Lakebase instance unless you bind
+an existing one.
 
 ## Deploy and run
 
-Step-by-step setup for a new workspace: [docs/deploy.md](docs/deploy.md).
+Run every command from the repo root. Choose the profile yourself. See [docs/deploy.md](docs/deploy.md).
 
-```bash
-# From the repo root (bundle lakefed_cursor). Compute variables default to Azure node types.
-# The gate: the name test (no lakefed_ingest / edp resource names), then bundle validate.
-scripts/validate.sh -t <target> -p <profile>
-databricks bundle deploy -t <target> -p <profile>
+1. Check the names and the bundle.
 
-# One-time: create the Lakebase schema. (Upgrades migrate it on the next ingestion run.)
-databricks bundle run lakefed_cursor_setup -t <target> -p <profile>
+   ```bash
+   scripts/validate.sh -t <target> -p <profile>
+   ```
 
-# Load one secret per source database (or use an Azure Key Vault-backed scope). Rows that read
-# through a UC connection (use_remote_query) need none.
-databricks secrets put-secret <scope> <secret_key> --string-value '{"user":"..","password":".."}'
+2. Deploy the bundle.
 
-# Register tables: edit and run notebooks/load_control_example.ipynb.
+   ```bash
+   databricks bundle deploy -t <target> -p <profile>
+   ```
 
-# Ingest a task_collection (the first run seeds; later runs apply Change Tracking increments).
-databricks bundle run lakefed_cursor -t <target> -p <profile> \
-  --params task_collection=<collection>,parallelism=32
-```
+3. Create the Lakebase schema.
 
-The job ships with a paused 15-minute schedule. Job schedules can't pass parameters, so the
-schedule only ingests the job's default `task_collection`; run other collections with `run-now`
-and `job_parameters` (a launcher over collections is planned).
+   ```bash
+   databricks bundle run lakefed_cursor_setup -t <target> -p <profile>
+   ```
 
-**Monitoring:** run and per-table telemetry, failures, and freshness queries are in
-[docs/monitoring.md](docs/monitoring.md).
+4. Store one secret per source database. Use a hidden prompt. Do not paste a secret into a notebook.
 
-**Sizing a source estate:** [`tools/source_profile.sql`](tools/source_profile.sql) is a read-only
-script to run once per SQL Server database. It reports table sizes, CT settings, and how many
-tables and rows change per time bucket — the inputs for choosing collections, `parallelism`, and
-cluster size.
+   ```bash
+   databricks secrets put-secret lakefed-cursor <secret_key> -p <profile>
+   ```
+
+5. Insert control rows with `notebooks/load_control_example.ipynb`.
+
+6. Run the ingestion.
+
+   ```bash
+   databricks bundle run lakefed_cursor -t <target> -p <profile> --params task_collection=<collection>
+   ```
+
+The first run seeds. Later runs increment cursor tables and reload full tables. The job ships with a
+paused 15-minute schedule. A schedule cannot pass parameters, so it ingests only the default
+collection. Trigger other collections with `run-now` and `job_parameters`.
+
+## Live proof
+
+The SQL Server live proof is on hold, because no SQL Server source is available. The Oracle live proof
+runs in Phase 10 of `specs/001-cursor-only-engine/tasks.md`. Results go to `tasks/todo.md`.
+`docs/baseline.md` records the Lakeflow Connect comparison baseline.
 
 ## Tests
 
 ```bash
-pytest                              # the same as pytest tests (testpaths in pytest.ini)
+.venv/bin/pytest -rs tests
 ```
 
-Run `pytest` from the repo root. Unit tests need no cluster.
+Unit tests need no cluster. A skipped test is a failure. Every cursor test runs against the SQL
+Server, Oracle and PostgreSQL adapters. `tests/synthetic/` builds a synthetic SQL Server database
+for a live test. See [tests/synthetic/README.md](tests/synthetic/README.md).
 
-For a dev or test source, `tests/synthetic/` builds a SQL Server database with 1,800 CT-enabled
-tables, applies changes to it, and reconciles the sinks with the source; see
-[tests/synthetic/README.md](tests/synthetic/README.md).
+## Not supported
 
-## Not yet supported
-
-The `cdc` load strategy (placeholder with a documented contract in `load_strategies.py`),
-`cursor` and `cdc` for sources other than SQL Server (placeholders), and production alerting.
+SQL Server CT, CDC, append-mode sinks, `cursor` on MySQL, `delete_mode` `soft_column` and
+`full_compare`, production alerting.
 
 ## Help
 
-Databricks support does not cover this project. For questions or bugs, open a GitHub issue and the
-team will help on a best-effort basis.
+Databricks support does not cover this project. Open a GitHub issue for questions or bugs.
 
 ## License
 

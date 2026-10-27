@@ -1,24 +1,24 @@
-"""Load strategies: HOW a table is kept in sync (``control.load_type``), independent of the source
-engine (``control.src_type`` -> ``source_adapters``).
+"""Load strategies: how a table is kept in sync (``control.load_type``), independent of the source
+engine (``control.src_type``, see ``source_adapters``).
 
-Each strategy owns the meaning of the generic checkpoint row (``lakefed_ingest.checkpoint``):
-``strategy`` names it and ``position`` (text) is its opaque resume position, encoded and decoded
-only by the strategy that wrote it.
+Each strategy owns the meaning of the checkpoint row (``lakefed_cursor.checkpoint``). ``strategy``
+names it. ``position`` (text) is its resume position.
 
 =========  ============================================================  ==========================
-load_type  behaviour                                                     position
+load_type  behavior                                                      position
 =========  ============================================================  ==========================
-cursor     High-watermark column (every adapter with cursor methods:        JSON {col, type, value}
-           SQL Server, Oracle, PostgreSQL): seed, then (position, hi]
-           reads upsert-MERGEd by PK; no deletes
+cursor     High watermark over one SQL expression (SQL Server, Oracle,   JSON {expr, kind, type,
+           PostgreSQL): seed, then (lo, hi] reads upsert-MERGEd by PK.   value}
+           Deletes only through delete_mode pk_snapshot.
 full       Reload the whole table every cycle (data-only atomic replace;  NULL (not resumable)
-           partitioned tables use the staged swap). No PK required
+           partitioned tables use the staged swap). No PK required.
 =========  ============================================================  ==========================
 
-``supported(src_type, load_type)`` is the support matrix the planner enforces: a control row whose
-pair isn't supported fails on its own (clear message, stage ``plan``) without affecting the run.
+``supported(src_type, load_type)`` is the support matrix the planner enforces. ``cursor`` on MySQL
+is not supported: the adapter has no cursor methods. ``unsupported_reason`` gives the message. A
+control row whose pair is not supported fails on its own at stage ``plan``.
 
-Pure Python — unit-tested in tests/load_strategies_test.py.
+Pure Python. Unit-tested in tests/load_strategies_test.py.
 """
 
 from __future__ import annotations

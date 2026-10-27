@@ -1,30 +1,34 @@
-"""Per-(tenant db, table) worker with Lakebase telemetry, moved out of ingest.ipynb.
+"""Per-table worker (``ingest_one``) with Lakebase telemetry.
 
-Source reads live in source_io, sink writes in sink_writer; everything here is orchestration +
-checkpointing + telemetry, keyed by the control id (cfg["id"]). Each table arrives with a ROUTE
-decided by the planner:
-  full             - load_type 'full': reload the whole table (data-only atomic replace; staged
-                     swap when partitioned), checkpoint {strategy full, phase loaded, no position}
-  cursor_seed      - load_type 'cursor', no usable checkpoint: capture the high watermark `hi`,
-                     seed, checkpoint {cursor position hi, incremental}
-  cursor           - load_type 'cursor': read `hi` unless the plan carries it from the batched capture
-                     (a temporal `hi` is capped at the source clock plus
-                     cursor_skew_s; logged as alert=max_above_clock); unchanged if equal to the
-                     checkpoint, else read (position - lookback, hi] + upsert MERGE by PK, advance
-                     to `hi`. An identity cursor logs `inserts_only` once per run per table. Then,
-                     when planner.snapshot_due (delete_mode pk_snapshot, interval passed): read every
-                     source PK, delete the sink rows absent from it (client-scoped), record the time
-  schema_reseed    - control.select_list gained columns vs the recorded one, or the cursor_expression
-                     / cursor_kind changed (plan["reason"]): enqueue a reseed
-  (retry)          - table_retries: the same route again on the fresh checkpoint
-The `stage` variable records how far a table got, so a failure pinpoints read vs merge vs
-checkpoint. The collection lock is re-checked (``deps.guard``, cached, <=1 query/30s) right before
-every commit point — seed, each partition + the swap, MERGE, reseed enqueue, checkpoint advance —
-so a run that lost its lock stops writing; skipped work is redone by the next sweep (at-least-once).
+Source reads live in ``source_io``. Sink writes live in ``sink_writer``. This module does the
+orchestration, the checkpoint, and the telemetry, keyed by the control id (``cfg["id"]``). Each
+table arrives with a route from the planner:
 
-``deps`` (research R-03): ``spark``, ``store``, ``slots``, ``executor``, ``log``, ``params``
-(``table_retries``, ``cursor_lookback_s``, ``cursor_skew_s``), plus ``guard`` (the lock check) and ``retry_policy`` (table_retry.RetryPolicy).
-The checkpoint advances only after the sink write commits (tests/worker_test.py).
+* ``full``: load_type ``full``. Reload the whole table (data-only atomic replace, staged swap when
+  partitioned). Checkpoint {strategy full, phase loaded, no position}.
+* ``cursor_seed``: load_type ``cursor``, no usable checkpoint. Capture the high watermark ``hi``,
+  seed, checkpoint {position hi, phase incremental}.
+* ``cursor``: load_type ``cursor``. Take ``hi`` from the plan (batched capture) or read it. A
+  temporal ``hi`` is capped at the source clock plus ``cursor_skew_s`` (``alert=max_above_clock`` in
+  the log and the checkpoint detail). Unchanged when equal to the position. Otherwise read
+  (position - lookback, hi], upsert MERGE by PK, advance to ``hi``. An identity cursor logs
+  ``inserts_only`` once per run per table. Then, when ``planner.snapshot_due`` (delete_mode
+  ``pk_snapshot``, interval passed): read every source PK, delete the sink rows absent from it
+  (client-scoped), record the time. Stage ``snapshot``.
+* ``schema_reseed``: ``control.select_list`` gained columns, or ``cursor_expression`` or
+  ``cursor_kind`` changed (``plan["reason"]``). Enqueue a reseed.
+* Retry: with ``table_retries`` the same route runs again on the fresh checkpoint.
+
+The ``stage`` variable records how far a table got, so a failure names read, merge, snapshot, or
+checkpoint. The collection lock is re-checked (``deps.guard``, cached, at most one query per 30 s)
+before every commit point: seed, each partition and the swap, MERGE, DELETE, reseed enqueue,
+checkpoint advance. A run that lost its lock stops writing. The next sweep redoes the skipped work.
+Error text is redacted with ``source_io.redact`` before it reaches the log or Lakebase.
+
+``deps``: ``spark``, ``store``, ``slots``, ``executor``, ``log``, ``params`` (``table_retries``,
+``cursor_lookback_s``, ``cursor_skew_s``), ``guard`` (the lock check), and ``retry_policy``
+(``table_retry.RetryPolicy``). The checkpoint advances only after the sink write commits
+(tests/worker_test.py).
 """
 import time
 

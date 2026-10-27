@@ -1,51 +1,44 @@
-"""Cursor (high-watermark) strategy: incremental reads on a monotonically increasing SQL expression
-(``control.cursor_expression``: one to three source columns, folded with GREATEST / COALESCE), MERGEd
-into the Delta sink by PK. Every dialect difference (type lookup, clock, text rendering, literals, the
-GREATEST form) is a ``SourceAdapter`` method; this module never branches on ``src_type``.
+"""Cursor strategy: incremental reads above a high watermark, merged into the Delta sink by primary key.
 
-Per cycle, for a seeded table (checkpoint phase ``incremental``):
-  1. ``hi`` = the expression's current high watermark (one small source query);
-  2. ``hi`` == checkpoint position -> unchanged (no read, no MERGE);
-  3. otherwise read ``expr > position AND expr <= hi`` (ONE source read) and
-     upsert-MERGE by PK; the checkpoint advances to ``hi`` only after the MERGE commits
-     (at-least-once — re-reading a window is harmless, the MERGE is idempotent).
-The seed captures ``hi`` BEFORE the full copy, so rows written during the seed are re-read by the
-first increment (no gap).
+The watermark is ``control.cursor_expression``: one SQL expression over one to three source columns
+of one type, folded with GREATEST over COALESCE inputs. ``control.cursor_kind`` names its clock:
+``rowversion``, ``db_timestamp``, ``app_timestamp``, or ``identity``. Every dialect difference is a
+``SourceAdapter`` method. This module never branches on ``src_type``.
 
-Supported column types (``SourceAdapter.type_class_of`` of the expression's columns, which share one
-type; SQL Server names shown,
-see each adapter for its own), by kind:
-  * ``identity`` (type class ``numeric``): tinyint, smallint, int, bigint, decimal, numeric (identity keys / sequences). A
-    value is taken at insert, not at commit, so a late commit below a read ``hi`` is lost: the kind
-    is inserts-only (``plan_increment`` says so) and reads exact bounds;
-  * ``temporal``: date, smalldatetime, datetime, datetime2, datetimeoffset (an application-maintained
-    ``updated_at``). ``lo`` is pulled back by ``lookback_s`` (job parameter ``cursor_lookback_s``,
-    the row's ``cursor_lookback_s`` overrides it) for late commits; ``hi`` is capped at the source
-    clock plus ``skew_s`` so one row stamped in 2099 cannot pin the window (``max_above_clock``
-    alert); ``datetime`` / ``smalldatetime`` literals carry at most three fractional digits;
-  * ``rowversion`` (``timestamp``): recommended — SQL Server bumps it on every insert AND update,
-    and ``hi`` is capped below ``MIN_ACTIVE_ROWVERSION()`` so rows from still-open transactions are
-    never skipped. Exact bounds.
-Float / real / string columns are rejected (lossy or not reliably ordered).
+One cycle of a seeded table (checkpoint phase ``incremental``):
 
-Limits (by design of a watermark): deletes are not captured, except by ``delete_mode``
-``pk_snapshot`` (``delete_missing``: all source keys read once per ``delete_min_interval_s``);
-updates are captured only if they move the cursor column (``rowversion`` always does, an identity
-never does). A ``hi`` below the position (a source truncate or reload) fails the table; the position
-never moves backwards.
+1. ``hi`` is the current value of the expression. It comes from the batched capture
+   (``capture_batch``, one ``max_batch_sql`` query per source database and cursor type) or from
+   ``high_watermark`` (one query per table).
+2. A temporal ``hi`` is capped at the source clock plus ``skew_s``. The cap raises the
+   ``max_above_clock`` alert.
+3. ``plan_increment`` decides: unchanged, or read. A temporal kind always reads, because ``lo`` is
+   the position minus ``lookback_s``. An identity or rowversion kind reads exact bounds.
+4. The read is ``expression > lo AND expression <= hi``, one source query. An upsert MERGE by
+   primary key applies it. A matched row is updated only when its expression changed.
+5. The checkpoint advances to ``hi`` after the MERGE commits. Delivery is at-least-once. The MERGE
+   is idempotent.
 
-Position (``checkpoint.position``, text) is JSON ``{"expr", "kind", "type", "value"}``
-(contracts/position.md): the expression text, ``cursor_kind`` and the type are recorded so a changed
-expression or kind re-seeds and every later cycle needs no type lookup. ``value`` is canonical source
-text (ISO 8601 for temporal, decimal text otherwise).
+The seed captures ``hi`` before the full copy. The first increment reads the rows written during
+the seed again. An identity value is set at insert time, so a late commit below ``hi`` is lost. The
+kind is inserts-only, and ``plan_increment`` returns the note ``inserts_only``. A ``hi`` below the
+position fails the table. The position never moves backwards.
 
-``validate_expression`` (data-model rules 4 to 7) checks the expression before any source read: one
-to three columns, GREATEST / COALESCE only, one shared type, no nullable input unless
-``null_cursor_policy`` is ``seed_only`` (then a NULL-expression row is copied by the seed and never
-read by an increment, whose window is ``(lo, hi]``).
+``validate_expression`` checks a row before any source read: one to three columns, GREATEST and
+COALESCE only, one shared type, and no nullable input unless ``null_cursor_policy`` is
+``seed_only``. The seed copies a row with a NULL expression. No increment reads it again.
 
-Pure builders are unit-tested in tests/cursor_engine_test.py; source access reuses ``source_io``
-(one slot per query unit, lazy Spark imports) and sink writes reuse ``sink_writer``.
+``delete_missing`` runs the ``pk_snapshot`` delete mode: read every source primary key once per
+``delete_min_interval_s``, then delete the sink rows absent from it, scoped to ``client_id``.
+
+The position (``checkpoint.position``) is JSON ``{"expr", "kind", "type", "value"}``. See
+contracts/position.md. ``encode_position`` and ``decode_position`` own the format. A position with
+a different ``expr`` or ``kind`` than the control row reseeds the table. ``value`` is ISO 8601 for a
+temporal type and decimal text otherwise. A ``datetime`` or ``smalldatetime`` literal carries at most
+three fractional digits.
+
+Pure builders are unit-tested in tests/cursor_engine_test.py against the SQL Server, Oracle, and
+PostgreSQL adapters. Source access reuses ``source_io``. Sink writes reuse ``sink_writer``.
 """
 
 from __future__ import annotations
