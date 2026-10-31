@@ -86,9 +86,14 @@ targets:
 
   devtest:
     # Live devtest workspace (quickstart.md, step 8). Same development mode as dev.
+    # Azure workspace with classic compute; one small worker is enough for the devtest tables.
     mode: development
     workspace:
-      host: https://dbc-8e058692-373e.cloud.databricks.com
+      host: https://adb-7405613017070986.6.azuredatabricks.net
+    variables:
+      node_type_id: Standard_D4ds_v4
+      driver_node_type_id: Standard_D4ds_v4
+      num_workers: 1
 
   prod:
     mode: production
