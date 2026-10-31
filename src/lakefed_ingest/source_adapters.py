@@ -137,7 +137,13 @@ class SourceAdapter:
 
     def bounds_query(self, schema: str, table: str, partition_col: str) -> str:
         col = self.quote_ident(partition_col)
-        return f"SELECT MIN({col}) AS lb, MAX({col}) AS ub FROM {self.table_ref(schema, table)}"
+    def result_alias(self, name: str) -> str:
+        """A result column alias the engine reads by name (``row["hi"]``). The default is the bare
+        name; a dialect that folds unquoted aliases to upper case (Oracle) quotes it."""
+        return name
+
+        return (f"SELECT MIN({col}) AS {self.result_alias('lb')}, MAX({col}) AS {self.result_alias('ub')}"
+                f" FROM {self.table_ref(schema, table)}")
 
     def table_size_mb_query(self, schema: str, table: str) -> str:
         """One row ``table_size_mb`` (data + indexes) for the partitioned seed's partition count."""
@@ -180,7 +186,7 @@ class SourceAdapter:
         cols = [f"(SELECT {self.max_text_sql(expr, now_type)} FROM {self.table_ref(schema, table)}) AS "
                 f"{self.quote_ident(alias)}" for alias, schema, table, expr in tables]
         if self.type_class_of(now_type) == "temporal":
-            cols.append(f"{self.cursor_text_sql(self.source_now_sql(now_type), now_type)} AS src_now")
+            cols.append(f"{self.cursor_text_sql(self.source_now_sql(now_type), now_type)} AS {self.result_alias('src_now')}")
         return f"SELECT {', '.join(cols)}{self.scalar_from}"
 
     def greatest_expr(self, inputs, type_name: str, server_version) -> str:
@@ -334,7 +340,7 @@ class OracleAdapter(SourceAdapter):
         # the table. A table without statistics reports 0 MB -> the 2-partition floor applies. Exact
         # segment sizes (DBA_SEGMENTS) need extra privileges — see docs/deploy.md.
         return (
-            "SELECT ROUND(NVL(num_rows, 0) * NVL(avg_row_len, 0) / 1048576, 2) AS table_size_mb"
+            "SELECT ROUND(NVL(num_rows, 0) * NVL(avg_row_len, 0) / 1048576, 2) AS \"table_size_mb\""
             f" FROM all_tables WHERE owner = {self.quote_str(schema)} AND table_name = {self.quote_str(table)}"
         )
 
@@ -351,15 +357,18 @@ class OracleAdapter(SourceAdapter):
         if m and int(m.group(2) or 0) <= 0:
             return "numeric"
         if self._temporal.match(t):
+
+    def result_alias(self, name):
+        return self.quote_ident(name)   # unquoted aliases come back upper case (TYPE_NAME), the engine reads type_name
             return "temporal"
         raise ValueError(self._type_error(type_name, ["NUMBER with scale 0", "DATE", "TIMESTAMP(n)",
                                                       "TIMESTAMP(n) WITH [LOCAL] TIME ZONE"]))
 
     def cursor_type_sql(self, schema, table, columns):
         names = ", ".join(self.quote_str(c) for c in columns)
-        return ("SELECT column_name, CASE WHEN data_type = 'NUMBER' AND data_scale IS NOT NULL THEN "
-                "'NUMBER(' || data_precision || ',' || data_scale || ')' ELSE data_type END AS type_name, "
-                "CASE WHEN nullable = 'Y' THEN 1 ELSE 0 END AS is_nullable FROM all_tab_columns "
+        return ("SELECT column_name AS \"column_name\", CASE WHEN data_type = 'NUMBER' AND data_scale IS NOT NULL THEN "
+                "'NUMBER(' || data_precision || ',' || data_scale || ')' ELSE data_type END AS \"type_name\", "
+                "CASE WHEN nullable = 'Y' THEN 1 ELSE 0 END AS \"is_nullable\" FROM all_tab_columns "
                 f"WHERE owner = {self.quote_str(schema)} AND table_name = {self.quote_str(table)} AND column_name IN ({names})")
 
     def source_now_sql(self, type_name):

@@ -203,7 +203,7 @@ def test_nullable_cursor_input_is_refused(monkeypatch, dialect):
     monkeypatch.setattr(source_io, "_read", lambda sp, cfg, q, **kw: _Rows([{"column_name": "updated_at", "type_name": typ, "is_nullable": 1}]))
     with pytest.raises(ValueError, match="is nullable"):
         cur.column_type(cfg)
-    assert "AS is_nullable" in cur.column_type_sql(cfg) and cur.column_type_sql(cfg) in cur.nullable_sql(cfg)
+    assert "is_nullable" in cur.column_type_sql(cfg) and cur.column_type_sql(cfg) in cur.nullable_sql(cfg)
 
 
 # ---- read_and_merge: one read feeding one MERGE, per-call temp view, always dropped -----------------
@@ -358,7 +358,7 @@ def test_gap_2_lookback_argument_replaces_env():
 
 @pytest.mark.parametrize("cfg,typ", DIALECTS)
 def test_gap_4_hi_capped_at_source_clock_plus_skew(monkeypatch, cfg, typ):
-    assert " AS src_now FROM" in cur.high_watermark_sql(cfg, typ)
+    assert f" AS {sa.for_cfg(cfg).result_alias('src_now')} FROM" in cur.high_watermark_sql(cfg, typ)
     _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
     assert cur.high_watermark(cfg, typ, skew_s=300) == ("2026-10-26T10:05:00", True)
     _source_rows(monkeypatch, [{"hi": "2026-10-26T09:59:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
@@ -562,7 +562,7 @@ def test_capture_batch_one_query_per_chunk_decodes_hi_and_clock(monkeypatch, dia
     out = cur.capture_batch(tables, skew_s=60, chunk=2)
     assert len(queries) == 2 and queries[0].count("(SELECT ") == 2 and queries[1].count("(SELECT ") == 1
     assert queries[0].startswith("SELECT (SELECT ") and a.table_ref(cfg["src_schema"], "t0") in queries[0]
-    assert a.table_ref(cfg["src_schema"], "t2") in queries[1] and "AS src_now" in queries[1]
+    assert a.table_ref(cfg["src_schema"], "t2") in queries[1] and f"AS {a.result_alias('src_now')}" in queries[1]
     assert out[0] == ("2026-01-01T10:00:00", False) and out[1] == (None, False)
     # the third table is capped at the clock plus skew_s and flagged (gap 4), as high_watermark does
     assert out[2] == ("2026-01-01T12:01:00", True)

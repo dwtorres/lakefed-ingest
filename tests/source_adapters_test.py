@@ -68,7 +68,7 @@ def test_bounds_queries_quote_identifiers():
 def test_table_size_queries_return_table_size_mb_and_escape():
     for t in sa.SRC_TYPES:
         q = sa.get_adapter(t).table_size_mb_query("s", "o'b")
-        assert "AS table_size_mb" in q and "o''b" in q, t
+        assert f"AS {sa.get_adapter(t).result_alias('table_size_mb')}" in q and "o''b" in q, t
     ora = sa.get_adapter("oracle").table_size_mb_query("HR", "EMP")
     assert "FROM all_tables" in ora and "dba_segments" not in ora.lower()   # least privilege
     assert "owner = 'HR' AND table_name = 'EMP'" in ora
@@ -134,7 +134,7 @@ CURSOR_METHODS = ("cursor_type_sql", "type_class_of", "source_now_sql", "max_bat
 @pytest.mark.parametrize("src_type,typ", CURSOR_DIALECTS)
 def test_cursor_type_sql_lists_the_columns(src_type, typ):
     sql = sa.get_adapter(src_type).cursor_type_sql("hr", "emp", ["upd", "o'c"])
-    assert "column_name" in sql and "AS type_name" in sql and "AS is_nullable" in sql
+    assert "column_name" in sql and "type_name" in sql and "is_nullable" in sql
     assert "o''c" in sql and sql.count("upd") == 1
     assert ("sys.columns" in sql) == (src_type == "sqlserver") and ("all_tab_columns" in sql) == (src_type == "oracle")
     assert "information_schema.columns" in sa.get_adapter("postgresql").cursor_type_sql("s", "t", ["c"])
@@ -144,9 +144,23 @@ def test_type_class_of_per_dialect():
     ss, ora = sa.get_adapter("sqlserver"), sa.get_adapter("oracle")
     assert ss.type_class_of("rowversion") == ss.type_class_of("timestamp") == "rowversion"
     assert ss.type_class_of("bigint") == "numeric" and ss.type_class_of(" DateTime2 ") == "temporal"
+def test_oracle_quotes_result_aliases_the_engine_reads_by_name():
+    # Oracle folds an unquoted alias to upper case; JDBC rows then lack row["type_name"], row["hi"].
+    ora = sa.get_adapter("oracle")
+    sql = ora.cursor_type_sql("HR", "EMP", ["UPD"])
+    assert 'AS "column_name"' in sql and 'AS "type_name"' in sql and 'AS "is_nullable"' in sql
+    assert 'AS "src_now"' in ora.max_batch_sql([("c1", "HR", "EMP", '"UPD"')], "TIMESTAMP(6)")
+    assert 'AS "lb"' in ora.bounds_query("HR", "EMP", "ID") and 'AS "table_size_mb"' in ora.table_size_mb_query("HR", "EMP")
+    assert ora.result_alias("hi") == '"hi"' and sa.get_adapter("sqlserver").result_alias("hi") == "hi"
+
+
     assert ora.type_class_of("NUMBER") == ora.type_class_of("NUMBER(10,0)") == ora.type_class_of("number(,0)") == "numeric"
     assert ora.type_class_of("TIMESTAMP(6)") == ora.type_class_of("DATE") == "temporal"
     assert ora.type_class_of("TIMESTAMP(6) WITH TIME ZONE") == "temporal"
+def test_type_class_of_per_dialect():
+    ss, ora = sa.get_adapter("sqlserver"), sa.get_adapter("oracle")
+    assert ss.type_class_of("rowversion") == ss.type_class_of("timestamp") == "rowversion"
+    assert ss.type_class_of("bigint") == "numeric" and ss.type_class_of(" DateTime2 ") == "temporal"
     pg = sa.get_adapter("postgresql")
     assert pg.type_class_of("timestamp without time zone") == "temporal" and pg.type_class_of("integer") == "numeric"
     for adapter, bad in ((ss, "float"), (ss, "nvarchar"), (ora, "NUMBER(10,2)"), (ora, "VARCHAR2"), (ora, "FLOAT"),
@@ -172,7 +186,7 @@ def test_max_batch_sql_one_scalar_subquery_per_table_plus_the_clock(src_type, ty
     a = sa.get_adapter(src_type)
     sql = a.max_batch_sql([("c1", "hr", "emp", a.quote_ident("upd")), ("c2", "hr", "dept", a.quote_ident("upd"))], typ)
     assert sql.startswith("SELECT (SELECT ") and sql.count("(SELECT ") == 2 and "MAX(" in sql
-    assert f"FROM {a.table_ref('hr', 'emp')})" in sql and "AS src_now" in sql
+    assert f"FROM {a.table_ref('hr', 'emp')})" in sql and f"AS {a.result_alias('src_now')}" in sql
     assert sql.endswith(" FROM DUAL") == (src_type == "oracle")
     assert a.source_now_sql(typ) in sql
     numeric = a.max_batch_sql([("c1", "hr", "emp", a.quote_ident("seq"))], {"sqlserver": "int", "oracle": "NUMBER"}[src_type])

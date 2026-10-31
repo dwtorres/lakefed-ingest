@@ -202,7 +202,8 @@ def column_type_sql(cfg: dict) -> str:
 def nullable_sql(cfg: dict) -> str:
     """Scalar subquery: 1 if any referenced column is nullable (checked on every run, not just at
     seed — a column can be altered to NULL after the table was seeded)."""
-    return f"(SELECT MAX(is_nullable) FROM ({column_type_sql(cfg)}) t)"
+    alias = source_adapters.for_cfg(cfg).result_alias("is_nullable")
+    return f"(SELECT MAX({alias}) FROM ({column_type_sql(cfg)}) t)"
 
 
 def high_watermark_sql(cfg: dict, typ: str, server_version=None) -> str:
@@ -214,8 +215,9 @@ def high_watermark_sql(cfg: dict, typ: str, server_version=None) -> str:
     a = source_adapters.for_cfg(cfg)
     src_now = ""
     if _kind(cfg, typ) == "temporal":
-        src_now = f", {a.cursor_text_sql(a.source_now_sql(typ), typ)} AS src_now"
-    return (f"SELECT {a.max_text_sql(_expr(cfg, typ, server_version), typ)} AS hi, {nullable_sql(cfg)} AS nullable{src_now} "
+        src_now = f", {a.cursor_text_sql(a.source_now_sql(typ), typ)} AS {a.result_alias('src_now')}"
+    return (f"SELECT {a.max_text_sql(_expr(cfg, typ, server_version), typ)} AS {a.result_alias('hi')}, "
+            f"{nullable_sql(cfg)} AS {a.result_alias('nullable')}{src_now} "
             f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}")
 
 
