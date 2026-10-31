@@ -389,12 +389,17 @@ def capture_batch(tables, skew_s: int, chunk: int, slots=None, log=print) -> Dic
 def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str], hi: str,
                    lookback_s: int, slots=None) -> Optional[int]:
     """Read (lo, hi] and upsert-MERGE it into the sink — ONE source read feeding the MERGE (no
-    ``.cache()``/``count()``). Returns rows affected from the MERGE metrics (None if unavailable)."""
+    ``.cache()``). An empty window skips the MERGE and returns 0: Delta records an empty MERGE as a
+    new table version, so a quiet table would grow one version per run. The emptiness probe is a
+    second source query bounded to one row (``LIMIT 1`` pushed down), the one allowed ``count()``.
+    Returns rows affected from the MERGE metrics (None if unavailable)."""
     version = source_io.server_version(cfg, slots)
     query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi, lookback_s, version))
     def once():
         with source_io._unit(slots, cfg):
             df = sink_writer._tag(source_io._read(spark, cfg, query), cfg)
+            if df.limit(1).count() == 0:
+                return _EMPTY_WINDOW
             view = f"cursor_staged_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
@@ -402,9 +407,14 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
             finally:
                 spark.catalog.dropTempView(view)
     result = sink_writer.with_write_retry(once, what=f"merge {sink_fqn}")
+    if result is _EMPTY_WINDOW:
+        return 0
     if result is not None and "num_affected_rows" in result.asDict():
         return int(result["num_affected_rows"] or 0)
     return None
+
+
+_EMPTY_WINDOW = object()
 
 
 def delete_missing(spark, cfg: dict, sink_fqn: str, slots=None) -> Optional[int]:
