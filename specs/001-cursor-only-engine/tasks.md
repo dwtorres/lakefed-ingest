@@ -113,7 +113,7 @@ Single project. Package `src/lakefed_ingest/`, tests `tests/`, bundle `databrick
 - [X] T026a [P] [US4] Write `test_gap_7_tie_rows_land_in_later_window` in `tests/cursor_engine_test.py`, parametrized over both dialects: two rows share the cursor value `hi`. The window `(lo, hi]` reads both. The next window with lookback reads both again. `upsert_merge_sql` is idempotent on the primary key, so a second merge of the same rows produces no change
 - [X] T027 [US4] Make T022 pass in `src/lakefed_ingest/cursor_engine.py` `_minus_seconds` and `literal` (FR-021)
 - [X] T028 [US4] Make T023 pass: replace `CURSOR_OVERLAP_S` and the `LAKEFED_CURSOR_OVERLAP_S` environment read in `src/lakefed_ingest/cursor_engine.py` `read_where` with a `lookback_s` argument. Pass `params.cursor_lookback_s` from `src/lakefed_ingest/worker.py` with the row `cursor_lookback_s` as override (FR-017)
-- [X] T029 [US4] Make T024 pass in `src/lakefed_ingest/cursor_engine.py` `high_watermark` and `high_watermark_sql`: the query also returns the source clock. The function returns `(hi, alert)`. The worker logs an `ingest_event` with detail `alert=max_above_clock` when set (FR-018)
+- [X] T029 [US4] Make T024 pass in `src/lakefed_ingest/cursor_engine.py` `high_watermark` and `high_watermark_sql`: the query also returns the source clock. The function returns `(hi, alert)`. The worker writes `alert=max_above_clock` to the checkpoint `detail` and the run log when set (FR-018)
 - [X] T030 [US4] Make T025 pass in `src/lakefed_ingest/cursor_engine.py` `plan_increment` and `read_where`. `src/lakefed_ingest/worker.py` logs the `inserts_only` note once per run per table (FR-020)
 - [X] T031 [US4] Make T026 pass in `src/lakefed_ingest/cursor_engine.py` `plan_increment` (FR-022)
 - [X] T032 [US4] Add `cursor_lookback_s` (default `3600`) and `cursor_skew_s` (default `300`) as widgets in `src/lakefed_ingest/ingest.ipynb`, job parameters in `resources/lakefed_ingest.yml`, and bundle variables in `databricks.yml` per contracts/job_parameters.md. Keep `tests/job_parameters_test.py` green
@@ -369,3 +369,21 @@ Two people:
 - Never auto-select a Databricks profile. The operator passes `--profile`.
 - No `edp` or `lakefed_ingest` resource changes at any point (SC-006).
 - Write a one-line checkpoint in `tasks/todo.md` after each phase.
+
+## Phase 11: Convergence
+
+- [X] T092 Align FR-024 and data-model.md with the lookback read: a temporal cursor with `hi` equal to the position still reads `(hi - lookback, hi]` for late commits, and only an identity cursor is a no-read quiet table; or route temporal quiet tables to the bulk stamp in `src/lakefed_ingest/planner.py` `apply_captured` per FR-024 (contradicts)
+- [ ] T093 Run the Lakeflow Connect baseline and the live seed, change, increment, reconcile for one SQL Server table when the owner provides a source; record in `docs/baseline.md` per US1, SC-001, T012a (missing)
+- [X] T094 Record the `changed_rows_sql` probe as a reviewed exception to "read each source once per cycle" in `CLAUDE.md` Engineering rules and `README.md`, or fold the probe into the MERGE read in `src/lakefed_ingest/cursor_engine.py` per plan constraint (contradicts)
+- [ ] T095 Run one live connect for `ntlm` and one for `aad_sp` when a Windows login or an Entra service principal exists for a SQL Server source; confirm whether the JDBC driver needs `tenant_id` and delete the unused field or pass it in `src/lakefed_ingest/source_adapters.py` per US7 scenarios 2 and 3 (partial)
+- [X] T096 Amend data-model.md and T029 text to the implemented placement of `alert=max_above_clock` (checkpoint `detail` and run log) and `inserts_only` (run log), or add the flags to `ingest_event` with a `SCHEMA_VERSION` bump in `src/lakefed_ingest/lakebase_schema.sql` and `src/lakefed_ingest/state_store.py` per data-model (partial)
+- [X] T097 Replace `lakefed_ingest` in the cell 0 title and the cell 2 setup error text of `src/lakefed_ingest/ingest.ipynb`, fix the cell 4 placeholder comment (Oracle cursor is first-class), and add the notebook's markdown and comments to `tests/docs_test.py` per FR-041 and Principle IX (contradicts)
+- [X] T098 Amend US1 scenario 2 in spec.md and data-model.md to state that a temporal seed position is pulled back by the seed duration (`cursor_engine.seed_position`) per US1/AC2 (unrequested)
+- [X] T099 Delete `write_mode` from `src/lakefed_ingest/sink_writer.py`, its call in `src/lakefed_ingest/planner.py`, and its tests per FR-002 (unrequested)
+- [X] T100 Drop the `reseed_on_new_columns` flag from `src/lakefed_ingest/planner.py` and `test_new_columns_carry_on_when_reseed_on_new_columns_is_off` in `tests/planner_test.py` per T011 (unrequested)
+- [X] T101 Delete the Change Tracking statements from `tests/synthetic/synth_sql.py`, `tests/synthetic/build_synth_db.py` and `test_change_tracking_sql` in `tests/synthetic_test.py`, or mark the generator fixture-only in its module docstring per FR-001 (unrequested)
+- [X] T102 Shorten the five sentences over 25 words in `README.md`, `docs/deploy.md`, `docs/monitoring.md`, and add a sentence-length check to `tests/docs_test.py` per Principle VIII (partial)
+
+## Phase 12: Convergence
+
+- [ ] T103 Remove the always-NULL select_list parameter from `bulk_advance_unchanged_sql` and `bulk_advance_unchanged` in `src/lakefed_ingest/state_store.py`, the third tuple element in `src/lakefed_ingest/planner.py` `apply_captured` and `bulk_rows_to_write`, and the "a, b" case in `tests/state_store_test.py`, because T100 made a grown select_list reseed before capture per FR-014, plan step 5 (unrequested)
