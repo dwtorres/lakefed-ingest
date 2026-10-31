@@ -386,4 +386,4 @@ Two people:
 
 ## Phase 12: Convergence
 
-- [ ] T103 Remove the always-NULL select_list parameter from `bulk_advance_unchanged_sql` and `bulk_advance_unchanged` in `src/lakefed_ingest/state_store.py`, the third tuple element in `src/lakefed_ingest/planner.py` `apply_captured` and `bulk_rows_to_write`, and the "a, b" case in `tests/state_store_test.py`, because T100 made a grown select_list reseed before capture per FR-014, plan step 5 (unrequested)
+- [X] T103 Remove the always-NULL select_list parameter from `bulk_advance_unchanged_sql` and `bulk_advance_unchanged` in `src/lakefed_ingest/state_store.py`, the third tuple element in `src/lakefed_ingest/planner.py` `apply_captured` and `bulk_rows_to_write`, and the "a, b" case in `tests/state_store_test.py`, because T100 made a grown select_list reseed before capture per FR-014, plan step 5 (unrequested)

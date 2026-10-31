@@ -171,10 +171,9 @@ def test_freshness_interval_skips_quiet_rows_whose_stamp_is_recent():
     cps = {1: dict(_cp(100), last_success_at=recent),                    # quiet, stamped recently: skip
            2: dict(_cp(100), last_success_at=old),                       # stamp too old
            3: dict(_cp(90), last_success_at=recent),                     # checkpoint moves
-           4: dict(_cp(100), last_success_at=recent, status="failed"),   # status to clear
-           5: dict(_cp(100), last_success_at=recent)}                    # records a select_list
-    rows = [(1, 100, None), (2, 100, None), (3, 100, None), (4, 100, None), (5, 100, "id, v")]
-    assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=now)] == [2, 3, 4, 5]
+           4: dict(_cp(100), last_success_at=recent, status="failed")}   # status to clear
+    rows = [(1, 100), (2, 100), (3, 100), (4, 100)]
+    assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=now)] == [2, 3, 4]
     assert planner.bulk_rows_to_write(rows, cps, 0) == rows
 
 
@@ -218,7 +217,7 @@ def test_gap_10_captured_hi_routes_unchanged_to_bulk_and_moved_to_cursor():
     plans = planner.route_tables(cfgs, cps)
     captured = {1: ("100", False), 2: ("120", False), 4: ("90", False)}   # 3: not captured, the worker reads MAX
     plans, unchanged = planner.apply_captured(plans, cps, captured)
-    assert unchanged == [(1, _id_pos("100"), None)]
+    assert unchanged == [(1, _id_pos("100"))]
     by_id = {p["cfg"]["id"]: p for p in plans}
     assert sorted(by_id) == [2, 3, 4]
     assert by_id[2]["hi"] == ("120", False) and "hi" not in by_id[3]
@@ -238,7 +237,7 @@ def test_gap_10_bulk_rows_to_write_skips_fresh_quiet_tables():
     now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
     cps = _id_cps((1, 2), last_success_at=now - timedelta(minutes=10))
     cps[2]["last_success_at"] = now - timedelta(hours=2)
-    rows = [(1, _id_pos("100"), None), (2, _id_pos("100"), None)]
+    rows = [(1, _id_pos("100")), (2, _id_pos("100"))]
     assert planner.bulk_rows_to_write(rows, cps, 3600, now=now) == [rows[1]]
 
 

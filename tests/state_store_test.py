@@ -415,20 +415,20 @@ def test_advance_checkpoint_records_select_list():
 
 def test_bulk_advance_stamps_an_unchanged_table_without_touching_its_position():
     # A quiet table's captured hi equals its position (JSON text, not a number): the bulk write only
-    # clears the status, records a grown select_list and stamps freshness, in the incremental phase.
+    # clears the status and stamps freshness, in the incremental phase.
     sql = ss.bulk_advance_unchanged_sql()
     assert "position" not in sql.split(" set ", 1)[1]
     assert "where control_id = %s and phase = 'incremental'" in sql
     assert "status = 'ok', detail = null" in sql
-    assert "last_success_at = now()" in sql and "select_list = coalesce(%s, select_list)" in sql
-    assert sql.count("%s") == 2
+    assert "last_success_at = now()" in sql and "select_list" not in sql
+    assert sql.count("%s") == 1
 
 
-def test_bulk_advance_binds_select_list_and_control_id():
+def test_bulk_advance_binds_control_id():
     conn = FakeConn()
-    n = ss.StateStore(conn).bulk_advance_unchanged([(7, '{"value":"500"}', None), (9, '{"value":"12"}', "a, b")])
+    n = ss.StateStore(conn).bulk_advance_unchanged([(7, '{"value":"500"}'), (9, '{"value":"12"}')])
     assert n == 2
-    assert conn.calls == [(ss.bulk_advance_unchanged_sql(), [(None, 7), ("a, b", 9)])]
+    assert conn.calls == [(ss.bulk_advance_unchanged_sql(), [(7,), (9,)])]
     assert ss.StateStore(FakeConn()).bulk_advance_unchanged([]) == 0
 
 

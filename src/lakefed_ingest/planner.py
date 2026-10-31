@@ -133,7 +133,7 @@ def retry_plan(plan: dict, cp: Optional[dict]) -> dict:
 # ---- batched hi (US6) ---------------------------------------------------------------------------------
 def apply_captured(plans: List[dict], checkpoints: Dict[int, dict], captured: Dict[int, tuple]) -> Tuple[List[dict], list]:
     """(plans, unchanged): a cursor plan whose captured ``hi`` leaves the position where it is (FR-024)
-    becomes an unchanged row ``(control_id, position text, None)`` for
+    becomes an unchanged row ``(control_id, position text)`` for
     ``StateStore.bulk_advance_unchanged``; one whose ``hi`` moved carries ``hi`` so its worker reads no
     MAX. A plan without a capture, or whose ``hi`` the increment rejects, stays as it is: the worker
     reads MAX itself and reports."""
@@ -152,7 +152,7 @@ def apply_captured(plans: List[dict], checkpoints: Dict[int, dict], captured: Di
         if decision == "read" or alert or snapshot_due(plan["cfg"], plan.get("cp")):
             kept.append(dict(plan, hi=(hi, alert)))
             continue
-        unchanged.append((cid, checkpoints[cid]["position"], None))
+        unchanged.append((cid, checkpoints[cid]["position"]))
     return kept, unchanged
 
 
@@ -193,10 +193,10 @@ def apply_seed_budget(plans: List[dict], max_seeds: int) -> Tuple[List[dict], Li
 
 
 def bulk_rows_to_write(unchanged: list, checkpoints: Dict[int, dict], interval_s: float, now=None) -> list:
-    """The unchanged rows the bulk advance has to write: rows = [(control_id, position, select_list|None)].
+    """The unchanged rows the bulk advance has to write: rows = [(control_id, position)].
     With ``interval_s`` > 0, a row is left out when writing it would only refresh ``last_success_at``
-    and that stamp is under ``interval_s`` old: the checkpoint is already at the captured position,
-    ok, and has no select_list to record. At scale nearly every table is quiet nearly every run, so
+    and that stamp is under ``interval_s`` old: the checkpoint is already at the captured position
+    and ok. At scale nearly every table is quiet nearly every run, so
     this removes most of a run's Lakebase writes; ``last_success_at`` of a quiet table is then at
     most ``interval_s`` stale. ``interval_s`` 0 = write every row (stamped every run)."""
     if not interval_s or interval_s <= 0:
@@ -204,10 +204,10 @@ def bulk_rows_to_write(unchanged: list, checkpoints: Dict[int, dict], interval_s
     now = now or datetime.now(timezone.utc)
     out = []
     for row in unchanged:
-        cid, cur, select_list = row[:3]
+        cid, cur = row[:2]
         cp = checkpoints.get(int(cid)) or {}
         stamp = cp.get("last_success_at")
-        quiet = (ss.position_text(cp.get("position")) == ss.position_text(cur) and select_list is None
+        quiet = (ss.position_text(cp.get("position")) == ss.position_text(cur)
                  and cp.get("status") == "ok" and stamp is not None
                  and (now - stamp).total_seconds() < interval_s)
         if not quiet:
