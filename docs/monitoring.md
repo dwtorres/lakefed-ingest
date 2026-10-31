@@ -1,136 +1,172 @@
 # Observability
 
-The ingestion job ingests a whole task_collection inside **one** job task (thread pool + FAIR scheduler
-pools), so there is no per-table task in the Jobs UI to watch. Visibility is re-created by writing
-per-table telemetry to **Lakebase**. The Lakebase database is already
-registered as a Unity Catalog catalog (`lakefed_ingest_lakebase`, via the `database_catalogs` resource
-in `lakefed_ingest_setup.yml`), so you query the telemetry **directly from DBSQL** — no sync job,
-no copy. Writes go to Lakebase (point writes from the ingestion run); reads go through UC federation.
+The ingestion job ingests a whole `task_collection` inside one job task. The Jobs UI shows no
+per-table task. The run writes per-table telemetry to Lakebase instead. The Lakebase database is
+registered as the Unity Catalog catalog `lakefed_cursor_lakebase` by the `database_catalogs` resource
+in `lakefed_cursor_setup.yml`. Query the telemetry from DBSQL. No sync job and no copy is needed.
+Writes go to Lakebase as point writes from the run. Reads go through UC federation.
 
-## Tables (Lakebase, UC path `lakefed_ingest_lakebase.lakefed_ingest`)
+## Tables (Lakebase, UC path `lakefed_cursor_lakebase.lakefed_cursor`)
 
-If your target overrides the `lakebase_catalog` bundle variable, substitute that catalog name in the
+If your target overrides the `lakebase_catalog` bundle variable, use that catalog name in the
 queries below.
 
 | Table | Grain | Written by |
 | --- | --- | --- |
-| `ingest_run` | one row per ingestion run | `ingest` (`start_run` at launch, `finish_run` at end) |
-| `ingest_event` | one row per (run, table) | `ingest` worker (`record_event_start` → `record_event_finish`) |
-| `checkpoint.last_success_at` | per source table | stamped on each successful event (freshness/lag) |
+| `ingest_run` | one row per run | `start_run` at launch, `finish_run` at the end |
+| `ingest_event` | one row per (run, table) | the worker: `record_event_start`, then `record_event_finish` |
+| `checkpoint.last_success_at` | per source table | stamped on each successful event, for freshness and lag |
 
-`ingest_event` carries `action` (seed/increment/reseed/full), `stage` (plan/detect/ensure_sink/read/
-seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = the row's
-`src_type`/`load_type` pair isn't supported), `status`, `duration_ms`, `rows_read`/`rows_merged`,
-`position_from`/`position_to` (checkpoint positions as text — the CT version for `ct`; NULL for
-`full`), `pool`, and `error`. One row is INSERTed at start
-(status `running`) and UPDATEd at finish — concurrent workers touch distinct rows, so there is no
-write contention. Tables in a batched append (`append_batch_size` > 1) are the exception: their rows
-are inserted, finished, when the batch ends, with `pool` = `batch<size>` and no row counts, so they
-don't appear among the in-flight tables. A `verify` stage is a run checking the sink for an append
-an earlier run left pending, or a retry checking for the rows of the attempt that failed.
+`ingest_event` carries these columns:
 
-With `table_retries` set (README "Table retries"), an attempt that fails with a transient source error
-and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
-its next attempt; `retry_count` numbers them (0, 1, ...). Only a final failure is `failed`, so the
-failure query below lists tables that are still failing.
+- `action`: `seed`, `increment`, `reseed`, `full`, or `capture`.
+- `stage`: how far the table got. `plan`, `capture`, `ensure_sink`, `read`, `seed`, `merge`, `load`,
+  `snapshot`, `checkpoint`. On a failure, this is where it failed. Stage `plan` means the control row
+  is invalid, for example an unsupported (`src_type`, `load_type`) pair.
+- `status`: `running`, `ok`, `failed`, `skipped`, or `retried`.
+- `duration_ms`, `rows_read`, `rows_merged`.
+- `position_from`, `position_to`: the position JSON before and after. NULL for `full`.
+- `pool`, `error`, `retry_count`.
 
-A run that ends without finishing (cancelled, or its cluster went away) can't close its own rows. The
-next run of the same collection holds the collection's lock, so it closes them at launch: the dead
-run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
-run that closed it (`closed_by_run`). So does the last `retried` event of a table that was waiting for
-its retry, keeping its error with the reason added. Until then the dead run still reads `running`.
+One row is inserted at start with status `running` and updated at the finish. Concurrent workers
+touch distinct rows, so there is no write contention.
+
+**Capture events.** One event per source database records the batched `MAX` query, with action
+`capture`, stage `capture`, and status `skipped`. `rows_read` is the number of tables the query
+captured. The `error` column names the tables that fell back to a per-table `MAX`.
+
+**Quiet tables.** A cursor table whose `hi` equals its checkpoint gets no event. Its checkpoint
+advances in one bulk write. `ingest_run.skipped` counts it. Its `last_success_at` is stamped.
+
+**Alerts and notes.** Two flags describe a cursor table:
+
+- `alert=max_above_clock`: the temporal `hi` was above the source clock plus `cursor_skew_s`. The
+  engine capped it. A source row carries a timestamp in the future. The flag goes to the run log
+  and to the checkpoint `detail`.
+- `note=inserts_only`: the table has an `identity` cursor. Updates and late commits below `hi` are
+  not captured. The note goes to the run log as `[inserts_only]`, once per table per run.
+
+**Retries.** With `table_retries` above 0, an attempt that fails with a transient source error ends
+as `retried`, with its stage and error. The table gets another row for its next attempt.
+`retry_count` numbers the attempts from 0. Only a final failure is `failed`.
+
+**Abandoned runs.** A cancelled run cannot close its own rows. The next run of the same collection
+holds the collection lock, so it closes them at launch. The dead run and its `running` events become
+`failed`. The `detail` names the run that closed them under `closed_by_run`.
 
 Table and column reference: [lakebase_schema.md](lakebase_schema.md).
 
-## Canonical queries (run in DBSQL against the Lakebase UC catalog)
+## Canonical queries
 
-Run these on a SQL warehouse (or serverless). The Lakebase catalog is a database catalog, and
-queries from a classic all-purpose or job cluster fail with `PERMISSION_DENIED` (foreign
-credentials). The ingestion job itself doesn't use it; it connects to Lakebase directly.
+Run these in DBSQL on a SQL warehouse or serverless. The Lakebase catalog is a database catalog. A
+query from a classic all-purpose or job cluster fails with `PERMISSION_DENIED`. The ingestion job
+connects to Lakebase directly and does not use the catalog.
 
-These are Spark-SQL dialect against the federated catalog `lakefed_ingest_lakebase`. `:collection` is a
-DBSQL query parameter.
+The queries use the Spark SQL dialect against the catalog `lakefed_cursor_lakebase`. `:collection`
+and `:run_id` are DBSQL query parameters.
 
-In-flight tables for the latest run of a collection:
+In-flight tables of the latest run of a collection:
+
 ```sql
 SELECT e.src_database, e.src_table, e.stage, e.pool, e.started_at
-FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event e
+FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_event e
 WHERE e.run_id = (
-        SELECT max(run_id) FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_run
+        SELECT max(run_id) FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_run
         WHERE task_collection = :collection)
   AND e.status = 'running'
 ORDER BY e.started_at;
 ```
 
-Failures in the latest run, with the stage + error (the "find the failing db/table/layer" view):
+Failures of the latest run, with the stage and the error:
+
 ```sql
 SELECT src_database, src_schema, src_table, stage, left(error, 200) AS error, finished_at
-FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event
+FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_event
 WHERE run_id = (
-        SELECT max(run_id) FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_run
+        SELECT max(run_id) FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_run
         WHERE task_collection = :collection)
   AND status = 'failed'
 ORDER BY finished_at DESC;
 ```
 
-Per-table freshness / lag (SLA tracking):
+Per-table freshness and lag:
+
 ```sql
 SELECT src_database, src_schema, src_table, strategy, last_success_at,
        timestampdiff(MINUTE, last_success_at, current_timestamp()) AS lag_minutes
-FROM lakefed_ingest_lakebase.lakefed_ingest.checkpoint
+FROM lakefed_cursor_lakebase.lakefed_cursor.checkpoint
 ORDER BY last_success_at NULLS FIRST;
 ```
 
-Per-run throughput and outcome (`skipped` counts unchanged tables; `detail.detection` has the skip-no-change stats):
+Per-run throughput and outcome. `skipped` counts the quiet tables:
+
 ```sql
 SELECT run_id, task_collection, total, ok, failed, skipped, reseeded,
        timestampdiff(SECOND, started_at, finished_at) AS seconds,
        round(total / nullif(timestampdiff(SECOND, started_at, finished_at), 0), 2) AS tables_per_sec
-FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_run
+FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_run
 ORDER BY started_at DESC
 LIMIT 20;
 ```
 
-Batched appends (`append_batch_size` > 1) record no `rows_merged` on their tables' events; the run's
-`detail` carries their rows instead: `batch_rows` (rows the batches committed, from each commit's
-metrics) and `batch_rows_unknown` (tables whose rows landed in a commit that reported an error; not
-counted in `batch_rows`).
+Capture events of one run, one per source database:
 
-Table retries: the run's `detail.table_retries` holds `retries` (granted), `recovered` (tables that
-succeeded on a retry), `failed_after_retry`, `budget` and `budget_left`, `budget_exhausted`,
-`sources_stopped` and `by_class` (retries per error class). The retried attempts of a run:
+```sql
+SELECT src_database, rows_read AS tables_captured, duration_ms, error
+FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_event
+WHERE run_id = :run_id AND action = 'capture'
+ORDER BY src_database;
+```
+
+Tables with a capped watermark:
+
+```sql
+SELECT src_database, src_schema, src_table, detail, updated_at
+FROM lakefed_cursor_lakebase.lakefed_cursor.checkpoint
+WHERE detail LIKE '%alert=max_above_clock%'
+ORDER BY updated_at DESC;
+```
+
+Delete snapshots, by last run time:
+
+```sql
+SELECT src_database, src_schema, src_table, last_delete_snapshot_at
+FROM lakefed_cursor_lakebase.lakefed_cursor.checkpoint
+WHERE last_delete_snapshot_at IS NOT NULL
+ORDER BY last_delete_snapshot_at;
+```
+
+The retried attempts of a run:
+
 ```sql
 SELECT src_database, src_schema, src_table, retry_count, stage, left(error, 200) AS error, finished_at
-FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event
+FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_event
 WHERE run_id = :run_id AND status = 'retried'
 ORDER BY finished_at;
 ```
 
-## Optional: durable history beyond the OLTP store
+The run `detail` is JSON. With `table_retries` set it holds `table_retries` with `retries`,
+`recovered`, `failed_after_retry`, `budget`, `budget_left`, `budget_exhausted`, `sources_stopped`
+and `by_class`. With `max_queries_per_source` set it holds `source_caps` with each source share and
+peak permits.
 
-Lakebase is the live store; if you want run history retained in Delta (e.g. for long-term
-analysis or to offload the OLTP instance), run **one scheduled statement** — no notebook or job
-needed. Simplest is a periodic snapshot (parameterize `<catalog>.<schema>`):
+## Optional: durable history
+
+Lakebase is the live store. To keep run history in Delta, run one scheduled statement. A periodic
+snapshot is the simplest form:
 
 ```sql
 CREATE OR REPLACE TABLE <catalog>.<schema>.ingest_event_history AS
-SELECT * FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event;
+SELECT * FROM lakefed_cursor_lakebase.lakefed_cursor.ingest_event;
 ```
 
-For append-only growth, an incremental MERGE on the primary key instead of a full snapshot:
+For append-only growth, use an incremental MERGE on the primary key:
+
 ```sql
 MERGE INTO <catalog>.<schema>.ingest_event_history t
-USING lakefed_ingest_lakebase.lakefed_ingest.ingest_event s
+USING lakefed_cursor_lakebase.lakefed_cursor.ingest_event s
 ON t.id = s.id
 WHEN NOT MATCHED THEN INSERT *;
 ```
 
-Schedule either as a DBSQL query (or a one-statement task) at whatever cadence durable history
-needs. This is optional — the UC-federated reads above work without it.
-
-## Future: a Databricks App
-
-Both Lakebase tables are app-ready — a lightweight Databricks App can read them (via the same UC
-catalog) for a live operations dashboard (in-flight tables, failures-by-stage, per-table freshness,
-sweep throughput) without any change to the ingestion code. Out of scope for now; noted as a
-follow-on.
+Schedule either statement as a DBSQL query. The UC-federated reads above work without it.

@@ -2,17 +2,14 @@
 
 The per-table worker lives in ingest.ipynb, so the end-to-end tests drive ``table_retry.with_retries``
 and ``planner.retry_plan`` with ``_Worker``, a fake that keeps ingest_one's contract: it records an
-event per attempt, asks the policy on failure and raises ``Retry`` when one is granted, records a
-pending append before a CT append, checks the sink first on a ``pending`` route or a
-``verify_run_id``, and advances the checkpoint after the commit. ``_Sink`` holds rows tagged
-(client, run) and can be told to fail before writing, or to commit and then fail.
+event per attempt, asks the policy on failure and raises ``Retry`` when one is granted, and advances
+the checkpoint after the commit. ``_Sink`` records writes tagged (control id, run) and can be told
+to fail before writing.
 """
 import threading
 
 import pytest
 
-import batch_append as ba
-import ct_engine as ce
 import planner
 import state_store as ss
 import table_retry as tr
@@ -48,93 +45,63 @@ def _spark_error(message=CONNECTION, cause=None):
     e._origin = _JavaError("org.apache.spark.SparkException", message, cause=cause)
     return e
 
-
-def _cfg(cid, mode="append", load_type="ct", host="h1", client="auto"):
+def _cfg(cid, load_type="cursor", host="h1"):
     return {"id": cid, "src_host": host, "src_port": 1433, "src_database": f"db{cid}", "src_schema": "dbo",
             "src_table": "orders", "secret_key": f"k{cid}", "select_list": "id, v", "primary_key": "id",
-            "sink_catalog": "main", "sink_schema": "bronze", "sink_table": "orders", "write_mode": mode,
-            "load_type": load_type, "client_id": f"eng-{cid}" if client == "auto" else client}
+            "sink_catalog": "main", "sink_schema": "bronze", "sink_table": "orders", "load_type": load_type,
+            "cursor_expression": "v", "cursor_kind": "identity"}
 
 
-def _plan(cid, route="seed", cp=None, **kw):
-    return {"cfg": _cfg(cid, **kw), "route": route, "cp": cp, "cur": 150}
+def _plan(cid, route="cursor_seed", cp=None, **kw):
+    return {"cfg": _cfg(cid, **kw), "route": route, "cp": cp, "hi": 150}
 
 
 class _Sink:
-    """Rows as (client, run). ``faults[id]``: a list of 'before' (fail, nothing written) or 'after'
-    (commit, then fail), used up one per append; ``check_fails``: the sink check raises."""
-    def __init__(self, faults=None, check_fails=False, error=CONNECTION):
-        self.rows, self.faults, self.check_fails, self.error = [], faults or {}, check_fails, error
+    """Writes as (control id, run). ``faults[id]``: a list of 'before' (fail, nothing written), used
+    up one per write."""
+    def __init__(self, faults=None, error=CONNECTION):
+        self.rows, self.faults, self.error = [], faults or {}, error
 
-    def append(self, cfg, run_id):
+    def write(self, cfg, run_id):
         fault = (self.faults.get(cfg["id"]) or [None]).pop(0) if self.faults.get(cfg["id"]) else None
         if fault == "before":
             raise _spark_error(self.error)
-        self.rows.append((ce.client_id(cfg), run_id))
-        if fault == "after":
-            raise _spark_error(self.error)
+        self.rows.append((cfg["id"], run_id))
 
-    def committed(self, cfg, run_id):
-        if self.check_fails:
-            raise RuntimeError("[DELTA_TABLE_NOT_FOUND] the sink could not be read")
-        return (ce.client_id(cfg), run_id) in self.rows
-
-    def appends(self, cfg, run_id):
-        return self.rows.count((ce.client_id(cfg), run_id))
+    def writes(self, cfg, run_id):
+        return self.rows.count((cfg["id"], run_id))
 
 
 class _Worker:
     """ingest_one's retry contract, over ``_Sink`` and an in-memory checkpoint table."""
-    def __init__(self, sink, policy, run_id=42, merge_faults=None, advance_faults=None):
+    def __init__(self, sink, policy, run_id=42, merge_faults=None):
         self.sink, self.policy, self.run_id = sink, policy, run_id
         self.checkpoints, self.events, self.merges = {}, [], []
-        self.merge_faults, self.advance_faults = merge_faults or {}, advance_faults or {}
+        self.merge_faults = merge_faults or {}
 
     def _advance(self, cfg, position, phase):
         cp = self.checkpoints.setdefault(cfg["id"], {})
-        cp.update(position=position, phase=phase, pending_run_id=None, pending_position=None, strategy=cfg["load_type"])
-        if self.advance_faults.get(cfg["id"]):
-            self.advance_faults[cfg["id"]] -= 1
-            raise _spark_error()            # e.g. recording CT's begin version after the advance
+        cp.update(position=position, phase=phase, strategy=cfg["load_type"])
 
     def __call__(self, plan, attempt=0):
         cfg, route, run_id = plan["cfg"], plan["route"], self.run_id
         stage = "plan"
         try:
-            if plan.get("verify_run_id") is not None:
-                stage = "verify"
-                if self.sink.committed(cfg, plan["verify_run_id"]):
-                    if cfg["load_type"] == "full":
-                        self._advance(cfg, None, ss.LOADED)
-                    route = "landed"
-            if route == "pending":
-                stage = "verify"
-                cp = plan["cp"]
-                if self.sink.committed(cfg, cp["pending_run_id"]):
-                    self._advance(cfg, cp["pending_position"], ss.INCREMENTAL)
-                    route = "landed"
-                else:
-                    route = "seed" if cp.get("phase") != ss.INCREMENTAL else "merge"
-            if route == "landed":
-                outcome = "recovered"
-            elif not ce.is_append(cfg):
+            if route == "cursor":
                 stage = "merge"
                 if self.merge_faults.get(cfg["id"]):
                     self.merge_faults[cfg["id"]] -= 1
                     raise _spark_error()
-                self.merges.append((cfg["id"], plan["cur"]))
+                self.merges.append((cfg["id"], plan["hi"]))
                 stage = "checkpoint"
-                self._advance(cfg, plan["cur"], ss.INCREMENTAL)
+                self._advance(cfg, plan["hi"], ss.INCREMENTAL)
                 outcome = "incremented"
             else:
                 stage = "seed"
-                if cfg["load_type"] == "ct":
-                    cp = self.checkpoints.setdefault(cfg["id"], {"phase": ss.SEEDING, "strategy": "ct"})
-                    cp.update(pending_run_id=run_id, pending_position=500)
-                self.sink.append(cfg, run_id)
+                self.sink.write(cfg, run_id)
                 stage = "checkpoint"
-                self._advance(cfg, 500 if cfg["load_type"] == "ct" else None,
-                              ss.INCREMENTAL if cfg["load_type"] == "ct" else ss.LOADED)
+                cursor = cfg["load_type"] == "cursor"
+                self._advance(cfg, plan["hi"] if cursor else None, ss.INCREMENTAL if cursor else ss.LOADED)
                 outcome = "seeded"
         except Exception as e:
             delay = self.policy.claim(cfg, e, attempt)
@@ -147,7 +114,7 @@ class _Worker:
 
     def replan(self, plan):
         cp = self.checkpoints.get(plan["cfg"]["id"])
-        return planner.retry_plan(plan, dict(cp) if cp is not None else None, self.run_id)
+        return planner.retry_plan(plan, dict(cp) if cp is not None else None)
 
 
 def _run(worker, policy, plans, sleeps):
@@ -180,9 +147,7 @@ def _policy(retries=2, budget=20, per_source=5):
     (RuntimeError("java.net.SocketTimeoutException: Read timed out"), tr.TRANSIENT),
     (RuntimeError("Invalid object name 'dbo.orders'."), tr.PERMANENT),
     (RuntimeError("The SELECT permission was denied on the object 'orders'"), tr.PERMANENT),
-    (RuntimeError(ce.CT_TABLE_NOT_ENABLED_MSG), tr.PERMANENT),
     (RuntimeError("collection lock lost; table deferred to the next sweep"), tr.PERMANENT),
-    (RuntimeError(f"{ce.RETENTION_LAPSED_MARKER}: Connection reset"), tr.PERMANENT),   # never wins over transient
     (ValueError("control row 3: Connection reset"), tr.PERMANENT),            # a configuration error
     (RuntimeError("[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'v'"), tr.PERMANENT),
     (RuntimeError("something nobody has seen before"), tr.PERMANENT),         # unknown: as today
@@ -219,6 +184,15 @@ def test_classify_retries_transient_source_errors_only(error, expected):
     assert tr.classify(error) == expected
 
 
+def test_ct_markers_are_gone_and_ct_errors_are_permanent_as_unknown_errors():
+    # Change Tracking is not a load strategy any more: no deny rule names it. Its errors are
+    # permanent the way every unknown error is.
+    assert not any("CT_RETENTION_LAPSED" in m or "CHANGE TRACKING" in m for m in tr._NEVER + tr._PERMANENT)
+    assert tr.classify(RuntimeError("CT_RETENTION_LAPSED: change tracking retention has passed the "
+                                    "checkpoint")) == tr.PERMANENT
+    assert tr.classify(RuntimeError("The VIEW CHANGE TRACKING permission was denied on 'orders'")) == tr.PERMANENT
+
+
 def test_describe_adds_the_java_cause_spark_leaves_out():
     e = _spark_error(cause=_JavaError("com.microsoft.sqlserver.jdbc.SQLServerException", "Connection reset", 0,
                                       "08S01"))
@@ -235,7 +209,7 @@ def test_a_transient_failure_is_retried_after_a_pause_and_recorded_per_attempt()
     worker = _Worker(sink, policy)
     assert _run(worker, policy, [_plan(1)], sleeps) == [("ok", "seeded")]
     assert worker.events == [(1, "retried", "seed", 0), (1, "ok", "checkpoint", 1)]
-    assert sleeps == [7.5] and sink.appends(_cfg(1), 42) == 1
+    assert sleeps == [7.5] and sink.writes(_cfg(1), 42) == 1
     assert policy.summary() == {"retries": 1, "recovered": 1, "failed_after_retry": 0, "budget": 20, "budget_left": 19,
                                 "budget_exhausted": False, "sources_stopped": [],
                                 "by_class": {"FAILED_JDBC.CONNECTION": 1}}
@@ -317,92 +291,12 @@ def test_a_run_stopped_during_a_pause_counts_the_table_as_failed():
     summary = policy.summary()
     assert (summary["retries"], summary["recovered"], summary["failed_after_retry"]) == (1, 0, 1)
 
-
-# ---- 6. a commit whose outcome is uncertain is never appended twice ------------------------------------------
-
-def test_a_ct_append_that_committed_before_failing_is_recovered_not_appended_again():
-    sink, policy, sleeps = _Sink(faults={1: ["after"]}), _policy(), []
-    worker = _Worker(sink, policy)
-    assert _run(worker, policy, [_plan(1)], sleeps) == [("ok", "recovered")]
-    assert sink.appends(_cfg(1), 42) == 1
-    assert worker.checkpoints[1]["position"] == 500 and worker.checkpoints[1]["pending_run_id"] is None
-    assert [e[1:3] for e in worker.events] == [("retried", "seed"), ("ok", "verify")]
-
-
-def test_a_full_append_that_committed_before_failing_is_checked_before_reloading():
-    sink, policy, sleeps = _Sink(faults={1: ["after"]}), _policy(), []
-    worker = _Worker(sink, policy)
-    assert _run(worker, policy, [_plan(1, route="full", load_type="full")], sleeps) == [("ok", "recovered")]
-    assert sink.appends(_cfg(1, load_type="full"), 42) == 1 and worker.checkpoints[1]["phase"] == ss.LOADED
-
-
-def test_a_failure_after_the_checkpoint_advance_is_not_appended_again():
-    sink, policy, sleeps = _Sink(), _policy(), []
-    worker = _Worker(sink, policy, advance_faults={1: 1})
-    assert _run(worker, policy, [_plan(1)], sleeps) == [("ok", "recovered")]
-    assert sink.appends(_cfg(1), 42) == 1
-
-
-def test_when_the_sink_cannot_be_checked_nothing_is_appended_and_the_pending_append_stays():
-    sink, policy, sleeps = _Sink(faults={1: ["after"]}), _policy(), []
-    worker = _Worker(sink, policy)
-    sink.check_fails = True
-    assert _run(worker, policy, [_plan(1)], sleeps)[0][0] == "failed"
-    assert sink.appends(_cfg(1), 42) == 1 and worker.checkpoints[1]["pending_run_id"] == 42
-    assert [e[1:3] for e in worker.events] == [("retried", "seed"), ("failed", "verify")]
-
-
-# ---- 7. batches --------------------------------------------------------------------------------------------
-
-class _BatchEngine:
-    """ct_engine for BatchRunner: member ``bad`` fails the batch read; everything else lands in ``sink``."""
-    sink_fqn = staticmethod(ce.sink_fqn)
-    client_id = staticmethod(ce.client_id)
-    change_read = staticmethod(ce.change_read)
-    snapshot_read = staticmethod(ce.snapshot_read)
-
-    def __init__(self, sink, bad):
-        self.sink, self.bad = sink, bad
-
-    def ensure_sink_table(self, spark, cfg, sink, slots=None):
-        pass
-
-    def seed_prep(self, spark, cfgs, slots=None):
-        return {int(c["id"]): (500, 1, 7) for c in cfgs}
-
-    def append_batch(self, spark, sink, reads, slots=None):
-        if any(int(r[0]["id"]) == self.bad for r in reads):
-            raise _spark_error()
-        for r in reads:
-            self.sink.rows.append((ce.client_id(r[0]), 42))
-        return len(reads)
-
-    def committed_clients(self, spark, sink, cfgs, run_id, slots=None):
-        return {ce.client_id(c) for c in cfgs if self.sink.committed(c, run_id)}
-
-
-class _Store:
-    def __getattr__(self, name):
-        return lambda *a, **k: None
-
-
-def test_a_batch_member_that_fails_alone_is_retried_and_the_others_are_written_once():
-    sink, policy, sleeps = _Sink(faults={2: ["after"]}), _policy(), []
-    worker = _Worker(sink, policy)
-    per_table = tr.with_retries(worker, policy, worker.replan, sleep=sleeps.append)
-    runner = ba.BatchRunner(None, _Store(), None, 42, per_table=per_table, engine=_BatchEngine(sink, bad=2))
-    out = runner.run({"kind": "seed", "members": [_plan(i) for i in (1, 2, 3)]})
-    assert [r["status"] for r in out["members"]] == ["ok", "ok", "ok"]
-    assert [sink.appends(_cfg(i), 42) for i in (1, 2, 3)] == [1, 1, 1]
-    assert [e[1:3] for e in worker.events] == [("retried", "seed"), ("ok", "verify")]
-
-
 # ---- 8. merge mode -----------------------------------------------------------------------------------------
 
 def test_merge_mode_retries_the_same_bounded_window_and_advances_once():
     sink, policy, sleeps = _Sink(), _policy(), []
     worker = _Worker(sink, policy, merge_faults={1: 1})
-    plan = _plan(1, route="merge", mode="merge", cp={"position": "100", "phase": ss.INCREMENTAL, "strategy": "ct"})
+    plan = _plan(1, route="cursor", cp={"position": "100", "phase": ss.INCREMENTAL, "strategy": "cursor"})
     assert _run(worker, policy, [plan], sleeps) == [("ok", "incremented")]
     assert worker.merges == [(1, 150)] and worker.checkpoints[1]["position"] == 150
 
@@ -426,20 +320,13 @@ def test_each_pause_doubles_with_jitter_up_to_the_cap_and_never_near_zero():
     assert [tr.backoff_delay(k, 10, 120, rand=lambda: 0.0) for k in range(5)] == [5, 10, 20, 40, 60]
     assert [tr.backoff_delay(k, 10, 120, rand=lambda: 1.0) for k in range(5)] == [10, 20, 40, 80, 120]
 
-
 # ---- retry_plan ----------------------------------------------------------------------------------------------
 
-def test_retry_plan_verifies_every_append_and_keeps_merges_as_they_were():
-    fresh = {"position": "100", "phase": ss.INCREMENTAL, "strategy": "ct", "pending_run_id": None}
-    merge = _plan(1, route="merge", mode="merge")
-    assert planner.retry_plan(merge, fresh, 42) == dict(merge, cp=fresh)
-    pending = dict(fresh, pending_run_id=42, pending_position="150")
-    assert planner.retry_plan(_plan(2, route="merge"), pending, 42) == {"cfg": _cfg(2), "route": "pending",
-                                                                       "cp": pending}
-    seed = _plan(3)
-    assert planner.retry_plan(seed, None, 42) == dict(seed, cp=None, verify_run_id=42)
-    full = _plan(4, route="full", load_type="full")
-    assert planner.retry_plan(full, dict(fresh, pending_run_id=7), 42)["verify_run_id"] == 42   # full: never pending
+def test_retry_plan_keeps_the_route_on_the_fresh_checkpoint():
+    fresh = {"position": "100", "phase": ss.INCREMENTAL, "strategy": "cursor"}
+    plan = _plan(1, route="cursor")
+    assert planner.retry_plan(plan, fresh) == dict(plan, cp=fresh)
+    assert planner.retry_plan(_plan(2), None) == dict(_plan(2), cp=None)
 
 
 def test_a_policy_that_cannot_judge_a_failure_fails_it_as_today():

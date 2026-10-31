@@ -1,10 +1,9 @@
-# Databricks asset bundle for lakefed_ingest (default version): ingestion that sweeps many tables per
-# job task on cluster compute, with control / checkpoint / telemetry state in Lakebase.
-# The original task-orchestrated (DBSQL warehouse) version is a separate bundle in job_orchestration/.
+# Databricks asset bundle for lakefed_cursor: cursor-only ingestion that sweeps many tables per job
+# task on cluster compute, with control / checkpoint / telemetry state in Lakebase (schema lakefed_cursor).
+# Own names (constitution IX): no resource reuses a lakefed_ingest or edp name; scripts/validate.sh checks.
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
 bundle:
-  name: lakefed_ingest_v2
-  uuid: bcc77784-ecf3-4a61-9436-2f404328a013
+  name: lakefed_cursor
 
 include:
   - resources/*.yml
@@ -28,20 +27,20 @@ variables:
   # State (Lakebase) and credentials.
   lakebase_instance:
     description: Lakebase instance holding control, checkpoint, and telemetry state.
-    default: lakefed-ingest
+    default: lakefed-cursor
   lakebase_capacity:
     description: Lakebase instance size (CU_1, CU_2, CU_4 or CU_8). Size up for collections of hundreds of thousands of tables, or many collections sweeping at once.
     default: CU_1
   lakebase_database:
     description: Postgres database on the Lakebase instance.
-    default: lakefed_ingest
+    default: databricks_postgres
   lakebase_catalog:
     description: Unity Catalog catalog the Lakebase database is registered as (for DBSQL monitoring).
-    default: lakefed_ingest_lakebase
+    default: lakefed_cursor_lakebase
   secret_scope:
     description: Secret scope holding per-database source credentials (may be Azure Key Vault-backed).
-    default: lakefed_ingest
-  # Defaults of the ingestion job's tuning parameters (resources/lakefed_ingest.yml explains each); a
+    default: lakefed-cursor
+  # Defaults of the ingestion job's tuning parameters (resources/lakefed_cursor.yml explains each); a
   # run can still override them.
   parallelism:
     description: Units of query work running at once in one run.
@@ -49,15 +48,6 @@ variables:
   trust_server_certificate:
     description: Trust the source's TLS certificate without validating it (production false).
     default: "true"
-  snapshot_isolation:
-    description: Read SQL Server changes under SNAPSHOT isolation (needs ALLOW_SNAPSHOT_ISOLATION ON).
-    default: "false"
-  reseed_on_new_columns:
-    description: Reseed a table whose select_list gained columns (false carries on from the checkpoint).
-    default: "true"
-  append_batch_size:
-    description: Append sinks with client_id, tables per batched append ("1" = per table).
-    default: "1"
   max_seeds_per_run:
     description: Seeds per run ("0" = no limit).
     default: "0"
@@ -70,6 +60,12 @@ variables:
   detection_chunk:
     description: Tables per batched change-detection query.
     default: "200"
+  cursor_lookback_s:
+    description: Seconds a temporal cursor increment starts below the checkpoint (a control row's cursor_lookback_s overrides it).
+    default: "3600"
+  cursor_skew_s:
+    description: Seconds the temporal high watermark may exceed the source clock before it is capped.
+    default: "300"
   table_retries:
     description: Extra attempts per table after a transient source error, in the same run ("0" = off).
     default: "0"
@@ -88,6 +84,29 @@ targets:
     workspace:
       host: https://company-dev.cloud.databricks.com/
 
+  devtest:
+    # Live devtest workspace (quickstart.md, step 8). Same development mode as dev.
+    # Azure workspace with classic compute; one small worker is enough for the devtest tables.
+    mode: development
+    workspace:
+      host: https://adb-7405613017070986.6.azuredatabricks.net
+    variables:
+      node_type_id: Standard_D4ds_v4
+      driver_node_type_id: Standard_D4ds_v4
+      num_workers: 0
+    # Single node: the subscription allows 10 DDSv4 cores, so driver plus worker does not fit
+    # beside a probe cluster.
+    resources:
+      jobs:
+        lakefed_cursor:
+          job_clusters:
+            - job_cluster_key: sweep_cluster
+              new_cluster:
+                spark_conf:
+                  spark.master: "local[*, 4]"
+                  spark.databricks.cluster.profile: singleNode
+                custom_tags:
+                  ResourceClass: SingleNode
 
   prod:
     mode: production

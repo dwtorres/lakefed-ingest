@@ -1,24 +1,27 @@
-"""Lakebase state accessor for lakefed_ingest (control, checkpoints, reseed queue, telemetry).
+"""Lakebase state accessor for lakefed_cursor: control, checkpoints, telemetry, locks.
 
-The framework is strategy-agnostic: ``control.load_type`` selects a load strategy
-(``load_strategies``) and ``control.src_type`` a source adapter (``source_adapters``). Per ADR-0004,
-the per-(db,table) checkpoint, phase/status, and reseed queue live in Lakebase (OLTP Postgres),
-alongside the cold `control` config. This module is imported by the cluster-side notebooks
-(ingest, apply_lakebase_schema), which own all writes to the hot store. Warehouse-free: everything
-runs on the cluster.
+``control.load_type`` selects a load strategy (``load_strategies``). ``control.src_type`` selects a
+source adapter (``source_adapters``). The per-table checkpoint and the telemetry live in Lakebase
+(Postgres), next to the ``control`` table. The cluster-side notebooks (ingest,
+apply_lakebase_schema) import this module and own all writes. No SQL warehouse is involved.
 
-Checkpoints are keyed by the control task id (``control.id``), not by db/schema/table, so
-same-named databases on different servers never share a checkpoint. A checkpoint is generic:
-``strategy`` names the strategy that wrote it and ``position`` (text) is that strategy's resume
-position (CT: the database CT version).
+A checkpoint is keyed by the control id (``control.id``), not by db/schema/table, so same-named
+databases on different servers never share one. ``strategy`` names the strategy that wrote it.
+``position`` (text) is that strategy's resume position: JSON {expr, kind, type, value} for
+``cursor``, NULL for ``full``. ``last_delete_snapshot_at`` records the last PK snapshot.
+
+``StateStore.migrate`` applies ``lakebase_schema.sql`` in one transaction when the database is
+behind ``SCHEMA_VERSION`` (2). ``RENAMES`` lists pending renames; it is empty. Per-run writes:
+``bulk_advance_unchanged`` stamps quiet tables in one statement, ``record_delete_snapshot`` records
+a PK snapshot, ``enqueue_reseed`` sets a table back to phase ``seeding``, ``close_abandoned_runs``
+closes the rows of a run that died.
 
 The pure decision helpers and SQL builders at the top have no database dependency and are
 unit-tested in tests/state_store_test.py. ``psycopg`` is imported lazily inside
-``StateStore.connect`` so the module (and its tests) load without the driver installed.
+``StateStore.connect``, so the module and its tests load without the driver.
 
-Naming: `control`, `checkpoint`, and the telemetry tables (`ingest_run`, `ingest_event`) are
-framework-level; the reseed surface (reseed_queue, is_reseed_needed, phases seeding/incremental) is used by
-the CT strategy.
+Naming: ``control``, ``checkpoint``, ``ingest_run``, and ``ingest_event`` are framework-level. The
+phases ``seeding`` and ``incremental`` belong to the cursor strategy, ``loaded`` to full.
 """
 
 from __future__ import annotations
@@ -29,34 +32,31 @@ import threading
 import zlib
 from typing import Callable, List, Optional
 
-SCHEMA = "lakefed_ingest"
+SCHEMA = "lakefed_cursor"
 CONTROL_TABLE = f"{SCHEMA}.control"
 CHECKPOINT_TABLE = f"{SCHEMA}.checkpoint"
-RESEED_TABLE = f"{SCHEMA}.reseed_queue"
 RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion run
 EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (run, table)
 
 SEEDING = "seeding"
-INCREMENTAL = "incremental"  # ct / cursor: seeded, applying increments
+INCREMENTAL = "incremental"  # cursor: seeded, applying increments
 LOADED = "loaded"    # full: last reload committed (no resumable position)
 
 # Columns selected from the control table, in order. list_task_configs / get_task return dicts
-# keyed by these names (the ``cfg`` the sweep and ct_engine consume).
+# keyed by these names (the ``cfg`` the sweep, source_io and sink_writer consume).
 CONTROL_COLUMNS = [
-    "id", "job_name", "task_collection", "src_type", "src_connection", "src_host", "src_port",
-    "secret_key", "src_database",
-    "src_catalog", "src_schema", "src_table", "sink_catalog", "sink_schema", "sink_table",
-    "enable_iceberg_reads", "primary_key", "sink_cluster_cols", "load_type", "load_partitioned",
-    "partition_col", "partition_size_mb",
-    "select_list", "use_remote_query", "ct_enabled", "cursor_column", "cdc_capture_instance",
-    "jdbc_options", "source_instance_group", "tier", "priority", "warehouse_id", "task_enabled",
-    "client_id", "write_mode", "client_attrs",
+    "id", "task_collection", "src_type", "src_connection", "src_host", "src_port", "secret_key",
+    "src_database", "src_schema", "src_table", "sink_catalog", "sink_schema", "sink_table",
+    "primary_key", "load_type", "load_partitioned", "partition_col", "partition_size_mb",
+    "select_list", "use_remote_query", "cursor_expression", "cursor_kind", "cursor_lookback_s",
+    "delete_mode", "delete_min_interval_s", "null_cursor_policy",
+    "jdbc_options", "tier", "priority", "task_enabled", "client_id", "client_attrs",
 ]
 
 
 def strategy_name(cfg: dict) -> str:
-    """The load strategy a control row's checkpoint belongs to (``control.load_type``; default ct)."""
-    return (cfg.get("load_type") or "ct").strip().lower()
+    """The load strategy a control row's checkpoint belongs to (``control.load_type``; default cursor)."""
+    return (cfg.get("load_type") or "cursor").strip().lower()
 
 
 def position_text(value) -> Optional[str]:
@@ -67,26 +67,12 @@ def position_text(value) -> Optional[str]:
 # --------------------------------------------------------------------------------------
 # Schema migration helpers for apply_lakebase_schema.ipynb (pure; unit-tested).
 # --------------------------------------------------------------------------------------
-# Renames from the CT-only naming to the generic one. Postgres has no IF EXISTS form for column
-# renames (and table/index renames fail when the target exists), so the applier inspects the catalog
-# and runs only the renames still pending — re-applying is a no-op. Applied BEFORE lakebase_schema.sql,
-# so its create-if-not-exists statements find the renamed objects (and their data) in place.
+# Pending renames. Postgres has no IF EXISTS form for column renames (and table/index renames fail
+# when the target exists), so the applier inspects the catalog and runs only the renames still
+# pending — re-applying is a no-op. Applied BEFORE lakebase_schema.sql, so its create-if-not-exists
+# statements find the renamed objects (and their data) in place. Empty: schema lakefed_cursor is new.
 #   (kind, table (columns only), old name, new name)
-RENAMES = [
-    ("table", None, "ct_checkpoint", "checkpoint"),
-    ("table", None, "sweep_run", "ingest_run"),
-    ("column", "checkpoint", "ct_version", "position"),
-    ("column", "ingest_run", "sweep_id", "run_id"),
-    ("column", "ingest_event", "sweep_id", "run_id"),
-    ("column", "ingest_event", "ct_version_from", "position_from"),
-    ("column", "ingest_event", "ct_version_to", "position_to"),
-    ("index", None, "ct_checkpoint_control_pk", "checkpoint_control_pk"),
-    ("index", None, "ct_checkpoint_control_uq", "checkpoint_control_uq"),
-    ("index", None, "sweep_run_pkey", "ingest_run_pkey"),
-    ("index", None, "sweep_run_collection_idx", "ingest_run_collection_idx"),
-    ("index", None, "ingest_event_sweep_idx", "ingest_event_run_idx"),
-    ("sequence", None, "sweep_run_sweep_id_seq", "ingest_run_run_id_seq"),
-]
+RENAMES = []
 
 
 def rename_statements(relations, columns, schema: str = SCHEMA) -> List[str]:
@@ -123,8 +109,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 # is newer than its database applies the pending migration itself (StateStore.migrate): upgrading is a
 # deploy. Bump SCHEMA_VERSION with every change to lakebase_schema.sql or RENAMES; a unit test pins the
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
-#   0 = no version recorded (deployed before versions existed)   1 = first recorded version
-SCHEMA_VERSION = 1
+#   0 = no version recorded   1 = lakefed_ingest root version   2 = lakefed_cursor: expression cursor, own names
+SCHEMA_VERSION = 2
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -142,44 +128,9 @@ def schema_fingerprint(ddl: str) -> str:
 # --------------------------------------------------------------------------------------
 # Pure decision helpers (no DB) — unit-tested directly.
 # --------------------------------------------------------------------------------------
-def is_reseed_needed(checkpoint_version: Optional[int], min_valid_version: Optional[int]) -> bool:
-    """True when the checkpoint is too old to read CHANGES from (CT retention lapsed).
-
-    SQL Server's CHANGETABLE(CHANGES tbl, @v) only returns rows when
-    ``@v >= CHANGE_TRACKING_MIN_VALID_VERSION(object_id)``. If the checkpoint has fallen
-    behind that minimum, changes have been purged and the table must be fully reseeded.
-
-    A NULL/None ``min_valid_version`` means CT is not enabled (or the object is unknown)
-    -> reseed. A None checkpoint means we have never seeded -> reseed.
-    """
-    if min_valid_version is None:
-        return True
-    if checkpoint_version is None:
-        return True
-    return int(checkpoint_version) < int(min_valid_version)
-
-
 def next_phase(current_phase: str) -> str:
     """Advance the per-table phase state machine: seeding -> incremental (terminal)."""
     return INCREMENTAL
-
-
-def decide_action(phase: str, checkpoint_version: Optional[int],
-                  min_valid_version: Optional[int]) -> str:
-    """Decide what the per-table state machine should do this cycle.
-
-    Returns one of:
-      - 'seed'      : phase is seeding (first onboarding, or re-seed after retention loss).
-      - 'reseed'    : phase is incremental but CT retention lapsed (checkpoint < min valid) -> re-seed.
-      - 'increment' : phase is incremental and the checkpoint is still valid -> read CHANGES + MERGE.
-
-    In the seeding branch ``min_valid_version`` is irrelevant and may be None. In the cdc branch
-    the caller fetches it (ct_engine.min_valid_version) first, then calls this to split
-    reseed vs increment via is_reseed_needed.
-    """
-    if phase == SEEDING:
-        return "seed"
-    return "reseed" if is_reseed_needed(checkpoint_version, min_valid_version) else "increment"
 
 
 def select_list_columns(select_list: Optional[str]) -> List[str]:
@@ -192,7 +143,7 @@ def select_list_added_columns(control_select_list: str,
     """Columns the control row's select_list has that the checkpoint's recorded select_list lacks.
 
     Returns None when nothing was recorded yet (legacy checkpoint -> caller falls back to checking
-    the sink's columns once). Only ADDED columns matter: CT returns changed rows only, so a new
+    the sink's columns once). Only ADDED columns matter: a cursor read returns changed rows only, so a new
     column needs a reseed to backfill history; reordering is harmless (writes map BY NAME) and a
     removed column just stops being written (bronze keeps it; existing columns are never dropped).
     """
@@ -257,15 +208,13 @@ def get_checkpoint_sql() -> str:
 def get_checkpoints_sql() -> str:
     """Checkpoints for MANY control tasks in one round trip (the sweep's planning phase).
     Param: list of control ids (bound as a Postgres array)."""
-    return (f"select control_id, position, phase, status, select_list, strategy, ct_begin_version, "
-            f"pending_position, pending_run_id, last_success_at from {CHECKPOINT_TABLE} "
-            "where control_id = any(%s)")
+    return (f"select control_id, position, phase, status, select_list, strategy, last_success_at, "
+            f"last_delete_snapshot_at from {CHECKPOINT_TABLE} where control_id = any(%s)")
 
 
 def upsert_checkpoint_sql() -> str:
     """Insert-or-update a checkpoint (keyed by control_id): set strategy + position, phase/status,
-    and record the select_list the sink was written with (kept when NULL is passed). Clears a
-    pending append (see ``record_pending_sql``): the checkpoint now says where the sink is.
+    and record the select_list the sink was written with (kept when NULL is passed).
 
     Params: control_id, src_database, src_schema, src_table, strategy, position, phase, status,
     detail, select_list.
@@ -278,52 +227,28 @@ def upsert_checkpoint_sql() -> str:
         "strategy = excluded.strategy, position = excluded.position, phase = excluded.phase, "
         "status = excluded.status, detail = excluded.detail, "
         f"select_list = coalesce(excluded.select_list, checkpoint.select_list), "
-        "pending_position = null, pending_run_id = null, "
-        "updated_at = now()"
-    )
-
-
-def record_pending_sql() -> str:
-    """Before an append write: the position it brings the sink to and the run writing it. A new row
-    (first seed) starts in phase seeding; an existing one keeps its position, phase and status.
-
-    Params: control_id, src_database, src_schema, src_table, strategy, pending_position, pending_run_id.
-    """
-    return (
-        f"insert into {CHECKPOINT_TABLE} "
-        "(control_id, src_database, src_schema, src_table, strategy, pending_position, pending_run_id, "
-        "updated_at) values (%s, %s, %s, %s, %s, %s, %s, now()) "
-        "on conflict (control_id) do update set "
-        "pending_position = excluded.pending_position, pending_run_id = excluded.pending_run_id, "
         "updated_at = now()"
     )
 
 
 def bulk_advance_unchanged_sql() -> str:
-    """Skip-no-change bookkeeping for ONE unchanged CT table (run via executemany over all of them).
-
-    Advances the checkpoint to the database's version captured BEFORE change detection, never
-    backwards (greatest, compared as numbers — positions are text), only for CT rows in the cdc
-    phase, and stamps freshness. Advancing quiet tables matters: CT cleanup keeps raising each
-    table's min valid version even when the table never changes, so a checkpoint left behind would
-    trigger a false reseed once retention passes. A table with a pending append is never advanced
-    here: the planner sends it to the worker, which checks whether that append committed.
-    Params: CT version (captured), select_list (or NULL to keep), CT begin_version (recorded only
-    when not yet known — legacy rows), control_id.
+    """Bookkeeping for ONE unchanged table (run via executemany over all of them): its captured ``hi``
+    equals its position, so the position stays; clear the status, record a grown select_list and
+    stamp freshness, only in the incremental phase.
+    Params: select_list (or NULL to keep), control_id.
     """
     return (
         f"update {CHECKPOINT_TABLE} set "
-        "position = greatest(coalesce(position, '0')::bigint, %s::bigint)::text, "
         "status = 'ok', detail = null, "
-        "select_list = coalesce(%s, select_list), ct_begin_version = coalesce(ct_begin_version, %s), "
+        "select_list = coalesce(%s, select_list), "
         "last_success_at = now(), updated_at = now() "
-        "where control_id = %s and phase = 'incremental' and strategy = 'ct' and pending_run_id is null"
+        "where control_id = %s and phase = 'incremental'"
     )
 
 
-def record_ct_begin_version_sql() -> str:
-    """Params: begin_version, control_id."""
-    return f"update {CHECKPOINT_TABLE} set ct_begin_version = %s, updated_at = now() where control_id = %s"
+def record_delete_snapshot_sql() -> str:
+    """Stamp the PK snapshot time of one table (delete_mode pk_snapshot, FR-029). Param: control_id."""
+    return f"update {CHECKPOINT_TABLE} set last_delete_snapshot_at = now(), updated_at = now() where control_id = %s"
 
 
 def set_status_sql() -> str:
@@ -338,14 +263,6 @@ def set_status_sql() -> str:
         "values (%s, %s, %s, %s, %s, %s, %s, now()) "
         "on conflict (control_id) do update set "
         "status = excluded.status, detail = excluded.detail, updated_at = now()"
-    )
-
-
-def enqueue_reseed_sql() -> str:
-    """Params: control_id, src_database, src_schema, src_table, reason."""
-    return (
-        f"insert into {RESEED_TABLE} (control_id, src_database, src_schema, src_table, reason) "
-        "values (%s, %s, %s, %s, %s)"
     )
 
 
@@ -473,7 +390,7 @@ def close_abandoned_runs_sql() -> str:
 # Changing the namespace changes every key: don't let a run of an older build (namespace
 # 'lakefed_ingest.sweep:') overlap a run of this one for the same collection during an upgrade.
 # --------------------------------------------------------------------------------------
-LOCK_NAMESPACE = "lakefed_ingest:"
+LOCK_NAMESPACE = "lakefed_cursor:"
 
 
 def collection_lock_key(task_collection: str) -> str:
@@ -483,7 +400,7 @@ def collection_lock_key(task_collection: str) -> str:
 
 def lock_application_name(task_collection: str, job_run_id: str = "") -> str:
     """Label for the lock connection, visible in pg_stat_activity (Postgres caps it at 63 chars)."""
-    return f"lakefed_ingest:{task_collection}:{job_run_id}"[:63]
+    return f"lakefed_cursor:{task_collection}:{job_run_id}"[:63]
 
 
 def try_lock_collection_sql() -> str:
@@ -505,7 +422,7 @@ SOURCE_LOCK_CLASS = 0x6C666973
 
 
 def source_lock_key(source: str) -> int:
-    """A source's lock key: a stable non-negative 31-bit hash of its name (``ct_engine.source_key``)."""
+    """A source's lock key: a stable non-negative 31-bit hash of its name (``source_io.source_key``)."""
     return zlib.crc32(source.encode("utf-8")) & 0x7FFFFFFF
 
 
@@ -644,12 +561,6 @@ class StateStore:
                                    f"{SCHEMA_VERSION}: deploy the newer code instead")
             if before == SCHEMA_VERSION and not force:
                 return None
-            # Instances created before the schema was renamed: move lakefed_ingest_mt (all tables and
-            # data) to lakefed_ingest first.
-            cur.execute("select nspname from pg_namespace where nspname in ('lakefed_ingest_mt', %s)", (SCHEMA,))
-            present = {r[0] for r in cur.fetchall()}
-            if "lakefed_ingest_mt" in present and SCHEMA not in present:
-                cur.execute(f"alter schema lakefed_ingest_mt rename to {SCHEMA}")
             cur.execute("select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace "
                         "where n.nspname = %s", (SCHEMA,))
             relations = {r[0] for r in cur.fetchall()}
@@ -712,8 +623,7 @@ class StateStore:
             cur.execute(get_checkpoints_sql(), (ids,))
             rows = cur.fetchall()
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
-                            "strategy": r[5], "ct_begin_version": r[6], "pending_position": r[7],
-                            "pending_run_id": r[8], "last_success_at": r[9]} for r in rows}
+                            "strategy": r[5], "last_success_at": r[6], "last_delete_snapshot_at": r[7]} for r in rows}
 
     def advance_checkpoint(self, cfg: dict, position, phase=INCREMENTAL, status="ok", detail=None,
                            select_list=None, strategy=None):
@@ -726,20 +636,7 @@ class StateStore:
                         (*task_identity(cfg), strategy or strategy_name(cfg), position_text(position),
                          phase, status, detail, select_list))
 
-    def record_pending(self, cfg: dict, position, run_id) -> None:
-        """Record an append write about to start (see ``record_pending_sql``). Call BEFORE the write."""
-        with self._cursor() as cur:
-            cur.execute(record_pending_sql(), (*task_identity(cfg), strategy_name(cfg),
-                                               position_text(position), int(run_id)))
-
-    # ---- bulk forms, for the members of a batched append (one executemany each) --------------
-    def record_pending_many(self, items, run_id) -> None:
-        """``record_pending`` for many rows: items = [(cfg, position)]."""
-        params = [(*task_identity(cfg), strategy_name(cfg), position_text(pos), int(run_id)) for cfg, pos in items]
-        if params:
-            with self._cursor() as cur:
-                cur.executemany(record_pending_sql(), params)
-
+    # ---- bulk forms (one executemany each) ---------------------------------------------------
     def advance_many(self, items) -> None:
         """``advance_checkpoint`` (status ok, recording each row's select_list) for many rows:
         items = [(cfg, position, phase, detail)]. Call ONLY after their write committed."""
@@ -748,13 +645,6 @@ class StateStore:
         if params:
             with self._cursor() as cur:
                 cur.executemany(upsert_checkpoint_sql(), params)
-
-    def record_ct_begin_versions(self, items) -> None:
-        """``record_ct_begin_version`` for many rows: items = [(cfg, begin_version)] (None skipped)."""
-        params = [(int(bv), int(cfg["id"])) for cfg, bv in items if bv is not None]
-        if params:
-            with self._cursor() as cur:
-                cur.executemany(record_ct_begin_version_sql(), params)
 
     def record_finished_events(self, run_id, items, duration_ms=0) -> None:
         """One finished ingest_event per item; 'ok' ones also stamp checkpoint.last_success_at.
@@ -775,33 +665,29 @@ class StateStore:
                 cur.execute(touch_last_success_many_sql(), (ok,))
 
     def bulk_advance_unchanged(self, rows) -> int:
-        """Advance many unchanged CT tables in one executemany: rows = [(control_id, ct_version,
-        select_list_or_None[, ct_begin_version_or_None]), ...]. Returns the number of rows submitted."""
-        params = [(int(r[1]), r[2], (r[3] if len(r) > 3 else None), int(r[0])) for r in rows]
+        """Stamp many unchanged tables in one executemany: rows = [(control_id, position,
+        select_list_or_None), ...] (the position is the checkpoint's own). Returns the number of rows submitted."""
+        params = [(r[2], int(r[0])) for r in rows]
         if not params:
             return 0
         with self._cursor() as cur:
             cur.executemany(bulk_advance_unchanged_sql(), params)
         return len(params)
 
-    def record_ct_begin_version(self, cfg: dict, begin_version) -> None:
-        """Record the table's CT begin_version on its checkpoint (seed time, or first time seen)."""
-        if begin_version is None:
-            return
+    def record_delete_snapshot(self, cfg: dict) -> None:
+        """Call ONLY after the snapshot's DELETE committed."""
         with self._cursor() as cur:
-            cur.execute(record_ct_begin_version_sql(), (int(begin_version), int(cfg["id"])))
+            cur.execute(record_delete_snapshot_sql(), (int(cfg["id"]),))
 
     def set_status(self, cfg: dict, status, detail=None):
         with self._cursor() as cur:
             cur.execute(set_status_sql(), (*task_identity(cfg), strategy_name(cfg), status, detail))
 
-    def enqueue_reseed(self, cfg: dict, reason="retention_miss"):
-        """Mark the table for a full reseed and flip its phase back to seeding (position cleared)."""
-        ident = task_identity(cfg)
+    def enqueue_reseed(self, cfg: dict, reason="schema_change"):
+        """Mark the table for a full reseed: flip its phase back to seeding (position cleared)."""
         with self._cursor() as cur:
-            cur.execute(enqueue_reseed_sql(), (*ident, reason))
             cur.execute(upsert_checkpoint_sql(),
-                        (*ident, strategy_name(cfg), None, SEEDING, "reseed_queued", reason, None))
+                        (*task_identity(cfg), strategy_name(cfg), None, SEEDING, "reseed_queued", reason, None))
 
     # ---- Observability / telemetry -----------------------------------------------------
     def start_run(self, task_collection, job_run_id, cluster_id, parallelism) -> int:

@@ -1,53 +1,31 @@
----
-ontology: true
-type: plan
-domain: lakefed-ingest
-summary: Two week viability test of lakefed as the orchestration engine for edp database sources, with caboodle_poc side by side in devtest and then rl_solutions
-tags: [viability, caboodle, rl-solutions, cursor, overlap, oracle, side-by-side]
-status: active
-discovered: 2026-10-25
-related: [cursor_engine, planner, source_adapters, edp-data-engineering]
----
+# speckit-implement: 001-cursor-only-engine (2026-10-26)
 
-# Two week viability test
+Driver: one subagent per phase, sequential. Gate per phase: `pytest tests` green, zero skips, grep check, one Conventional Commit, task lines marked [X] in specs/001-cursor-only-engine/tasks.md.
 
-Goal: decide with evidence whether lakefed replaces the edp source to bronze path for database sources. The decision rule is at the end. Nothing in edp changes during the test.
+- [X] Phase 1 Setup (T001-T012; T012a blocked: live Databricks run needs operator --profile)
+- [X] Phase 2 Worker module (T013-T016)
+- [X] Phase 3 US1 SQL Server cursor (T017-T021)
+- [X] Phase 4 US4 Safe window bounds (T022-T034)
+- [X] Phase 5 US2 Oracle (T034a blocked: live baseline, needs an operator --profile)
+- [X] Phase 6 US3 Expression cursor, schema v2, names
+- [X] Phase 7 US6 Quiet tables
+- [X] Phase 8 US5 PK snapshot deletes
+- [X] Phase 9 US7 Auth modes
+- [ ] Phase 10 Polish + docs (devtest run tasks blocked)
 
-## Week 1: make lakefed able to run caboodle_poc
-
-- [x] 1. Temporal cursor overlap. Add `LAKEFED_CURSOR_OVERLAP_S` (environment variable, default `600`) to `cursor_engine.py`. If the cursor kind is `temporal`, `read_where` subtracts the overlap from `lo` in Python before the literal is built. Rowversion and numeric kinds keep the exact bound. Verify: a new test in `tests/cursor_engine_test.py` asserts the shifted bound for temporal and the exact bound for the other two kinds.
-- [x] 2. Seed position for a temporal cursor. `cursor_seed` records the high watermark minus the seed duration, so a row that committed during a long seed is inside the first increment window. Verify: a planner test with a fake seed that takes 2 hours asserts the first `cursor` route reads from `hi - 2h - overlap`.
-- [ ] 3. Register caboodle_poc in a devtest Lakebase control table. 48 `incremental_watermark` datasets become `load_type cursor`, `cursor_column _LastUpdatedInstant`, `primary_key` from the edp metadata. The 2 `snapshot` datasets become `load_type full`. `DateDim` (generated) stays in edp. `src_type sqlserver`, `write_mode merge`. Use a new `task_collection caboodle_poc`. Verify: `planner.route_tables` on the 50 rows gives 48 `cursor_seed` and 2 `full`, no `unsupported`.
-- [ ] 4. Secret. The Fabric SQL endpoint uses a service principal with `authentication=ActiveDirectoryServicePrincipal` in the JDBC URL. Make sure that `SqlServerAdapter.jdbc_url` accepts that through `jdbc_options`, or add it. Store the `{user,password}` JSON secret in the lakefed secret scope. Never echo the secret. Verify: `ct_engine._read` of `SELECT 1` succeeds from the devtest job cluster.
-- [ ] 5. Deploy the bundle to devtest with `--profile <name>` chosen by the operator. Run `lakefed_ingest_setup`, then `lakefed_ingest` with `task_collection=caboodle_poc`, `parallelism=8`, `max_queries_per_source=16` (the measured Fabric ceiling in edp). Verify: `ingest_run` shows one `succeeded` run and 50 `ingest_event` rows with stage `seed` or `full`.
-
-## Week 2: side by side
-
-- [ ] 6. Schedule the lakefed job on the same cadence as the edp `caboodle_poc` chunk job. Both read the same Fabric endpoint for 5 days. Verify each morning with one DBSQL query per pair: row count of the edp bronze current slice versus the lakefed sink, and distinct primary key count equal to row count on the lakefed sink. Record the numbers in the Review section.
-- [ ] 7. Failure injection. On day 3, cancel the lakefed run during the fan out. Verify: the next run shows no duplicate keys and `ingest_event` shows the interrupted tables rerun from the same position. Do the same to the edp chunk job and record what the state table shows.
-- [ ] 8. Source pressure. Read `sys.dm_exec_sessions` on the Fabric endpoint during both runs. Verify: lakefed never exceeds 16 sessions and the run time is at or below the edp chain time.
-- [ ] 9. rl_solutions. If step 6 passes 5 days, register `rl_solutions`. Verified in edp metadata: `src_type mssql`, database `RL6_Prod`, 55 datasets, 53 incremental on `LAST_MODIFIED`, 2 full, and `windows_auth` true. Windows auth means the JDBC read needs `integratedSecurity=true` and `authenticationScheme=NTLM`. Pass both through `jdbc_options` on each control row, the same way the Fabric `authentication` option is passed in step 4. Before you register, run one query on the source: the type and nullability of `LAST_MODIFIED` on every table. The cursor engine refuses a nullable column. Run 3 days side by side.
-- [ ] 10. Postgres cursor on the Supabase instance. Add the Postgres branches to `cursor_engine.py`: type lookup from `information_schema.columns`, `MAX` cast to text for the high watermark, and a `'...'::timestamp` or `::numeric` literal. Move `(postgresql, cursor)` to `SUPPORT`. Fixtures in `tests/cursor_engine_test.py` gain `src_type`. Then use the full control of the instance to prove the overlap: open a transaction, insert a row with an old timestamp, run the collection, commit the row, run again. Verify: the row lands on the second run and nothing is duplicated.
-
-## Silver input shape (verified)
-
-`_promote_caboodle_scd2` in `ingest/fabric.py` reads the bronze run slice by `run_key` and drops `_run_id`. The lakefed sink is current state, not a slice. For the side by side, silver stays on the edp bronze. If lakefed is adopted, the SCD2 promotion must read the whole lakefed sink and compare on `_LastUpdatedInstant`. That change is not part of this test.
-
-## Decision rule
-
-If all four conditions hold, adopt lakefed for database sources. The four conditions are:
-
-1. No duplicate keys on any day.
-2. Row counts match the edp slice within the overlap window.
-3. The failure injection recovered without manual repair.
-4. Source sessions stayed under the cap.
-
-If any condition fails, stop the migration. Record the cause in the Review section.
-
-## Not in scope
-
-Silver, gold, masking, classification, file and API sources. Change Tracking. `DateDim`. Oracle and MySQL cursors.
-
-## Review
-
-(fill after each day of step 6, and after steps 7 to 9)
+## Checkpoints
+- Phase 1 done c3a4ca9: CT, CDC, append, pending paths deleted; ct_engine split into source_io + sink_writer; 324 tests, 0 skips; src 4381 -> 3106 lines
+- Phase 2 done 3b1e79f: ingest_one, _replan, _pools_label moved to worker.py with a deps object; 9 worker tests pin write-before-advance; 333 tests, 0 skips
+- Phase 3 done 1720487: config_error rejects any load_type but cursor/full; cursor_seed -> cursor routes and worker hi -> merge -> advance order pinned; 336 tests, 0 skips
+- Phase 4 done 7a39705: lookback_s argument (job param cursor_lookback_s, row override) replaces the env var; temporal hi capped at source clock + cursor_skew_s (alert=max_above_clock in the log and checkpoint detail); identity kind reads exact and logs inserts_only; hi below position fails the table; datetime literals at 3 digits; 355 tests, 0 skips; dialect tests cover sqlserver + postgresql (oracle in Phase 5)
+- Phase 5 done 354e002: SourceAdapter cursor methods (cursor_type_sql, type_class_of, source_now_sql, cursor_text_sql, max_text_sql, max_batch_sql, cursor_literal, minus_seconds_sql, greatest_expr, server_version_sql, pk_snapshot_sql) on sqlserver, oracle, postgresql; mysql raises and unsupported_reason names it; cursor_engine and worker have no _is_pg / src_type branch (tests/no_dialect_branch_test.py); cursor tests run under sqlserver + oracle + postgresql; 402 tests, 0 skips. T034a (Oracle Lakeflow Connect baseline) not run: live Databricks, operator profile
+- Phase 6 done a1ed16f: cursor_expression + cursor_kind replace cursor_column; position {expr, kind, type, value}; validate_expression (1-3 columns, GREATEST/COALESCE only, one type, nullable inputs vs null_cursor_policy, rowversion = one column); changed expr/kind -> schema_reseed; config_error rejects soft_column/full_compare and unknown cursor_kind; source_io.server_version once per source drives SQL Server GREATEST vs CASE; sink_writer.sink_expr; schema lakefed_cursor at SCHEMA_VERSION 2 (fingerprint 6bf32555..., RENAMES empty, 14 reviewed drops, no legacy CT backfills); bundle lakefed_cursor, jobs lakefed_cursor / lakefed_cursor_setup, secret scope lakefed-cursor, catalog lakefed_cursor_lakebase, db databricks_postgres; scripts/validate.sh = name test + bundle validate (bundle validate not run: needs an operator --profile); 416 tests, 0 skips
+- Phase 7 done ab6a188: cursor_engine.capture_batch (one max_batch_sql query per source database and cursor type, detection_chunk tables per query; failed chunk -> high_watermark per table; a table whose fallback fails is left to its worker); the clock column only for temporal types; planner.apply_captured splits quiet tables (plan_increment unchanged) into one bulk_advance_unchanged stamp (no position write; position is JSON) and puts hi on the other cursor plans so the worker reads no MAX; upsert_merge_sql updates a matched row only when sink_expr(s) <> sink_expr(tgt) (sink_writer.sink_expr qualifies columns per alias); notebook records one 'capture' ingest_event per source database; 433 tests, 0 skips
+- Phase 8 done 1c93d7c: delete_mode pk_snapshot: planner.snapshot_due (pk_snapshot, phase incremental, last_delete_snapshot_at NULL or >= delete_min_interval_s ago, NULL = 86400); worker runs it in the cursor route after the increment's advance (quiet tables too; a due snapshot keeps a quiet table out of the bulk stamp): cursor_engine.delete_missing (source_io.read_pk_snapshot through _read under one slot + source permit, temp view, sink_writer.delete_missing_sql anti-join DELETE scoped to client_id, with_write_retry) then store.record_delete_snapshot; stage 'snapshot'; no schema change (SCHEMA_VERSION 2 unchanged); 446 tests, 0 skips
+- Phase 9 done 6165716: secret JSON auth_mode (sql default, ntlm, aad_sp; source_adapters.AUTH_FIELDS); source_io._extract_creds returns a dict and names missing fields, never values; SourceAdapter.auth_options (SQL Server per mode, Oracle/Postgres/MySQL sql only, NotImplementedError before connect); _jdbc_config caches {host, port, options}; planner.config_error rejects ntlm/aad_sp off sqlserver (ingest.ipynb attaches cfg['auth_mode'] via source_io.secret_auth_mode); worker redacts error text with source_io.redact(known_creds); 458 tests, 0 skips
+- Phase 10 docs done: README, docs/deploy.md, docs/monitoring.md, docs/lakebase_schema.md, CLAUDE.md, and eight module headers rewritten cursor-only in STE; tests/docs_test.py scans them for ct_engine, batch_append, CHANGETABLE, change tracking, write_mode, cursor_column; 474 tests, 0 skips. Live proof still pending (T088-T091)
+- 2026-10-26 20:3x EDT: code + docs complete through 220538c. 474 tests, 0 skips. Open: T012a (SQL Server on hold), T034a (Oracle connections freedb/freesql fail: FAILED_JDBC.CONNECTION HV000), T088-T091 (await reachable source + Lakebase create approval). Untracked docs/cursor_orchestration_analysis.md left as found.
+- 2026-10-31: T088 + T091 done on profile ding-dong-ditch (Azure, Standard_D4ds_v4 x1): deploy 6 resources, setup job SUCCESS (schema v2), no lakefed_ingest/edp names. Open: T012a, T034a, T089, T090 (need a reachable source).
+- 2026-10-31 09:40 EDT: T089 done on ding-dong-ditch: Oracle seed 100 rows, 10/5/5 change, increment MERGE 10+5, reconcile 5 sink-only, pk_snapshot run deletes 5, reconcile 0 differences (SC-001), capture 1 query per source (SC-004). Five live bugs fixed (docs/baseline.md). Finding: quiet temporal table still writes an empty MERGE version per run. T090 gap: no Windows login or Entra service principal for a SQL Server source exists; ntlm/aad_sp untested live. Open: T012a (SQL Server on hold), T034a (Lakeflow Connect Oracle baseline).
+- 2026-10-31 10:1x EDT: secret re-stored as bare JSON; parsing fallback removed (0151dcd); increment run 10 green. T034a baseline running via lfc-oracle agent. Push/PR pending on the operator (classifier blocks push here).
+- 2026-10-31 11:4x EDT: option 1 done (f185e6e, cf303f7): changed-rows probe skips the MERGE on quiet tables; run 12 no-change added only the snapshot DELETE version. 477 tests. Remaining open: T012a (SQL Server, on hold); empty snapshot DELETE still records a version each interval.
