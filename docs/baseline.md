@@ -75,3 +75,45 @@ Kept: schema `devtest_edp_bronze.lakefed_cursor_devtest` (empty, no sink table w
 3. Pick one small table with a timestamp or numeric id column.
 4. Create the pipeline as above with that table. Run once. Record duration, rows and DBUs here.
 5. Delete the pipeline and the foreign catalog.
+
+## Devtest run 2026-10-31 (T089, the cursor engine itself)
+
+Workspace: profile `ding-dong-ditch` (Azure, `adb-7405613017070986`). Job cluster: one
+`Standard_D4ds_v4`, single node. Source: Oracle `db.freesql.com:2484` (TCPS), service
+`23ai_34ui2`, schema `DTORRES_SCHEMA_AI814`, table `LAKEFED_DEVTEST` (ID NUMBER PK, NAME,
+UPDATED_AT TIMESTAMP(6)), 100 rows created by the probe notebook. Control row: `load_type cursor`,
+`cursor_expression UPDATED_AT`, `cursor_kind app_timestamp`, secret `lakefed-cursor/oracle_devtest`,
+`jdbc_options {"protocol": "tcps"}`. Sink `my_catalog.lakefed_cursor_devtest.oracle_lakefed_devtest`.
+
+| Step | Run id (engine / job) | Result |
+|---|---|---|
+| Seed | 6 / 1038635287192307 group of fixes, final seed 09:03 EDT | `seeded 1`, 100 rows, checkpoint `incremental` |
+| Change source | probe run 183740887546180 | 10 inserts (101-110), 5 updates (1-5), 5 deletes (96-100), source 105 rows |
+| Increment | 7 | `incremented 1`, `capture_queries_sources 1`, MERGE 10 inserted, 5 updated |
+| Reconcile | probe run 926490377508270 | 110 sink, 105 source, 5 differences: exactly IDs 96-100 (`delete_mode none`) |
+| `delete_mode pk_snapshot`, `delete_min_interval_s 0` | 8 | `incremented 1`, DELETE of the 5 rows, `last_delete_snapshot_at` set |
+| Reconcile | probe run 91767964247780 | 105 sink, 105 source, 0 differences (SC-001) |
+| Increment, no change | 9 | `incremented 1`, sink versions 5 and 6 added (empty MERGE, snapshot DELETE) |
+
+Each job run takes about 7 minutes, almost all cluster start. One `MAX` query per source
+database per run (SC-004).
+
+### Bugs the live run found (all fixed, unit tests added)
+
+1. Oracle upper-cases unquoted aliases, so `row["type_name"]` failed. Fix: `OracleAdapter.result_alias`
+   quotes every alias the engine reads (`a27e838`).
+2. `nullable_sql` referenced the alias unquoted (`ORA-00904`). Fix in the same change.
+3. Oracle raises `ORA-00937` for a scalar subquery or a clock beside `MAX()` with no `GROUP BY`.
+   Fix: `high_watermark_sql` is scalar subqueries only, every dialect (`65966ed`).
+4. The runtime does not ship the Oracle JDBC driver. The job installs `ojdbc11` from Maven (`ca8b101`).
+5. TCPS needs `jdbc:oracle:thin:@tcps://host:port/service`. `jdbc_options.protocol` selects it (`ca8b101`).
+
+### Open findings
+
+- A quiet temporal table still writes one empty MERGE version per run (SC quiet-table goal not met for
+  temporal cursors; the lookback window is always read). Decide: skip the MERGE when the window
+  read is empty, or accept the empty commit.
+- `delete_min_interval_s 0` runs the PK snapshot every run. Use a real interval in production.
+- The stored secret `oracle_devtest` carries text around the JSON object. `source_io._extract_creds`
+  tolerates it (`947eb26`); store bare JSON and drop that fallback.
+- The Lakeflow Connect Oracle baseline (T034a) is still not recorded.
