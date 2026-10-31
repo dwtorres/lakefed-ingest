@@ -217,7 +217,7 @@ class _Result:
 class _Spark:
     def __init__(self, result=None, fail=False):
         self.result, self.fail, self.views, self.statements = result, fail, {}, []
-        self.window_rows = 1    # rows the window read returns to the LIMIT 1 probe
+        self.changed = True     # the changed_rows_sql probe finds a row to write
         spark = self
 
         class _Catalog:
@@ -231,6 +231,8 @@ class _Spark:
         if self.conflicts:
             self.conflicts -= 1
             raise RuntimeError("ConcurrentAppendException: files added by a concurrent update")
+        if stmt.startswith("SELECT 1 FROM"):
+            return type("R", (), {"first": lambda s_: _Result({}) if self.changed else None})()
         if self.fail:
             raise RuntimeError("merge failed")
         return type("R", (), {"first": lambda s_: self.result})()
@@ -243,8 +245,6 @@ class _DF:
         d = _DF(self.spark, self.query); d.tagged = cols; return d
     def __getitem__(self, name): return f"col({name})"     # df[name]: a column object, as PySpark's DataFrame
     def createOrReplaceTempView(self, name): self.spark.views[name] = (self.query, self.tagged)
-    def limit(self, n): return self
-    def count(self): return self.spark.window_rows
 
 
 def _merge(monkeypatch, spark, lo="10", hi="20", cfg=CFG):
@@ -263,21 +263,24 @@ def test_read_and_merge_reads_window_once_and_drops_view(monkeypatch):
     assert n == 7 and spark.views == {}
     assert queries == ["SELECT [id], [amount], [updated_at] FROM [dbo].[orders] "
                        "WHERE [updated_at] > 10 AND [updated_at] <= 20"]
-    assert len(spark.statements) == 1 and "USING cursor_staged_" in spark.statements[0]
+    merges = [st for st in spark.statements if st.startswith("MERGE")]
+    assert len(spark.statements) == 2 and len(merges) == 1 and "USING cursor_staged_" in merges[0]
 
 
-def test_read_and_merge_empty_window_skips_the_merge(monkeypatch):
-    # A quiet table must not grow a Delta version per run: no MERGE statement, no view, 0 rows.
+def test_read_and_merge_skips_the_merge_when_no_window_row_differs(monkeypatch):
+    # A quiet table must not grow a Delta version per run: probe only, no MERGE, view dropped, 0 rows.
     spark = _Spark(result=_Result({"num_affected_rows": 0}))
-    spark.window_rows = 0
+    spark.changed = False
     n, queries = _merge(monkeypatch, spark)
-    assert n == 0 and spark.statements == [] and spark.views == {} and len(queries) == 1
+    assert n == 0 and spark.views == {} and len(queries) == 1
+    assert len(spark.statements) == 1 and spark.statements[0].startswith("SELECT 1 FROM cursor_staged_")
+    assert "LEFT ANTI JOIN c.s.t AS tgt ON" in spark.statements[0] and "<=>" in spark.statements[0]
 
 
 def test_read_and_merge_views_are_unique_per_call(monkeypatch):
     spark = _Spark(result=_Result({"num_affected_rows": 0}))
     _merge(monkeypatch, spark); _merge(monkeypatch, spark)
-    views = [st.split(" USING ")[1].split(" ")[0] for st in spark.statements]
+    views = [st.split(" USING ")[1].split(" ")[0] for st in spark.statements if st.startswith("MERGE")]
     assert len(set(views)) == 2
 
 
@@ -303,7 +306,7 @@ def test_read_and_merge_retries_whole_unit_on_conflict(monkeypatch):
     spark = _Spark(result=_Result({"num_affected_rows": 4}))
     spark.conflicts = 1
     n, queries = _merge(monkeypatch, spark)
-    views = {st.split(" USING ")[1].split(" ")[0] for st in spark.statements}
+    views = {re.search(r"cursor_staged_[0-9a-f]+", st).group(0) for st in spark.statements}
     assert n == 4 and len(queries) == 2 and len(views) == 2 and spark.views == {}
 
 
@@ -312,13 +315,13 @@ def test_consolidated_cursor_read_is_tagged_and_merged_on_client(monkeypatch):
     seen = {}
     real_sql = spark.sql
     def sql(stmt):
-        view = stmt.split(" USING ")[1].split(" ")[0]
+        view = re.search(r"cursor_staged_[0-9a-f]+", stmt).group(0)
         seen["tagged"] = spark.views[view][1]
         return real_sql(stmt)
     spark.sql = sql
     _merge(monkeypatch, spark, cfg=dict(CFG, client_id="t1"))
     assert seen["tagged"] == ("lit(t1) AS __client_id__", "col(id)", "col(amount)", "col(updated_at)")
-    assert "AND tgt.`__client_id__` = 't1' " in spark.statements[0]
+    assert all("AND tgt.`__client_id__` = 't1' " in st for st in spark.statements)   # probe and MERGE
 
 
 def test_every_run_rechecks_nullability(monkeypatch):
