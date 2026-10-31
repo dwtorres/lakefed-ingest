@@ -157,13 +157,13 @@ def test_oracle_quotes_result_aliases_the_engine_reads_by_name():
     assert cur.nullable_sql(cfg).startswith('(SELECT MAX("is_nullable") FROM (')   # the outer read matches the quoted alias
 
 
-    assert ora.type_class_of("NUMBER") == ora.type_class_of("NUMBER(10,0)") == ora.type_class_of("number(,0)") == "numeric"
-    assert ora.type_class_of("TIMESTAMP(6)") == ora.type_class_of("DATE") == "temporal"
-    assert ora.type_class_of("TIMESTAMP(6) WITH TIME ZONE") == "temporal"
 def test_type_class_of_per_dialect():
     ss, ora = sa.get_adapter("sqlserver"), sa.get_adapter("oracle")
     assert ss.type_class_of("rowversion") == ss.type_class_of("timestamp") == "rowversion"
     assert ss.type_class_of("bigint") == "numeric" and ss.type_class_of(" DateTime2 ") == "temporal"
+    assert ora.type_class_of("NUMBER") == ora.type_class_of("NUMBER(10,0)") == ora.type_class_of("number(,0)") == "numeric"
+    assert ora.type_class_of("TIMESTAMP(6)") == ora.type_class_of("DATE") == "temporal"
+    assert ora.type_class_of("TIMESTAMP(6) WITH TIME ZONE") == "temporal"
     pg = sa.get_adapter("postgresql")
     assert pg.type_class_of("timestamp without time zone") == "temporal" and pg.type_class_of("integer") == "numeric"
     for adapter, bad in ((ss, "float"), (ss, "nvarchar"), (ora, "NUMBER(10,2)"), (ora, "VARCHAR2"), (ora, "FLOAT"),

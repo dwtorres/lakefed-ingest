@@ -272,6 +272,7 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         return spark.sql(sql, args=args)
     adapter = source_adapters.for_cfg(cfg)
     conf = _jdbc_config(cfg)
+    row_options = source_adapters.parse_jdbc_options(cfg.get("jdbc_options"))
     return (
         spark.read.format("jdbc")
         .options(**adapter.read_options(cfg))
@@ -282,7 +283,6 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         .option("driver", adapter.driver)
         .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()
-    row_options = source_adapters.parse_jdbc_options(cfg.get("jdbc_options"))
     )
 
 
