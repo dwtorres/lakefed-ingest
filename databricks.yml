@@ -93,7 +93,20 @@ targets:
     variables:
       node_type_id: Standard_D4ds_v4
       driver_node_type_id: Standard_D4ds_v4
-      num_workers: 1
+      num_workers: 0
+    # Single node: the subscription allows 10 DDSv4 cores, so driver plus worker does not fit
+    # beside a probe cluster.
+    resources:
+      jobs:
+        lakefed_cursor:
+          job_clusters:
+            - job_cluster_key: sweep_cluster
+              new_cluster:
+                spark_conf:
+                  spark.master: "local[*, 4]"
+                  spark.databricks.cluster.profile: singleNode
+                custom_tags:
+                  ResourceClass: SingleNode
 
   prod:
     mode: production
