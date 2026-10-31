@@ -135,17 +135,6 @@ def client_attrs(cfg: dict) -> List[Tuple[str, Optional[str]]]:
     return out
 
 
-MERGE = "merge"
-
-
-def write_mode(cfg: dict) -> str:
-    """The row's write mode: 'merge' (NULL or empty is merge). Any other value is an error."""
-    mode = str(cfg.get("write_mode") or MERGE).strip().lower()
-    if mode != MERGE:
-        raise ValueError(f"invalid write_mode {cfg.get('write_mode')!r}: use merge")
-    return mode
-
-
 def write_columns(cfg: dict) -> List[str]:
     """Columns written to the sink: select_list, plus __client_id__ for a consolidated sink and
     the client_attrs columns."""

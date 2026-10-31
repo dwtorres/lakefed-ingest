@@ -45,7 +45,7 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     __client_id__ column, or a sink shared by a dedicated row and consolidated rows. Also a missing
     primary key for a strategy that MERGEs by it (the database CHECK constraints enforce this too;
     this gives a clear per-table error if a row ever gets past them), a load_type other than
-    cursor or full, an invalid write_mode or
+    cursor or full, invalid
     client_attrs, client_attrs column names clashing with select_list, and a read through a
     connection without one."""
     try:
@@ -71,7 +71,6 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
         return "use_remote_query reads through the Unity Catalog connection in src_connection, which is not set"
     try:
         cid = sink_writer.client_id(cfg)
-        sink_writer.write_mode(cfg)
         attrs = [name.lower() for name, _ in sink_writer.client_attrs(cfg)]
     except ValueError as e:
         return str(e)
@@ -89,15 +88,10 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     return None
 
 
-def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset(),
-                 reseed_on_new_columns: bool = True) -> List[dict]:
+def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset()) -> List[dict]:
     """One plan per control row, ready for the worker: unsupported (pair not in the support matrix,
     or a sink-ownership problem — see ``config_error``; carries ``error``), full (reload), or
-    cursor_seed / schema_reseed / cursor (carries the decoded ``position``) for load_type cursor.
-
-    ``reseed_on_new_columns`` False: a table whose select_list gained columns carries on from its
-    checkpoint instead of reseeding (the writes add the columns; rows written before stay NULL in
-    them)."""
+    cursor_seed / schema_reseed / cursor (carries the decoded ``position``) for load_type cursor."""
     plans = []
     for cfg in configs:
         cp = checkpoints.get(int(cfg["id"]))
@@ -107,15 +101,15 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
         elif ss.strategy_name(cfg) == ls.FULL:
             plans.append({"cfg": cfg, "route": "full", "cp": cp})
         else:
-            plans.append(_route_cursor(cfg, cp, reseed_on_new_columns))
+            plans.append(_route_cursor(cfg, cp))
     return plans
 
 
-def _route_cursor(cfg: dict, cp: Optional[dict], reseed_on_new_columns: bool = True) -> dict:
+def _route_cursor(cfg: dict, cp: Optional[dict]) -> dict:
     """Cursor tables: seed when there's no usable cursor checkpoint (none, phase seeding, another
     strategy's, or not a cursor position); reseed when the position's ``expr`` or ``kind`` differs
-    byte for byte from the control row (FR-014), or when select_list gained columns (unless
-    ``reseed_on_new_columns`` is off); else a per-table high-watermark increment."""
+    byte for byte from the control row (FR-014), or when select_list gained columns; else a
+    per-table high-watermark increment."""
     pos = cursor_engine.decode_position(cp.get("position")) if cp else None
     if (cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CURSOR) != ls.CURSOR
             or pos is None):
@@ -123,7 +117,7 @@ def _route_cursor(cfg: dict, cp: Optional[dict], reseed_on_new_columns: bool = T
     if pos["expr"] != cfg.get("cursor_expression") or pos["kind"] != cfg.get("cursor_kind"):
         return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": [], "reason": "expression_change"}
     added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
-    if added and reseed_on_new_columns:
+    if added:
         return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": added, "reason": "schema_change"}
     return {"cfg": cfg, "route": "cursor", "cp": cp, "position": pos}
 
@@ -139,7 +133,7 @@ def retry_plan(plan: dict, cp: Optional[dict]) -> dict:
 # ---- batched hi (US6) ---------------------------------------------------------------------------------
 def apply_captured(plans: List[dict], checkpoints: Dict[int, dict], captured: Dict[int, tuple]) -> Tuple[List[dict], list]:
     """(plans, unchanged): a cursor plan whose captured ``hi`` leaves the position where it is (FR-024)
-    becomes an unchanged row ``(control_id, position text, select_list to record | None)`` for
+    becomes an unchanged row ``(control_id, position text, None)`` for
     ``StateStore.bulk_advance_unchanged``; one whose ``hi`` moved carries ``hi`` so its worker reads no
     MAX. A plan without a capture, or whose ``hi`` the increment rejects, stays as it is: the worker
     reads MAX itself and reports."""
@@ -158,9 +152,7 @@ def apply_captured(plans: List[dict], checkpoints: Dict[int, dict], captured: Di
         if decision == "read" or alert or snapshot_due(plan["cfg"], plan.get("cp")):
             kept.append(dict(plan, hi=(hi, alert)))
             continue
-        cp = checkpoints[cid]
-        grown = ss.select_list_added_columns(plan["cfg"]["select_list"], cp.get("select_list"))
-        unchanged.append((cid, cp["position"], plan["cfg"]["select_list"] if grown else None))
+        unchanged.append((cid, checkpoints[cid]["position"], None))
     return kept, unchanged
 
 

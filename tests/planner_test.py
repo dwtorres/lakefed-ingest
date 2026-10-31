@@ -76,12 +76,6 @@ def test_cursor_select_list_growth_routes_to_schema_reseed():
     assert [(p["route"], p["added"]) for p in plans] == [("schema_reseed", ["w"])]
 
 
-def test_new_columns_carry_on_when_reseed_on_new_columns_is_off():
-    cfgs, cps = [_cur_cfg(cid=2, sl="id, v, w")], {2: _cur_cp()}
-    assert [p["route"] for p in planner.route_tables(cfgs, cps, reseed_on_new_columns=False)] == ["cursor"]
-    assert [p["route"] for p in planner.route_tables(cfgs, cps)] == ["schema_reseed"]
-
-
 def test_position_from_is_the_cursor_value_only_for_an_increment():
     import cursor_engine
     cur_cp = _cur_cp()
@@ -139,10 +133,9 @@ def test_sqlserver_cursor_row_routes_by_its_checkpoint():
     assert plan["route"] == "cursor" and plan["position"]["value"] == "2026-05-01T00:00:00"
 
 
-def test_write_mode_and_client_attrs_config_errors():
+def test_client_attrs_config_errors():
     ok = dict(_cfg(1, "d1", "a"), client_attrs='{"tenant_name": "x"}')
     assert planner.config_error(ok) is None and planner.config_error(dict(ok, load_type="full")) is None
-    assert "invalid write_mode" in planner.config_error(dict(ok, write_mode="append"))
     assert "invalid client_attrs column" in planner.config_error(dict(ok, client_attrs='{"__x": 1}'))
     clash = planner.config_error(dict(ok, select_list="id, Tenant_Name"))
     assert "tenant_name" in clash and "rename" in clash
@@ -232,12 +225,12 @@ def test_gap_10_captured_hi_routes_unchanged_to_bulk_and_moved_to_cursor():
     assert "hi" not in by_id[4]                     # hi below the position: the worker reports the failure
 
 
-def test_gap_10_unchanged_row_records_a_grown_select_list():
+def test_gap_10_grown_select_list_reseeds_before_capture():
     cfg = _cfg(1, "d1", "t", col="id_seq", kind="identity", sl="id, v, w")
     cps = _id_cps((1,))
-    plans = planner.route_tables([cfg], cps, reseed_on_new_columns=False)
-    plans, unchanged = planner.apply_captured(plans, cps, {1: ("100", False)})
-    assert plans == [] and unchanged == [(1, _id_pos("100"), "id, v, w")]
+    plans = planner.route_tables([cfg], cps)
+    assert [p["route"] for p in plans] == ["schema_reseed"]
+    assert planner.apply_captured(plans, cps, {1: ("100", False)}) == (plans, [])
 
 
 def test_gap_10_bulk_rows_to_write_skips_fresh_quiet_tables():

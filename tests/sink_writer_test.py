@@ -516,9 +516,6 @@ def test_write_columns_are_select_list_then_identity_columns():
     assert sw.write_columns(_ATTRS) == ["id", "v", "__client_id__", "tenant_name", "source_server", "app_version"]
     assert sw.write_columns(dict(_CONS, client_attrs='{"tenant_name": "Acme"}')) == \
         ["id", "v", "__client_id__", "tenant_name"]
-    assert sw.write_mode(_CONS) == "merge" and sw.write_mode(dict(_CONS, write_mode=" Merge ")) == "merge"
-    with pytest.raises(ValueError, match="invalid write_mode 'append'"):
-        sw.write_mode(dict(_CONS, write_mode="append"))
 
 
 def test_sink_expr_maps_greatest_and_coalesce_and_refuses_other_functions():
