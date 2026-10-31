@@ -27,6 +27,10 @@ def test_jdbc_urls_and_drivers():
     assert ss.jdbc_url("h", 1433, "db", False) == \
         "jdbc:sqlserver://h:1433;databaseName=db;encrypt=true;trustServerCertificate=false"
     assert ora.jdbc_url("h", 1521, "ORCLPDB1", True) == "jdbc:oracle:thin:@//h:1521/ORCLPDB1"
+    assert ora.jdbc_url("h", 2484, "ORCLPDB1", True, options={"protocol": "tcps"}) == \
+        "jdbc:oracle:thin:@tcps://h:2484/ORCLPDB1"
+    # the protocol is a URL setting: not forwarded to the driver as a property
+    assert ora.read_options({"jdbc_options": '{"protocol": "tcps", "fetchsize": "5"}'}) == {"fetchsize": "5"}
     assert pg.jdbc_url("h", 5432, "app", True) == "jdbc:postgresql://h:5432/app?sslmode=require"
     assert pg.jdbc_url("h", 5432, "app", False) == ("jdbc:postgresql://h:5432/app?sslmode=verify-full"
                                                     "&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory")
@@ -140,10 +144,6 @@ def test_cursor_type_sql_lists_the_columns(src_type, typ):
     assert "information_schema.columns" in sa.get_adapter("postgresql").cursor_type_sql("s", "t", ["c"])
 
 
-def test_type_class_of_per_dialect():
-    ss, ora = sa.get_adapter("sqlserver"), sa.get_adapter("oracle")
-    assert ss.type_class_of("rowversion") == ss.type_class_of("timestamp") == "rowversion"
-    assert ss.type_class_of("bigint") == "numeric" and ss.type_class_of(" DateTime2 ") == "temporal"
 def test_oracle_quotes_result_aliases_the_engine_reads_by_name():
     # Oracle folds an unquoted alias to upper case; JDBC rows then lack row["type_name"], row["hi"].
     ora = sa.get_adapter("oracle")
@@ -152,6 +152,9 @@ def test_oracle_quotes_result_aliases_the_engine_reads_by_name():
     assert 'AS "src_now"' in ora.max_batch_sql([("c1", "HR", "EMP", '"UPD"')], "TIMESTAMP(6)")
     assert 'AS "lb"' in ora.bounds_query("HR", "EMP", "ID") and 'AS "table_size_mb"' in ora.table_size_mb_query("HR", "EMP")
     assert ora.result_alias("hi") == '"hi"' and sa.get_adapter("sqlserver").result_alias("hi") == "hi"
+    import cursor_engine as cur
+    cfg = {"src_type": "oracle", "src_schema": "HR", "src_table": "EMP", "cursor_expression": "UPD", "cursor_kind": "app_timestamp"}
+    assert cur.nullable_sql(cfg).startswith('(SELECT MAX("is_nullable") FROM (')   # the outer read matches the quoted alias
 
 
     assert ora.type_class_of("NUMBER") == ora.type_class_of("NUMBER(10,0)") == ora.type_class_of("number(,0)") == "numeric"

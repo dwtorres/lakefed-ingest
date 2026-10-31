@@ -82,7 +82,9 @@ class SourceAdapter:
     remote_database_option: str = "database"
 
     # ---- connection ---------------------------------------------------------------------
-    def jdbc_url(self, host: str, port: int, database: str, trust_cert: bool) -> str:
+    def jdbc_url(self, host: str, port: int, database: str, trust_cert: bool,
+                 options: Optional[Dict[str, str]] = None) -> str:
+        """``options`` are the row's ``read_options``; an adapter may read a URL setting from them."""
         raise NotImplementedError
 
     def read_options(self, cfg: dict) -> Dict[str, str]:
@@ -135,13 +137,13 @@ class SourceAdapter:
         sql = f"SELECT {self.select_cols(cfg['select_list'])} FROM {self.table_ref(cfg['src_schema'], cfg['src_table'])}"
         return f"{sql} WHERE {where}" if where else sql
 
-    def bounds_query(self, schema: str, table: str, partition_col: str) -> str:
-        col = self.quote_ident(partition_col)
     def result_alias(self, name: str) -> str:
         """A result column alias the engine reads by name (``row["hi"]``). The default is the bare
         name; a dialect that folds unquoted aliases to upper case (Oracle) quotes it."""
         return name
 
+    def bounds_query(self, schema: str, table: str, partition_col: str) -> str:
+        col = self.quote_ident(partition_col)
         return (f"SELECT MIN({col}) AS {self.result_alias('lb')}, MAX({col}) AS {self.result_alias('ub')}"
                 f" FROM {self.table_ref(schema, table)}")
 
@@ -215,7 +217,7 @@ class SqlServerAdapter(SourceAdapter):
     default_port = 1433
     driver = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
 
-    def jdbc_url(self, host, port, database, trust_cert):
+    def jdbc_url(self, host, port, database, trust_cert, options=None):
         return (
             f"jdbc:sqlserver://{host}:{int(port)};databaseName={database};encrypt=true;"
             f"trustServerCertificate={'true' if trust_cert else 'false'}"
@@ -331,9 +333,17 @@ class OracleAdapter(SourceAdapter):
     default_options = {"fetchsize": "10000"}   # the driver default (10 rows/round trip) is far too small
     remote_database_option = "service_name"
 
-    def jdbc_url(self, host, port, database, trust_cert):
-        # TLS (TCPS) needs a wallet / truststore and is configured per deployment; see docs/deploy.md.
+    def jdbc_url(self, host, port, database, trust_cert, options=None):
+        # jdbc_options {"protocol": "tcps"} selects TLS; the server certificate must be in the JVM
+        # truststore (public CA) or jdbc_options must add oracle.net.ssl_server_dn_match etc.; see docs/deploy.md.
+        if (options or {}).get(self.PROTOCOL_OPTION, "tcp").lower() == "tcps":
+            return f"jdbc:oracle:thin:@tcps://{host}:{int(port)}/{database}"
         return f"jdbc:oracle:thin:@//{host}:{int(port)}/{database}"
+
+    PROTOCOL_OPTION = "protocol"   # URL setting, not a driver property
+
+    def read_options(self, cfg):
+        return {k: v for k, v in super().read_options(cfg).items() if k != self.PROTOCOL_OPTION}
 
     def table_size_mb_query(self, schema, table):
         # Least privilege: ALL_TABLES optimizer statistics (num_rows x avg_row_len) need only SELECT on
@@ -347,6 +357,9 @@ class OracleAdapter(SourceAdapter):
     # all_tab_columns.data_type: NUMBER (rendered NUMBER(p,s) by cursor_type_sql when a scale is set),
     # DATE, TIMESTAMP(n)[ WITH [LOCAL] TIME ZONE]. No rowversion.
     scalar_from = " FROM DUAL"
+
+    def result_alias(self, name):
+        return self.quote_ident(name)   # unquoted aliases come back upper case (TYPE_NAME), the engine reads type_name
     _number = re.compile(r"^NUMBER(\(\d*,\s*(-?\d+)\))?$")
     _temporal = re.compile(r"^(DATE|TIMESTAMP\(\d+\)( WITH( LOCAL)? TIME ZONE)?)$")
     _iso = "YYYY-MM-DD\"T\"HH24:MI:SS"
@@ -357,9 +370,6 @@ class OracleAdapter(SourceAdapter):
         if m and int(m.group(2) or 0) <= 0:
             return "numeric"
         if self._temporal.match(t):
-
-    def result_alias(self, name):
-        return self.quote_ident(name)   # unquoted aliases come back upper case (TYPE_NAME), the engine reads type_name
             return "temporal"
         raise ValueError(self._type_error(type_name, ["NUMBER with scale 0", "DATE", "TIMESTAMP(n)",
                                                       "TIMESTAMP(n) WITH [LOCAL] TIME ZONE"]))
@@ -408,7 +418,7 @@ class PostgresAdapter(SourceAdapter):
     # with the default 0 the whole result is buffered in executor memory.
     default_options = {"fetchsize": "10000"}
 
-    def jdbc_url(self, host, port, database, trust_cert):
+    def jdbc_url(self, host, port, database, trust_cert, options=None):
         if trust_cert:
             return f"jdbc:postgresql://{host}:{int(port)}/{database}?sslmode=require"
         # verify-full against the JVM truststore (public CAs) rather than ~/.postgresql/root.crt; a
@@ -462,7 +472,7 @@ class MySqlAdapter(SourceAdapter):
     driver = "com.mysql.cj.jdbc.Driver"
     default_options = {"fetchsize": "10000"}   # cursor fetch is enabled in the URL
 
-    def jdbc_url(self, host, port, database, trust_cert):
+    def jdbc_url(self, host, port, database, trust_cert, options=None):
         ssl = "REQUIRED" if trust_cert else "VERIFY_IDENTITY"
         return f"jdbc:mysql://{host}:{int(port)}/{database}?sslMode={ssl}&useCursorFetch=true"
 

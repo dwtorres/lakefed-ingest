@@ -266,12 +266,13 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         spark.read.format("jdbc")
         .options(**adapter.read_options(cfg))
         .option("url", adapter.jdbc_url(conf["host"], conf["port"], cfg["src_database"],
-                                        trust_server_certificate()))
+                                        trust_server_certificate(), options=row_options))
         .option("query", query)
         .options(**conf["options"])
         .option("driver", adapter.driver)
         .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()
+    row_options = source_adapters.parse_jdbc_options(cfg.get("jdbc_options"))
     )
 
 
