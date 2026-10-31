@@ -131,7 +131,17 @@ def _extract_creds(blob) -> dict:
     """The secret JSON as ``{auth_mode, host, <required fields of the mode>}`` (contracts/secret_json.md).
     A missing ``auth_mode`` means ``sql``; legacy shapes (alternate user key names, one nested object)
     still parse. Fails before any connect; the message names fields, never values."""
-    raw = json.loads(blob) if isinstance(blob, str) else dict(blob)
+    if isinstance(blob, str):
+        try:
+            raw = json.loads(blob)
+        except json.JSONDecodeError:
+            # shortcut: a secret pasted with text around the JSON object; drop once secrets are bare JSON
+            found = re.search(r"\{.*\}", blob, re.S)
+            if found is None:
+                raise ValueError("the source credential secret is not a JSON object")
+            raw = json.loads(found.group(0))
+    else:
+        raw = dict(blob)
     mode = str(raw.get("auth_mode") or "sql").strip().lower()
     if mode not in source_adapters.AUTH_FIELDS:
         raise ValueError(f"unknown auth_mode in the source credential secret: "
