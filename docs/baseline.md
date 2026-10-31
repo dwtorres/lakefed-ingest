@@ -106,9 +106,11 @@ database per run (SC-004).
 
 ### Open findings
 
-- A quiet temporal table still writes one empty MERGE version per run (SC quiet-table goal not met for
-  temporal cursors; the lookback window is always read). Decide: skip the MERGE when the window
-  read is empty, or accept the empty commit.
+- Fixed (`cf303f7`): a quiet temporal table wrote one empty MERGE version per run, because the lookback
+  window re-reads rows the sink already holds. `changed_rows_sql` probes the staged window with a
+  LEFT ANTI JOIN; no differing row means no MERGE. Run 12 (no source change) added only the snapshot
+  DELETE version (`delete_min_interval_s 0` in devtest). An empty snapshot DELETE still records a
+  version; a production interval limits that to once per interval.
 - `delete_min_interval_s 0` runs the PK snapshot every run. Use a real interval in production.
 - The stored secret `oracle_devtest` carries text around the JSON object. `source_io._extract_creds`
   tolerates it (`947eb26`); store bare JSON and drop that fallback.
