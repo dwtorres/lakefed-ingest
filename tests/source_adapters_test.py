@@ -177,8 +177,8 @@ def test_source_now_sql_matches_the_cursor_type():
     assert ss.source_now_sql("datetime2") == "SYSUTCDATETIME()"
     assert "SYSUTCDATETIME()" in ss.source_now_sql("datetimeoffset")      # UTC, with an offset like the column
     assert ss.source_now_sql("datetime") == ss.source_now_sql("smalldatetime") == "GETDATE()"
-    assert ora.source_now_sql("TIMESTAMP(6)") == ora.source_now_sql("timestamp(6) with time zone") == "MAX(SYSTIMESTAMP)"
-    assert ora.source_now_sql("DATE") == "MAX(SYSDATE)"
+    assert ora.source_now_sql("TIMESTAMP(6)") == ora.source_now_sql("timestamp(6) with time zone") == "SYSTIMESTAMP"
+    assert ora.source_now_sql("DATE") == "SYSDATE"
     assert pg.source_now_sql("timestamp with time zone") == "now()"
     with pytest.raises(ValueError):
         ss.source_now_sql("int")

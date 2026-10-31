@@ -216,9 +216,11 @@ def high_watermark_sql(cfg: dict, typ: str, server_version=None) -> str:
     src_now = ""
     if _kind(cfg, typ) == "temporal":
         src_now = f", {a.cursor_text_sql(a.source_now_sql(typ), typ)} AS {a.result_alias('src_now')}"
-    return (f"SELECT {a.max_text_sql(_expr(cfg, typ, server_version), typ)} AS {a.result_alias('hi')}, "
-            f"{nullable_sql(cfg)} AS {a.result_alias('nullable')}{src_now} "
-            f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}")
+    # Scalar subqueries, no aggregate in the outer select: Oracle rejects a subquery or a clock
+    # beside MAX() with no GROUP BY (ORA-00937). Same shape as max_batch_sql.
+    return (f"SELECT (SELECT {a.max_text_sql(_expr(cfg, typ, server_version), typ)} "
+            f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}) AS {a.result_alias('hi')}, "
+            f"{nullable_sql(cfg)} AS {a.result_alias('nullable')}{src_now}{a.scalar_from}")
 
 
 def literal(cfg: dict, value: str, typ: str) -> str:

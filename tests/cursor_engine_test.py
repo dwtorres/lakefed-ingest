@@ -53,7 +53,8 @@ def test_type_lookup_sql_quotes_names():
     ("datetimeoffset", "CONVERT(VARCHAR(64), MAX([updated_at]), 126)", ", CONVERT(VARCHAR(64), TODATETIMEOFFSET(SYSUTCDATETIME(), 0), 126) AS src_now"),
 ])
 def test_high_watermark_sql(typ, expr, clock):
-    assert cur.high_watermark_sql(CFG, typ) == f"SELECT {expr} AS hi, {cur.nullable_sql(CFG)} AS nullable{clock} FROM [dbo].[orders]"
+    # Scalar subqueries, no outer aggregate: Oracle rejects a subquery or clock beside MAX() (ORA-00937).
+    assert cur.high_watermark_sql(CFG, typ) == f"SELECT (SELECT {expr} FROM [dbo].[orders]) AS hi, {cur.nullable_sql(CFG)} AS nullable{clock}"
 
 
 @pytest.mark.parametrize("typ", ["timestamp", "rowversion"])
@@ -61,8 +62,8 @@ def test_rowversion_high_watermark_capped_below_min_active_rowversion(typ):
     # Never past the oldest open transaction: rows it commits later must not fall below the watermark.
     mx, mar = "CAST(MAX([updated_at]) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
     assert cur.high_watermark_sql(CFG, typ) == (
-        f"SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) AS hi, "
-        f"{cur.nullable_sql(CFG)} AS nullable FROM [dbo].[orders]")
+        f"SELECT (SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) FROM [dbo].[orders]) AS hi, "
+        f"{cur.nullable_sql(CFG)} AS nullable")
 
 
 @pytest.mark.parametrize("typ", ["float", "real", "nvarchar", "uniqueidentifier", "bit"])
@@ -126,12 +127,11 @@ def test_postgres_cursor_sql():
                                        "THEN 1 ELSE 0 END AS is_nullable FROM information_schema.columns WHERE "
                                        "table_schema = 'public' AND table_name = 'orders' AND column_name IN ('updated_at')")
     hw = cur.high_watermark_sql(PG, "timestamp with time zone")
-    assert hw.startswith("SELECT to_char(MAX(\"updated_at\") AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS hi")
-    assert hw.endswith(", to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS src_now "
-                       'FROM "public"."orders"')
-    assert cur.high_watermark_sql(PG, "bigint") == f'SELECT MAX("updated_at")::text AS hi, {cur.nullable_sql(PG)} AS nullable FROM "public"."orders"'
+    assert hw.startswith("SELECT (SELECT to_char(MAX(\"updated_at\") AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' FROM \"public\".\"orders\") AS hi")
+    assert hw.endswith(", to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS src_now")
+    assert cur.high_watermark_sql(PG, "bigint") == f'SELECT (SELECT MAX("updated_at")::text FROM "public"."orders") AS hi, {cur.nullable_sql(PG)} AS nullable'
     assert cur.high_watermark_sql(PG, "timestamp without time zone").startswith(
-        "SELECT to_char(MAX(\"updated_at\"), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS hi")
+        "SELECT (SELECT to_char(MAX(\"updated_at\"), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') FROM \"public\".\"orders\") AS hi")
     assert ", to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS src_now" in cur.high_watermark_sql(PG, "timestamp without time zone")
     where = cur.read_where(PG, "timestamp without time zone", "2026-01-01T10:00:00", "2026-01-01T11:00:00", 600)
     assert where == ('"updated_at" > CAST(\'2026-01-01T09:50:00\' AS timestamp without time zone) AND '
@@ -358,7 +358,7 @@ def test_gap_2_lookback_argument_replaces_env():
 
 @pytest.mark.parametrize("cfg,typ", DIALECTS)
 def test_gap_4_hi_capped_at_source_clock_plus_skew(monkeypatch, cfg, typ):
-    assert f" AS {sa.for_cfg(cfg).result_alias('src_now')} FROM" in cur.high_watermark_sql(cfg, typ)
+    assert f" AS {sa.for_cfg(cfg).result_alias('src_now')}" in cur.high_watermark_sql(cfg, typ)
     _source_rows(monkeypatch, [{"hi": "2099-01-01T00:00:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
     assert cur.high_watermark(cfg, typ, skew_s=300) == ("2026-10-26T10:05:00", True)
     _source_rows(monkeypatch, [{"hi": "2026-10-26T09:59:00", "nullable": 0, "src_now": "2026-10-26T10:00:00"}])
