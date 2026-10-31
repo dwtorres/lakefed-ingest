@@ -384,7 +384,9 @@ class OracleAdapter(SourceAdapter):
     def source_now_sql(self, type_name):
         if self.type_class_of(type_name) != "temporal":
             raise ValueError(self._type_error(type_name, ["DATE", "TIMESTAMP(n)"]))
-        return "SYSDATE" if type_name.strip().upper() == "DATE" else "SYSTIMESTAMP"
+        # MAX(): the clock sits beside MAX(expr) with no GROUP BY, which Oracle rejects for a bare
+        # function (ORA-00937). MAX of a constant is the constant.
+        return "MAX(SYSDATE)" if type_name.strip().upper() == "DATE" else "MAX(SYSTIMESTAMP)"
 
     def cursor_text_sql(self, expr, type_name):
         t = type_name.strip().upper()
