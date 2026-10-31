@@ -234,12 +234,11 @@ def test_extract_creds_without_mode_is_sql():
     assert (creds["user"], creds["password"]) == ("svc", SECRET_VALUE)
 
 
-def test_extract_creds_accepts_json_wrapped_in_text():
+def test_extract_creds_rejects_text_around_the_json():
     blob = 'oracle devtest login: {"user": "svc", "password": "%s"} (free tier)' % SECRET_VALUE
-    creds = sio._extract_creds(blob)
-    assert creds["user"] == "svc" and creds["auth_mode"] == "sql"
-    with pytest.raises(ValueError, match="not a JSON object"):
-        sio._extract_creds("user=svc password=x")
+    with pytest.raises(ValueError, match="not a JSON object") as e:
+        sio._extract_creds(blob)
+    assert SECRET_VALUE not in str(e.value)
 
 
 def test_extract_creds_ntlm_needs_domain():
