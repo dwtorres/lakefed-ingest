@@ -67,7 +67,8 @@ One run of job `lakefed_cursor` ingests one `task_collection`.
    cursor table. Tables with `hi` equal to the checkpoint are quiet. Their checkpoints advance in one
    Lakebase write. No source read and no Delta commit happens for them.
 4. Seeds, reseeds, reloads and changed tables run in parallel. Each worker reads once, writes to
-   Delta, and then advances the checkpoint.
+   Delta, and then advances the checkpoint. One exception: a second one-row read probes each cursor
+   window before the MERGE. A window with no changed row makes no Delta commit.
 5. The run writes per-table events and a run summary to Lakebase telemetry.
 
 ### Sources and load types

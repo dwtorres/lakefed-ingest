@@ -127,7 +127,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 
 ### Engineering rules
 - No `.cache()` / `.persist()`; read each source once per cycle (Delta MERGE materializes the JDBC
-  source itself).
+  source itself). Reviewed exception: `cursor_engine.changed_rows_sql` probes the staged window with a
+  second one-row read, so a quiet temporal table makes no empty Delta commit.
 - No SQL warehouse dependency.
 - Live proof: SQL Server on hold (no source); Oracle pending the Phase 10 devtest run (`specs/001-cursor-only-engine/quickstart.md`).
 - Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE).
