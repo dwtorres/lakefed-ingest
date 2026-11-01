@@ -7,6 +7,20 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+# Set these widgets, then run all cells. apply=false is a dry run.
+dbutils.widgets.text("metadata_file", "", "1. edp source_to_bronze_<source>.json path")
+dbutils.widgets.text("source_name", "", "2. edp source name, e.g. rl_solutions")
+dbutils.widgets.text("task_collection", "", "3. task_collection, e.g. rl_solutions_shadow")
+dbutils.widgets.text("sink_catalog", "devtest_team_dpe", "4. sink catalog")
+dbutils.widgets.text("bronze_catalog", "devtest_edp_bronze", "5. edp bronze catalog")
+dbutils.widgets.text("ntlm_domain", "cnmc", "6. NTLM domain (login without DOMAIN\\)")
+dbutils.widgets.text("engine_path", "", "7. folder of state_store.py (empty: from this notebook)")
+dbutils.widgets.text("db_instance", "lakefed-cursor", "8. Lakebase instance")
+dbutils.widgets.text("db_name", "databricks_postgres", "9. Lakebase database")
+dbutils.widgets.dropdown("apply", "false", ["false", "true"], "10. apply")
+
+# COMMAND ----------
+
 # Build lakefed-cursor shadow control rows and source secrets from one edp
 # source_to_bronze_<source>.json file. Run on the edp devtest workspace.
 # Reads secrets from scope edp-akv, writes JSON secrets to scope
@@ -168,23 +182,27 @@ def _run_notebook():
     import sys
     from databricks.sdk import WorkspaceClient
 
-    def widget(name, default=""):
-        dbutils.widgets.text(name, default)
+    def widget(name):
         return dbutils.widgets.get(name).strip()
 
-    # The deployed bundle folder that holds state_store.py.
-    sys.path.append(widget("engine_path"))
+    # Default: <bundle files>/src/lakefed_ingest, next to <bundle files>/tools.
+    engine_path = widget("engine_path")
+    if not engine_path:
+        context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        tools_dir = "/Workspace" + context.notebookPath().get().rsplit("/", 1)[0]
+        engine_path = tools_dir.rsplit("/", 1)[0] + "/src/lakefed_ingest"
+    sys.path.append(engine_path)
     from state_store import StateStore
 
     metadata_file = widget("metadata_file")  # /Workspace/.../source_to_bronze_<source>.json
     source_name = widget("source_name")      # e.g. rl_solutions
     collection = widget("task_collection")   # e.g. rl_solutions_shadow
-    sink_catalog = widget("sink_catalog", "devtest_lakefed_shadow")
-    bronze_catalog = widget("bronze_catalog", "devtest_edp_bronze")
+    sink_catalog = widget("sink_catalog")
+    bronze_catalog = widget("bronze_catalog")
     ntlm_domain = widget("ntlm_domain")
-    db_instance = widget("db_instance", "lakefed-cursor")
-    db_name = widget("db_name", "databricks_postgres")
-    apply = widget("apply", "false") == "true"
+    db_instance = widget("db_instance")
+    db_name = widget("db_name")
+    apply = widget("apply") == "true"
 
     with open(metadata_file) as handle:
         body = json.load(handle)[source_name]
