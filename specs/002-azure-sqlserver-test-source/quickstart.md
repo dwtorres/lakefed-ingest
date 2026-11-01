@@ -116,8 +116,10 @@ directory named in its step. Replace `<...>` values. Do not paste a password int
 
 26. In the Terraform project, set `enable_private_network_gateway = true` and `terraform apply`.
     Follow `docs/private-network-gateway-runbook.md` there to attach the devtest workspace.
-27. Create a UC connection of type `SQLSERVER` to `<sqlserver_test_host>:1433`, database
-    `lakefed_test`, login `lakefed_sql`, trust server certificate on.
+27. Note `terraform output -raw sqlserver_test_fqdn`. Create a UC connection of type `SQLSERVER` to
+    `<sqlserver_test_fqdn>:1433`, database `lakefed_test`, login `lakefed_sql`, trust server
+    certificate on. Use the DNS name, not `<sqlserver_test_host>`. Serverless refuses an IPv4 literal
+    through the gateway.
 28. Create a query-based ingestion pipeline, serverless, triggered, one table object
     `dbo.doc_attachment_079`, cursor `row_version`, target `my_catalog.lakefed_cursor_devtest.sqlserver_baseline_doc_attachment_079`.
     The Oracle section of `docs/baseline.md` shows the spec shape.

@@ -370,3 +370,17 @@ Task: "az consumption budget list -g rg-lakefed-sqlserver-test, expect one budge
 - Commit after each phase. Terraform changes are in the ding-dong-ditch project. This repo's changes are in this feature branch.
 - Never paste a Terraform output, a `password`, or a `client_secret` into a chat or a task note. Pipe them with `terraform output -raw ... | databricks secrets put-secret`.
 - Stop at any checkpoint. Every state in data-model.md can go to `absent` through T056 to T060.
+
+---
+
+## Phase 8: Convergence
+
+- [X] T062 Remove `tenant_id` from the `aad_sp` secret example in `docs/deploy.md` line 103. Run `.venv/bin/pytest tests/docs_test.py` per FR-009 (partial)
+- [X] T063 Amend FR-035 in `specs/001-cursor-only-engine/spec.md` line 235 so `aad_sp` requires `client_id` and `client_secret` only. Link the T095 answer in `docs/baseline.md` per FR-009 (contradicts)
+- [X] T064 Add `azurerm_private_dns_a_record.sqlserver_test` (`TF/sqlserver_test.tf` line 222, gated on both toggles) to the resource list in `contracts/terraform_toggle.md`. In `quickstart.md` step 27, point the UC connection at the private DNS name, not the IP, because serverless refuses an IPv4 literal through the gateway per FR-014 (partial)
+
+---
+
+## Phase 9: Convergence
+
+- [ ] T065 Update `tests/synthetic/README.md` line 9 so the `build_synth_db.py` row says Change Tracking is enabled only when `enable_change_tracking` is `true`. Run `.venv/bin/pytest tests/docs_test.py` per plan: tests/synthetic/README.md edit (partial)

@@ -43,6 +43,10 @@ Project: `/Users/dwtorres/src/ding-dong-ditch-azure-terraform`. File: `sqlserver
 9. `azurerm_virtual_machine_extension.sqlserver_test_setup` (CustomScriptExtension): creates the
    Windows user, the database `lakefed_test`, the two logins, the `db_owner` grants
 10. `azurerm_consumption_budget_resource_group.sqlserver_test`: 80 percent notification
+11. `azurerm_private_dns_a_record.sqlserver_test`: name `sqlserver` in zone `png-test.contoso.com`,
+    record the NIC private IP. Count is 1 only when both `enable_sqlserver_test_source` and
+    `enable_private_network_gateway` are true. Serverless reaches the VNet through the gateway by
+    name only, never by an IPv4 literal
 
 With the toggle on, `address_space` in `network.tf` adds `var.sqlserver_test_cidr`.
 
@@ -51,6 +55,7 @@ With the toggle on, `address_space` in `network.tf` adds `var.sqlserver_test_cid
 | Output | Sensitive | Value |
 |---|---|---|
 | `sqlserver_test_host` | no | private IP of the NIC |
+| `sqlserver_test_fqdn` | no | DNS name of the A record; null unless the gateway toggle is also on |
 | `sqlserver_test_database` | no | `lakefed_test` |
 | `sqlserver_test_ntlm_domain` | no | `lakefedsqltest` |
 | `sqlserver_test_sql_secret_json` | yes | `{"user": "lakefed_sql", "password": "..."}` |

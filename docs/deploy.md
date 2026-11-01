@@ -100,7 +100,7 @@ catalog for the same database fails.
    |---|---|---|
    | `sql` or absent | `{"user": "...", "password": "..."}` | all |
    | `ntlm` | `{"auth_mode": "ntlm", "domain": "CORP", "user": "...", "password": "..."}` | SQL Server |
-   | `aad_sp` | `{"auth_mode": "aad_sp", "client_id": "...", "client_secret": "...", "tenant_id": "..."}` | SQL Server |
+   | `aad_sp` | `{"auth_mode": "aad_sp", "client_id": "...", "client_secret": "..."}` | SQL Server |
 
    An Azure Key Vault-backed scope also works. AKV secret names allow only letters, digits and
    dashes. Each control row names its secret in `secret_key`.
