@@ -264,16 +264,22 @@ WARNING: T056 to T060 delete the VM, its disk, the database, the table, the secr
   - Files: `specs/002-azure-sqlserver-test-source/quickstart.md`, `research.md`, `plan.md`, `tasks.md`
   - Rules: instructions 20 words or fewer, descriptions 25 words or fewer
   - Banned words: `utilize`, `ensure`, `facilitate`, `leverage`, `commence`, `terminate`
-- [ ] T056 In `TF/terraform.tfvars` set `enable_sqlserver_test_source = false`. If T045 turned the gateway on only for this test, set `enable_private_network_gateway = false` too. Run `terraform plan`. Expected: destroys only the feature resources, changes nothing else. Run `terraform apply`.
-- [ ] T057 Delete the service principal (R-04): `az ad app delete --id "$(az ad app list --display-name sp-lakefed-sqlserver-test --query '[0].appId' -o tsv)"`.
-- [ ] T058 Delete the three secrets: `for k in sqlserver_test_sql sqlserver_test_ntlm sqlserver_test_aad_sp; do databricks secrets delete-secret lakefed-cursor $k --profile ding-dong-ditch; done`.
-- [ ] T059 Delete the control row: `delete from lakefed_cursor.control where src_host = '<sqlserver_test_host>'`. Delete its checkpoint row too. Delete the sink tables in `my_catalog.lakefed_cursor_devtest`: `sqlserver_doc_attachment_079`, `sqlserver_baseline_doc_attachment_079`, `synth_manifest`.
-- [ ] T060 Run the teardown check from `contracts/terraform_toggle.md`. Record the four results in the task note (SC-007, US1/AC4).
+- [X] T056 In `TF/terraform.tfvars` set `enable_sqlserver_test_source = false`. If T045 turned the gateway on only for this test, set `enable_private_network_gateway = false` too. Run `terraform plan`. Expected: destroys only the feature resources, changes nothing else. Run `terraform apply`.
+  - Result 2026-11-01: gateway off applied first (00:09 to 07:01 EDT, the Databricks gateway took 7 hours to release its NIC). Source toggle off: plan 13 destroys 1 change, apply 07:11:19 to 07:14:53 EDT.
+- [X] T057 Delete the service principal (R-04): `az ad app delete --id "$(az ad app list --display-name sp-lakefed-sqlserver-test --query '[0].appId' -o tsv)"`.
+  - Result 2026-11-01: app deleted. `az ad app list` and `az ad sp list` return no line.
+- [X] T058 Delete the three secrets: `for k in sqlserver_test_sql sqlserver_test_ntlm sqlserver_test_aad_sp; do databricks secrets delete-secret lakefed-cursor $k --profile ding-dong-ditch; done`.
+  - Result 2026-11-01: three secrets deleted. Scope holds `oracle_devtest` only.
+- [X] T059 Delete the control row: `delete from lakefed_cursor.control where src_host = '<sqlserver_test_host>'`. Delete its checkpoint row too. Delete the sink tables in `my_catalog.lakefed_cursor_devtest`: `sqlserver_doc_attachment_079`, `sqlserver_baseline_doc_attachment_079`, `synth_manifest`.
+  - Result 2026-11-01: checkpoint and control row deleted (count 0). `sqlserver_doc_attachment_079` and `synth_manifest` dropped. Schema holds `oracle_lakefed_devtest` only.
+- [X] T060 Run the teardown check from `contracts/terraform_toggle.md`. Record the four results in the task note (SC-007, US1/AC4).
+  - Result 2026-11-01: tagged resources 0, `az group exists` false, feature subnets 0, app 0. VNet address space back to `10.0.0.0/20`. Terraform state has no `sqlserver_test` or `png` entry.
   - `az resource list --tag Feature=002-azure-sqlserver-test-source -o tsv`: expect no line
   - `az group exists -n rg-lakefed-sqlserver-test`: expect `false`
   - `az network vnet subnet list -g rg-databricks-network --vnet-name ding-dong-ditch-vnet --query "[?contains(name,'sqlserver-test')]" -o tsv`: expect no line
   - `az ad app list --display-name sp-lakefed-sqlserver-test -o tsv`: expect no line
 - [ ] T061 Read the actual spend. Before T056, read the budget. After T056, read the subscription cost analysis filtered on tag `Feature=002-azure-sqlserver-test-source` the next day. Record total spend against the ceiling in `docs/baseline.md` (SC-006).
+  - Partial 2026-11-01: budget `currentSpend` read 0.0 USD before teardown (Azure cost lags a day). Cost Management by tag: read on 2026-11-02 and record in `docs/baseline.md`.
 
 ---
 

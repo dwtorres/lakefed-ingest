@@ -201,6 +201,11 @@ same five rows, so the updated rows left the table before the read. The sink cou
 
 ### Build notes
 
+- Teardown 2026-11-01 07:15 EDT: toggle off, 13 resources destroyed, service principal and secrets
+  deleted, control row and sinks removed. SC-007 checks: 0 tagged resources, group gone, no subnet.
+- Total Azure spend (SC-006): pending, the budget read 0.0 USD before teardown. Read Cost Management
+  by tag `Feature=002-azure-sqlserver-test-source` on 2026-11-02.
+
 - `terraform apply` failed twice before the VM existed: the subscription has 0 DSv5 cores in eastus
   (the VM is `Standard_D2ds_v4`), and `Microsoft.SqlVirtualMachine` was not registered.
 - Source up in 19 minutes (US1/AC1), table loaded in 30 minutes (SC-001).
