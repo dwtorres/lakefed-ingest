@@ -58,6 +58,8 @@ notebooks with these widgets (all three share the connection widgets):
 | `secret_scope`, `secret_key` | (required) | The credential secret |
 | `seed` | `42` | Catalog and data seed; keep it the same across all three notebooks |
 | `scale_factor` | `0.1` | Size (see above); keep it the same across build and changes |
+| `tables` | (empty) | Comma list of table names for build and changes. Empty means every table. An unknown name fails the run |
+| `enable_change_tracking` | `true` | Build only. `false` skips the Change Tracking step, for cursor-only sources |
 
 1. **Build:** run `build_synth_db`. Its other widgets are `threads` (12), `batch_rows` (1,000,000) and
    `ct_retention_days` (3). It's safe to rerun: a table that already has the expected row count is skipped, and a partial one
