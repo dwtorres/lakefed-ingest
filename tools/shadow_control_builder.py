@@ -47,7 +47,9 @@ SRC_TYPES = {
     "fabric_direct_watermark": "sqlserver",
 }
 ORACLE_URL = re.compile(
-    r"^jdbc:oracle:thin:@(?://)?(?P<host>[^:/@()]+):(?P<port>\d+)[/:](?P<service>[^?\s()]+)$"
+    r"^jdbc:oracle:thin:@(?:tcp://|//)?(?P<host>[^:/@()?\s]+)(?::(?P<port>\d+))?"
+    r"[/:](?P<service>[^:?/\s()]+)(?::[^?\s]*)?(?:\?.*)?$",
+    re.I,
 )
 TNS_KEY = re.compile(r"\(\s*(HOST|PORT|SERVICE_NAME|SID)\s*=\s*([^)\s]+)\s*\)", re.I)
 
@@ -63,8 +65,13 @@ def describe_oracle_url(url: str) -> str:
             parts.append(key)
     if re.search(r"PROTOCOL\s*=\s*TCPS", text, re.I):
         parts.append("TCPS")
-    if re.match(r"^jdbc:oracle:thin:[^@]+@", text):
+    if re.match(r"^jdbc:oracle:thin:[^@]+@", text, re.I):
         parts.append("credentials before @")
+    # Structure only: each word becomes w and each number becomes N.
+    template = re.sub(r"[A-Za-z0-9_\-]+",
+                      lambda m: "N" if m.group().isdigit() else "w",
+                      text.split("@", 1)[-1])
+    parts.append(f"form @{template}")
     return ", ".join(parts)
 
 
@@ -73,7 +80,7 @@ def parse_oracle_url(url: str) -> tuple:
     text = url.strip()
     match = ORACLE_URL.match(text)
     if match:
-        return match["host"], int(match["port"]), match["service"]
+        return match["host"], int(match["port"] or 1521), match["service"]
     values = {}
     for key, value in TNS_KEY.findall(text):
         values.setdefault(key.upper(), []).append(value)
