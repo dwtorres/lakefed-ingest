@@ -4,6 +4,9 @@ Pure string builders (no database access) — unit-tested in tests/synthetic_tes
 INSIDE SQL Server with set-based INSERT ... SELECT over a numbers source, so nothing is pushed over
 the network row by row. Values are deterministic functions of the row number ``n`` and the table's
 seed, so a rebuild yields the same data.
+
+Fixture only: the Change Tracking statements build the shared test database. The engine has no
+Change Tracking code path (FR-001).
 """
 from __future__ import annotations
 

@@ -1,25 +1,13 @@
 # Lakebase schema
 
-All state for the default version lives in one Lakebase (Postgres) database, schema
-`lakefed_ingest`. The DDL is [`src/lakefed_ingest/lakebase_schema.sql`](../src/lakefed_ingest/lakebase_schema.sql),
-applied by the `lakefed_ingest_setup` job on a new deployment and migrated by the first ingestion run
-after an upgrade (see `schema_version` below). The database is registered in Unity Catalog
-(default catalog `lakefed_ingest_lakebase`), so every table below can be queried from a SQL warehouse
-as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitoring.md)).
-
-| Table | Role | Written by |
-|---|---|---|
-| `control` | **Configuration.** One row per source table to ingest | You (load control rows) |
-| `checkpoint` | **State.** Where each table is: phase, resume position, status, freshness | The ingestion job |
-| `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
-| `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
-| `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
-| `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
+All state lives in one Lakebase (Postgres) database, schema `lakefed_cursor`. The file
+`src/lakefed_ingest/lakebase_schema.sql` holds the DDL. `state_store.SCHEMA_VERSION` is 2. The
+job cluster reads and writes the tables through `psycopg` with an SDK-minted OAuth token. The
+database is registered in Unity Catalog as `lakefed_cursor_lakebase` for DBSQL reads.
 
 ```mermaid
 erDiagram
     control ||--o| checkpoint : "control_id"
-    control ||--o{ reseed_queue : "control_id"
     control ||--o{ ingest_event : "control_id"
     ingest_run ||--o{ ingest_event : "run_id"
 
@@ -35,12 +23,15 @@ erDiagram
         text sink_schema
         text sink_table
         text client_id
-        text client_attrs
-        text write_mode
         text load_type
         text primary_key
         text select_list
-        text cursor_column
+        text cursor_expression
+        text cursor_kind
+        int cursor_lookback_s
+        text null_cursor_policy
+        text delete_mode
+        int delete_min_interval_s
         boolean task_enabled
     }
     checkpoint {
@@ -49,17 +40,10 @@ erDiagram
         text position
         text phase
         text status
+        text detail
         text select_list
-        bigint ct_begin_version
-        text pending_position
-        bigint pending_run_id
         timestamptz last_success_at
-    }
-    reseed_queue {
-        bigserial id PK
-        bigint control_id
-        text reason
-        timestamptz enqueued_at
+        timestamptz last_delete_snapshot_at
     }
     ingest_run {
         bigserial run_id PK
@@ -70,6 +54,7 @@ erDiagram
         int failed
         int skipped
         int reseeded
+        text detail
     }
     ingest_event {
         bigserial id PK
@@ -78,185 +63,197 @@ erDiagram
         text action
         text stage
         text status
+        bigint rows_read
         bigint rows_merged
         text position_from
         text position_to
         text error
+        int retry_count
     }
 ```
 
-The diagram shows the key columns only; the full lists are below. The relationships are logical
-(by id) and not enforced with foreign keys. Deleting a `control` row leaves its checkpoint and
-history behind, which is harmless: a row added again later gets a new `id`, so it seeds from
-scratch.
+The diagram shows the key columns. The full lists are below. The relationships are logical, by id.
+No foreign key enforces them. A deleted `control` row leaves its checkpoint and history behind. A
+row added again later gets a new `id`, so it seeds from the start.
 
-## `control` — what to ingest
+## `control`: what to ingest
 
-One row per (source database, table). You maintain it; the job only reads it (one query per run,
-for the run's `task_collection`). See "Control rows" in the [README](../README.md) and
-`notebooks/load_control_example.ipynb`.
-
-| Column | Meaning |
-|---|---|
-| `id` | Primary key. Checkpoints and telemetry refer to it as `control_id` |
-| `task_collection` | Which run ingests this row. One job run = one collection |
-| `task_enabled` | `false` skips the row without deleting its state |
-| `tier`, `priority` | Order within a run (`tier`, then `priority`, then `id`) |
-| `src_type` | Source adapter: `sqlserver` \| `oracle` \| `postgresql` \| `mysql` |
-| `src_host`, `src_port` | Source server; NULL port = the engine's default |
-| `src_database`, `src_schema`, `src_table` | Source table (Oracle: `src_database` is the service name) |
-| `secret_key` | Secret (in the job's secret scope) holding JSON `{"user", "password"}` for this database |
-| `use_remote_query` | `true`: read through the Unity Catalog connection in `src_connection` (`remote_query`) instead of Spark JDBC; `src_host`, `src_port` and `secret_key` aren't used then. Default `false` |
-| `src_connection` | The connection read through when `use_remote_query` is `true`. Otherwise only a fallback for the host when `src_host` is NULL |
-| `jdbc_options` | Optional JSON object of extra Spark JDBC read options |
-| `select_list` | Explicit, comma-separated columns to copy (`*` isn't supported). Adding a column reseeds the table |
-| `primary_key` | Comma-separated; required for `ct`, `cursor` and `cdc` (MERGE key) |
-| `sink_catalog`, `sink_schema`, `sink_table` | Target Delta table |
-| `client_id` | Optional. Set it to share one sink across many source databases; written to the sink column `__client_id__` |
-| `client_attrs` | Optional JSON object `{column: value}`: identity columns written (as STRING) on every row, e.g. the tenant name or source server |
-| `write_mode` | `merge` (default): the sink mirrors the source table. `append` (`ct` and `full`): the sink is a change log (see "Append sinks" in the [README](../README.md)) |
-| `load_type` | Load strategy: `ct` \| `cursor` \| `full` (`cdc` is a placeholder) |
-| `cursor_column` | `cursor` only: the high-watermark column (rowversion recommended) |
-| `load_partitioned`, `partition_col`, `partition_size_mb` | Optional partitioned seed / full load for large tables |
-| `ct_enabled` | Informational for `ct` rows; the job checks Change Tracking on the source itself |
-| `cdc_capture_instance` | Reserved for the placeholder `cdc` strategy |
-| `job_name`, `src_catalog`, `warehouse_id`, `enable_iceberg_reads`, `sink_cluster_cols`, `source_instance_group` | Not used by this version (shared with the job orchestration version, or reserved). Leave NULL / default |
-
-**Constraints.** CHECK constraints reject invalid combinations, for example:
-- `ct` on a source other than SQL Server, or without a primary key;
-- `cursor` without `cursor_column`;
-- partitioned settings that are incomplete;
-- `jdbc_options` or `client_attrs` that isn't a JSON object;
-- `use_remote_query` without `src_connection`;
-- a malformed `client_id`;
-- `write_mode` other than `merge` / `append`, or `append` with a load type other than `ct` / `full`.
-
-A unique index allows only one row per sink, or one row per (sink, `client_id`) for shared sinks,
-so two rows can never overwrite each other's data.
-
-## `checkpoint` — where each table is
-
-One row per control row (`control_id` is the primary key), created on the table's first run and
-updated after every successful write. The job reads all of a collection's checkpoints in one query
-at the start of a run.
+One row per (source database, table). You maintain it. The job reads it once per run, for the run
+`task_collection`. See "Control rows" in the [README](../README.md),
+`specs/001-cursor-only-engine/contracts/control_row.md`, and `notebooks/load_control_example.ipynb`.
 
 | Column | Meaning |
 |---|---|
-| `control_id` | The control row this state belongs to |
-| `src_database`, `src_schema`, `src_table` | Copied from control, for readability |
-| `strategy` | Load strategy that wrote the row (`ct`, `cursor`, `full`). A different `load_type` in control means a reseed |
-| `phase` | `seeding` (needs a full copy) → `incremental` (seeded; applying increments, for `ct` and `cursor`); `loaded` for `full` |
-| `position` | Resume point, owned by the strategy. `ct`: the source database's CT version. `cursor`: JSON `{"col", "type", "value"}` (the watermark). `full`: NULL |
-| `status`, `detail` | `ok` or `failed`, with the last error in `detail` |
-| `select_list` | Columns the sink was last written with; compared with `control.select_list` to detect added columns |
-| `ct_begin_version` | `ct`: the table's Change Tracking begin version at seed time. A change means CT was turned off and on, so the table reseeds |
-| `pending_position`, `pending_run_id` | Append sinks (`ct`): set just before a change or seed append, to the position it reaches and the run writing it; cleared when the checkpoint advances. Set at the start of a run means the last run stopped in between: the job checks the sink for that run's rows before doing anything else with the table. A `full` append isn't marked: each run appends one complete snapshot tagged with its `__run_id`, so a run that stopped after its commit leaves a complete snapshot and the next run appends its own |
-| `last_success_at` | When the table last ingested successfully, used for freshness and lag |
-| `updated_at` | Last change to this row |
+| `id` | primary key. Checkpoints and telemetry refer to it as `control_id` |
+| `task_collection` | the run that ingests this row. One run is one collection |
+| `task_enabled` | `false` skips the row and keeps its state |
+| `tier`, `priority` | order inside a run: `tier`, then `priority`, then `id` |
+| `src_type` | source adapter: `sqlserver`, `oracle`, `postgresql`, `mysql` |
+| `src_host`, `src_port` | source server. A NULL port means the engine default |
+| `src_database`, `src_schema`, `src_table` | source table. Oracle: `src_database` is the service name |
+| `secret_key` | key in scope `lakefed-cursor` of the secret JSON for this database. See `contracts/secret_json.md` |
+| `use_remote_query` | `true`: read through the UC connection in `src_connection` with `remote_query`. `src_host`, `src_port` and `secret_key` are not used then. Default `false` |
+| `src_connection` | the UC connection for `use_remote_query`. With `src_host` NULL, the host fallback |
+| `jdbc_options` | optional JSON object of extra Spark JDBC read options |
+| `select_list` | comma-separated columns to copy. `*` is not supported. An added column reseeds the table |
+| `primary_key` | comma-separated. Required for `cursor`. The MERGE key |
+| `sink_catalog`, `sink_schema`, `sink_table` | target Delta table |
+| `client_id` | optional. Set it to share one sink across many source databases. Written to sink column `__client_id__` |
+| `client_attrs` | optional JSON object `{column: value}`. Each value is written as a STRING column on every row |
+| `load_type` | load strategy: `cursor` (default) or `full` |
+| `cursor_expression` | `cursor` only. One SQL expression in the source dialect over one to three columns of one type. `GREATEST` and `COALESCE` only |
+| `cursor_kind` | `cursor` only. `rowversion`, `db_timestamp`, `app_timestamp`, or `identity` |
+| `cursor_lookback_s` | `cursor` only. Lookback in seconds for a temporal kind. NULL means the job parameter `cursor_lookback_s` |
+| `null_cursor_policy` | `reject` (default) fails a nullable input column. `seed_only` allows it. The seed copies a row with a NULL expression, and no increment reads it |
+| `delete_mode` | `none` (default) or `pk_snapshot`. `soft_column` and `full_compare` are reserved and fail at plan time |
+| `delete_min_interval_s` | seconds between PK snapshots. NULL means 86400 |
+| `load_partitioned`, `partition_col`, `partition_size_mb` | optional partitioned seed or full load for large tables |
 
-**Lifecycle.** Checkpoints only move forward after the Delta commit succeeds, so a failure never
-skips data; the next run redoes that window and the MERGE is idempotent.
+**Constraints.** CHECK constraints reject invalid rows:
+
+| Name | Rule |
+|---|---|
+| `valid_load_type` | `load_type in ('cursor', 'full')` |
+| `valid_src_type` | `src_type in ('sqlserver', 'oracle', 'postgresql', 'mysql')` |
+| `valid_cursor_kind` | `cursor_kind` is NULL or one of the four kinds |
+| `valid_delete_mode` | `delete_mode in ('none', 'soft_column', 'pk_snapshot', 'full_compare')` |
+| `valid_null_cursor_policy` | `null_cursor_policy in ('reject', 'seed_only')` |
+| `valid_cursor_metadata` | a `cursor` row has `primary_key`, `cursor_expression` and `cursor_kind` |
+| `valid_full_metadata` | a `full` row has no `cursor_expression` and no `cursor_kind` |
+| `valid_source` | `src_host` or `src_connection` is set |
+| `valid_remote_query` | `use_remote_query` needs `src_connection` |
+| `valid_intervals` | `cursor_lookback_s` and `delete_min_interval_s` are NULL or at least 0 |
+| `valid_partitioning` | partitioned settings are complete |
+| `valid_jdbc_options`, `valid_client_attrs` | the value is a JSON object |
+| `valid_client_id` | `client_id` matches `^[A-Za-z0-9_.:-]{1,128}$` |
+
+The unique index `control_sink_client_uq` allows one row per (sink, `client_id`). A dedicated sink
+has one row. Two rows can never overwrite each other's data.
+
+The columns `job_name`, `src_catalog`, `enable_iceberg_reads`, `sink_cluster_cols`,
+`source_instance_group`, `warehouse_id`, `ct_enabled` and `cdc_capture_instance` of the root version
+are dropped. Two more root version cursor columns are dropped, replaced by `cursor_expression`,
+`cursor_kind` and `delete_mode`.
+
+## `checkpoint`: where each table is
+
+One row per control row. `control_id` is the primary key. The first run creates the row. Every
+successful write updates it. The job reads all checkpoints of a collection in one query at the start
+of a run.
+
+| Column | Meaning |
+|---|---|
+| `control_id` | the control row this state belongs to |
+| `src_database`, `src_schema`, `src_table` | copied from control, for readability |
+| `strategy` | `cursor` or `full`. A different `load_type` in control means a reseed |
+| `phase` | `seeding`, then `incremental` for `cursor`. `loaded` for `full` |
+| `position` | `cursor`: JSON `{"expr", "kind", "type", "value"}`. `full`: NULL. See `contracts/position.md` |
+| `status`, `detail` | `ok`, `running`, `failed` or `quarantined`. `detail` holds the last error or note, for example `alert=max_above_clock` |
+| `select_list` | the columns the sink was last written with. A difference from `control.select_list` reseeds |
+| `last_success_at` | last successful ingest. Used for freshness and lag |
+| `last_delete_snapshot_at` | last PK snapshot for `delete_mode` `pk_snapshot`. NULL means never |
+| `updated_at` | last change to this row |
+
+**Position.** `expr` is the `cursor_expression` text at the last seed. `kind` is the `cursor_kind`
+at the last seed. `type` is the source type of the expression result. `value` is digits for a
+numeric type, ISO 8601 for a temporal type, a decimal integer for rowversion. A position with a
+different `expr` or `kind` than the control row reseeds the table. The position never moves
+backwards.
+
+**Lifecycle.** The checkpoint moves forward only after the Delta commit succeeds. A failure never
+skips data. The next run reads the window again, and the MERGE is idempotent.
 
 ```mermaid
 stateDiagram-v2
     [*] --> seeding: first run (no checkpoint)
-    seeding --> incremental: seed committed (ct, cursor)
+    seeding --> incremental: seed committed (cursor)
     seeding --> loaded: full load committed (full)
-    incremental --> incremental: increment committed, or unchanged
-    incremental --> seeding: reseed needed
+    incremental --> incremental: increment committed, quiet, or snapshot done
+    incremental --> seeding: expression, kind, or select_list changed
     loaded --> loaded: reload every run
 ```
 
-A table reseeds when Change Tracking retention lapsed, CT was turned off or re-enabled on it,
-`select_list` gained columns, `cursor_column` changed, or `load_type` changed.
+A table reseeds in three cases: `select_list` gained columns, `cursor_expression` or `cursor_kind`
+changed, or `load_type` changed. The reseed sets `phase` to `seeding` and `detail` to
+`reseed_queued`.
 
-**Forcing a reseed.** Set the phase back to `seeding`; the next run copies the table again:
+**Force a reseed.** Set the phase back to `seeding`. The next run copies the table again:
 
 ```sql
-update lakefed_ingest.checkpoint set phase = 'seeding' where control_id in (...);
+update lakefed_cursor.checkpoint set phase = 'seeding' where control_id in (...);
 ```
 
-## `reseed_queue` — reseed log
+## `ingest_run`: one row per run
 
-One row every time the job queues a reseed: the table, its `control_id`, `reason`
-(`retention_miss`, `schema_change`, `ct_disabled`, `ct_reenabled`, `ct_version_reset`) and
-`enqueued_at`. It's an audit log. The reseed itself happens because the same step sets the
-checkpoint's phase to `seeding`. `processed` / `processed_at` are reserved and not currently set.
-
-## `ingest_run` — one row per run
-
-Inserted when a run starts (`status = 'running'`) and finalized when it ends.
+The run start inserts the row with `status = 'running'`. The run end updates it.
 
 | Column | Meaning |
 |---|---|
-| `run_id` | Primary key; `ingest_event.run_id` refers to it |
-| `task_collection` | Collection the run ingested |
-| `job_run_id`, `cluster_id` | The Databricks job run and cluster, for cross-referencing the Jobs UI |
-| `parallelism` | The run's concurrency budget |
-| `started_at`, `finished_at` | Timing |
-| `status` | `running` → `completed` \| `failed` (any table failed); `skipped` when another run of the same collection held the lock |
-| `total`, `ok`, `failed` | Table counts |
-| `skipped` | Tables that were unchanged (nothing to read) |
-| `reseeded` | Tables queued for a reseed |
-| `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted), and table retry totals (`table_retries`) |
+| `run_id` | primary key. `ingest_event.run_id` refers to it |
+| `task_collection` | the collection the run ingested |
+| `job_run_id`, `cluster_id` | the Databricks job run and cluster, for the Jobs UI |
+| `parallelism` | the run concurrency budget |
+| `started_at`, `finished_at` | timing |
+| `status` | `running`, then `completed`, `failed` (a table failed), or `skipped` (another run held the lock) |
+| `total`, `ok`, `failed` | table counts |
+| `skipped` | quiet tables, nothing to read |
+| `reseeded` | tables set to reseed |
+| `detail` | JSON: planning counts per route, timings, peak concurrency, `source_caps` with `max_queries_per_source` set, `table_retries` totals |
 
-## `ingest_event` — one row per table per run
+## `ingest_event`: one row per table per run
 
-Inserted when a table starts (`status = 'running'`) and updated when it finishes. Tables that fail
-before any work (stage `plan` or `detect`) also get a `failed` event. CT tables that skip-no-change
-finds unchanged don't get an event: they're advanced in bulk, counted in `ingest_run.skipped`, and
-their `checkpoint.last_success_at` is still stamped. Cursor tables always get one, with no rows
-when the watermark hasn't moved.
+The table start inserts the row with `status = 'running'`. The table finish updates it. A table that fails
+at stage `plan` also gets a `failed` event. A quiet cursor table gets no event. Its checkpoint
+advances in bulk, `ingest_run.skipped` counts it, and its `last_success_at` is stamped. One event per
+source database records the batched `MAX` capture.
 
 | Column | Meaning |
 |---|---|
-| `id` | Primary key |
-| `run_id`, `task_collection`, `control_id` | Which run and which control row |
-| `src_database`, `src_schema`, `src_table`, `sink_fqn` | Source and target, copied for convenience |
-| `action` | `seed`, `increment`, `reseed` or `full` |
-| `phase` | Checkpoint phase when the table started |
-| `stage` | How far it got: `plan`, `detect`, `verify` (checking a pending append), `ensure_sink`, `read`, `seed`, `merge`, `load`, `checkpoint`. On a failure, this is where it failed |
-| `status` | `running` → `ok` \| `failed`; `skipped` for a reseed that was only queued (no data copied); `retried` for an attempt that failed and was tried again in the same run (`table_retries`), so the table has a later row for its next attempt |
-| `started_at`, `finished_at`, `duration_ms` | Timing |
-| `rows_read`, `rows_merged` | Row counts from the Delta commit metrics (NULL when the runtime doesn't report them) |
-| `position_from`, `position_to` | Checkpoint position before and after (CT version, or cursor value) |
-| `pool` | Spark FAIR pools the table's work ran in |
-| `error` | Error message for a failed or retried attempt, with its deepest Java cause when Spark's message leaves it out |
-| `retry_count` | Earlier attempts of this table in the run: 0 for the first, 1 for the first retry. Write-conflict retries inside an attempt are logged in the job output only |
+| `id` | primary key |
+| `run_id`, `task_collection`, `control_id` | the run and the control row |
+| `src_database`, `src_schema`, `src_table`, `sink_fqn` | source and target, copied for convenience |
+| `action` | `seed`, `increment`, `reseed`, `full`, or `capture` |
+| `phase` | the checkpoint phase at the table start |
+| `stage` | how far it got: `plan`, `capture`, `ensure_sink`, `read`, `seed`, `merge`, `load`, `snapshot`, `checkpoint`. On a failure, where it failed |
+| `status` | `running`, then `ok` or `failed`. `skipped` for a reseed only set, or a capture event. `retried` for an attempt tried again in the same run |
+| `started_at`, `finished_at`, `duration_ms` | timing |
+| `rows_read`, `rows_merged` | row counts from the Delta commit metrics. A runtime that reports none leaves NULL. A capture event stores the captured table count in `rows_read` |
+| `position_from`, `position_to` | position JSON before and after |
+| `pool` | Spark FAIR pool the table ran in |
+| `error` | error message of a failed or retried attempt, with its deepest Java cause |
+| `retry_count` | earlier attempts of this table in the run. 0 for the first |
 
-Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
-(see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
+Telemetry tables grow with every run. To keep long-term history, snapshot them to Delta (see
+[monitoring.md](monitoring.md)) and prune old rows from Lakebase.
 
-## `schema_version` — schema versions applied
+## `schema_version`: schema versions applied
 
-One row per version (`state_store.SCHEMA_VERSION`) applied: `version`, `applied_at`, `applied_by`.
-An ingestion run whose code needs a newer version than the newest row applies the DDL and pending
-renames first, in one transaction, under an advisory lock (so runs of other collections wait for it
-rather than migrating twice); a failure changes nothing. A database without the table (deployed
-before versions were recorded) counts as version 0.
+One row per `state_store.SCHEMA_VERSION` applied: `version`, `applied_at`, `applied_by`. A run whose
+code needs a newer version than the newest row applies the DDL first, in one transaction, under an
+advisory lock. Runs of other collections wait for it. A failure changes nothing. A database without
+the table counts as version 0.
 
 ## Changing the schema
 
-An upgrade doesn't run only the new statements: it re-applies the whole of `lakebase_schema.sql`, plus
-the pending `state_store.RENAMES`, to a database at any earlier version. So every statement must be:
+An upgrade re-applies the whole of `lakebase_schema.sql`, plus the pending `state_store.RENAMES`,
+to a database at any earlier version. Every statement must be:
 
-- **Idempotent:** safe to run again. Use `create ... if not exists`, `add column if not exists`, and
-  `drop constraint if exists` right before `add constraint`. A backfill (`update`) must be a no-op
-  once applied, for example `where control_id is null`.
-- **Additive:** no `drop table`, `drop column` or `truncate`. A change that can't be written this way
-  (a destructive change, a one-time step for one version) needs a per-version migration step, which
-  the framework doesn't have yet.
-- **Valid from any earlier version:** the statement may run on a database several versions behind.
-- **Valid in a transaction:** no `CREATE INDEX CONCURRENTLY`, no `DO $$` blocks.
+- **Idempotent.** Use `create ... if not exists`, `add column if not exists`, and
+  `drop constraint if exists` before `add constraint`. A backfill must be a no-op once applied.
+- **Additive.** No `truncate`. A `drop column if exists` or `drop table if exists` is allowed only
+  after review. List it in `REVIEWED_NON_ADDITIVE`. The root version columns above are dropped this
+  way, and so is the table `reseed_queue`.
+- **Valid from any earlier version.** The statement can run on a database several versions behind.
+- **Valid in a transaction.** No `CREATE INDEX CONCURRENTLY`. No `DO $$` blocks.
 
-Renames go in `state_store.RENAMES`, which runs only the ones still pending. Prefer adding a column over
-renaming one: add the new column, write both, move the readers, and drop the old one in a later version.
+Renames go in `state_store.RENAMES`. Only the pending ones run. `RENAMES` is empty at version 2.
+Prefer a new column over a rename.
 
-`tests/state_store_test.py` enforces this with no database. `test_ddl_statements_are_safe_to_re_apply`
-checks each statement's form. A statement that changes an existing column or rows (`alter column`,
-`update`) must be reviewed as a no-op once applied and listed in `REVIEWED_NON_ADDITIVE`. Then bump
-`state_store.SCHEMA_VERSION` and add the new fingerprint to `SCHEMA_FINGERPRINTS`; the test says what to add.
+`tests/state_store_test.py` enforces this with no database. The test `ddl_problems` checks the form
+of each statement. A statement that changes an existing column or rows needs a `REVIEWED_NON_ADDITIVE`
+entry. Then bump `state_store.SCHEMA_VERSION` and add the new fingerprint to `SCHEMA_FINGERPRINTS`.
+The test says what to add.
 
-Upgrades that only add columns, tables or indexes are safe while runs are going. A version that renames,
-or adds a constraint to a table the ingestion job writes, can fail tables of a run still on the old code
-(they're redone by the next run): for those, pause schedules or deploy between runs.
+An upgrade that only adds columns, tables or indexes is safe while runs are going. A version that
+renames, or adds a constraint to a table the job writes, can fail tables of a run on the old code.
+The next run redoes them. For those versions, pause the schedules or deploy between runs.

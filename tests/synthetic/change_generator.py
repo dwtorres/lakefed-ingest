@@ -25,12 +25,12 @@ for name, default in [("host", ""), ("port", "1433"), ("trust_server_certificate
                       ("database", ""), ("secret_scope", ""), ("secret_key", ""),
                       ("scale_factor", "0.1"), ("seed", "42"), ("fraction", "0.05"), ("change_seed", "1"),
                       ("inserts", "10"), ("updates", "10"), ("deletes", "2"), ("threads", "8"),
-                      ("run_label", ""), ("manifest_table", "")]:
+                      ("run_label", ""), ("manifest_table", ""), ("tables", "")]:
     dbutils.widgets.text(name, default)
 W = {k: dbutils.widgets.get(k) for k in ["host", "port", "trust_server_certificate", "database",
                                          "secret_scope", "secret_key", "scale_factor",
                                          "seed", "fraction", "change_seed", "inserts", "updates", "deletes",
-                                         "threads", "run_label", "manifest_table"]}
+                                         "threads", "run_label", "manifest_table", "tables"]}
 assert W["host"] and W["database"] and W["secret_scope"] and W["secret_key"] and W["manifest_table"], \
     "host/database/secret_*/manifest_table required"
 RUN = W["run_label"] or datetime.now(timezone.utc).strftime("chg-%Y%m%dT%H%M%S")
@@ -63,7 +63,14 @@ def conn():
 
 SF = float(W["scale_factor"])
 catalog = sc.build_catalog(int(W["seed"]))
-picked = ch.pick_tables(catalog, SF, float(W["fraction"]), int(W["change_seed"]))
+if W["tables"]:
+    by_name = {t.name: t for t in catalog}
+    wanted = [n.strip() for n in W["tables"].split(",") if n.strip()]
+    unknown = sorted(set(wanted) - set(by_name))
+    assert not unknown, f"unknown tables: {unknown}"
+    picked = [by_name[n] for n in wanted]
+else:
+    picked = ch.pick_tables(catalog, SF, float(W["fraction"]), int(W["change_seed"]))
 st0 = conn().createStatement()
 rs = st0.executeQuery("SELECT compatibility_level AS c FROM sys.databases WHERE name = DB_NAME()")
 rs.next(); use_gs = int(rs.getString(1)) >= 160; st0.close()

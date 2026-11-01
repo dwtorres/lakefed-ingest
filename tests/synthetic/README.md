@@ -6,7 +6,7 @@ that the ingested Delta tables match the source.
 
 | File | What it does |
 |---|---|
-| `build_synth_db.py` (notebook) | Creates 1,800 tables, loads deterministic data, then enables CT on the database and every table |
+| `build_synth_db.py` (notebook) | Creates 1,800 tables, loads deterministic data, then enables CT on the database and every table when `enable_change_tracking` is `true` |
 | `change_generator.py` (notebook) | Inserts, updates and deletes rows in a seeded sample of the tables; writes a manifest of what it changed |
 | `reconcile.py` (notebook) | Compares source and sink for the manifest's tables (or all tables) and reports mismatches |
 | `synth_catalog.py` | The table catalog: names, columns, primary keys and row counts (pure Python) |
@@ -58,6 +58,8 @@ notebooks with these widgets (all three share the connection widgets):
 | `secret_scope`, `secret_key` | (required) | The credential secret |
 | `seed` | `42` | Catalog and data seed; keep it the same across all three notebooks |
 | `scale_factor` | `0.1` | Size (see above); keep it the same across build and changes |
+| `tables` | (empty) | Comma list of table names for build and changes. Empty means every table. An unknown name fails the run |
+| `enable_change_tracking` | `true` | Build only. `false` skips the Change Tracking step, for cursor-only sources |
 
 1. **Build:** run `build_synth_db`. Its other widgets are `threads` (12), `batch_rows` (1,000,000) and
    `ct_retention_days` (3). It's safe to rerun: a table that already has the expected row count is skipped, and a partial one

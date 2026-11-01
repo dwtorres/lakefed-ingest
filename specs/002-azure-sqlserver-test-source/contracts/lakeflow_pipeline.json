@@ -1,0 +1,29 @@
+{
+  "name": "lakefed_baseline_sqlserver_t012a",
+  "serverless": true,
+  "continuous": false,
+  "catalog": "my_catalog",
+  "target": "lakefed_cursor_devtest",
+  "ingestion_definition": {
+    "connection_name": "lakefed_sqlserver_test",
+    "objects": [
+      {
+        "table": {
+          "source_catalog": "lakefed_test",
+          "source_schema": "dbo",
+          "source_table": "doc_attachment_079",
+          "destination_catalog": "my_catalog",
+          "destination_schema": "lakefed_cursor_devtest",
+          "destination_table": "sqlserver_baseline_doc_attachment_079",
+          "table_configuration": {
+            "primary_keys": ["id"],
+            "query_based_connector_config": {
+              "cursor_columns": ["row_version"],
+              "hard_deletion_sync_min_interval_in_seconds": 60
+            }
+          }
+        }
+      }
+    ]
+  }
+}

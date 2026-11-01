@@ -135,3 +135,18 @@ def test_compare_checks_normalizes_numbers():
                              {"n": 5, "pk_sum": 15, "col_agg": 12.5}) == []
     assert ch.compare_checks({"n": "5", "pk_sum": "15", "col_agg": "1"},
                              {"n": 4, "pk_sum": 15, "col_agg": 2}) == ["n", "col_agg"]
+
+
+# ---- reconcile (tests/synthetic/reconcile.py compares these aggregates per table) ------------------
+
+def test_compare_checks_is_empty_when_the_aggregates_match():
+    import synth_changes as ch
+    src = {"n": "2", "pk_sum": "3", "col_agg": "1.50"}
+    assert ch.compare_checks(src, {"n": 2, "pk_sum": 3, "col_agg": 1.5}) == []
+
+
+def test_compare_checks_names_every_aggregate_that_differs():
+    import synth_changes as ch
+    src = {"n": "2", "pk_sum": "3", "col_agg": "x"}
+    assert ch.compare_checks(src, {"n": 3, "pk_sum": "3", "col_agg": "y"}) == ["n", "col_agg"]   # missed row, stale value
+    assert ch.compare_checks(src, {"n": "2", "pk_sum": None, "col_agg": "x"}) == ["pk_sum"]

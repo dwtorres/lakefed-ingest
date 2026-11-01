@@ -12,6 +12,9 @@
 # MAGIC JSON `{"user": ..., "password": ...}` — supply host/database/scope/key as widget values
 # MAGIC (`port` and `trust_server_certificate` are optional). Works with Azure SQL Database, SQL Server on a
 # MAGIC VM, or on-premises SQL Server; see `README.md` in this folder.
+# MAGIC
+# MAGIC `tables` limits the build to a comma list of table names. `enable_change_tracking=false`
+# MAGIC skips the Change Tracking step.
 
 # COMMAND ----------
 
@@ -28,11 +31,13 @@ import synth_sql as ps
 for name, default in [("host", ""), ("port", "1433"), ("trust_server_certificate", "false"),
                       ("database", ""), ("secret_scope", ""), ("secret_key", ""),
                       ("scale_factor", "0.1"), ("threads", "12"), ("seed", "42"),
-                      ("batch_rows", "1000000"), ("ct_retention_days", "3")]:
+                      ("batch_rows", "1000000"), ("ct_retention_days", "3"),
+                      ("tables", ""), ("enable_change_tracking", "true")]:
     dbutils.widgets.text(name, default)
 W = {k: dbutils.widgets.get(k) for k in ["host", "port", "trust_server_certificate", "database",
                                          "secret_scope", "secret_key", "scale_factor",
-                                         "threads", "seed", "batch_rows", "ct_retention_days"]}
+                                         "threads", "seed", "batch_rows", "ct_retention_days",
+                                         "tables", "enable_change_tracking"]}
 assert W["host"] and W["database"] and W["secret_scope"] and W["secret_key"], "host/database/secret_* required"
 SF, THREADS, SEED, BATCH = float(W["scale_factor"]), int(W["threads"]), int(W["seed"]), int(W["batch_rows"])
 
@@ -107,6 +112,11 @@ query("SELECT 1 AS warm")                               # wakes a paused serverl
 compat = int(query("SELECT compatibility_level AS c FROM sys.databases WHERE name = DB_NAME()")[0]["c"])
 use_gs = compat >= 160
 catalog = pc.build_catalog(SEED)
+if W["tables"]:
+    wanted = [n.strip() for n in W["tables"].split(",") if n.strip()]
+    unknown = sorted(set(wanted) - {t.name for t in catalog})
+    assert not unknown, f"unknown tables: {unknown}"
+    catalog = [t for t in catalog if t.name in wanted]
 existing = {r["table_name"]: int(r["row_count"]) for r in query(ps.ROW_COUNTS_SQL)}
 print(f"compat={compat} generate_series={use_gs} existing_tables={len(existing)} scale={SF}")
 
@@ -142,14 +152,15 @@ t_load = time.time() - t0
 # COMMAND ----------
 
 # Change Tracking AFTER the bulk load (enabling it first would track every generated row).
-ct_db = int(query("SELECT COUNT(*) AS n FROM sys.change_tracking_databases WHERE database_id = DB_ID()")[0]["n"])
-if not ct_db:
-    execute(ps.enable_ct_database_sql(W["database"], int(W["ct_retention_days"])))
-ct_have = {r["table_name"] for r in query(ps.CT_TABLES_SQL)}
-todo = [t for t in catalog if t.name not in ct_have and t.name not in {x["table"] for x in failures}]
-with ThreadPoolExecutor(max_workers=THREADS) as ex:
-    for f in as_completed([ex.submit(execute, ps.enable_ct_table_sql(t)) for t in todo]):
-        f.result()
+CT_DB_SQL = "SELECT COUNT(*) AS n FROM sys.change_tracking_databases WHERE database_id = DB_ID()"
+if W["enable_change_tracking"].lower() == "true":
+    if not int(query(CT_DB_SQL)[0]["n"]):
+        execute(ps.enable_ct_database_sql(W["database"], int(W["ct_retention_days"])))
+    ct_have = {r["table_name"] for r in query(ps.CT_TABLES_SQL)}
+    todo = [t for t in catalog if t.name not in ct_have and t.name not in {x["table"] for x in failures}]
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for f in as_completed([ex.submit(execute, ps.enable_ct_table_sql(t)) for t in todo]):
+            f.result()
 
 # COMMAND ----------
 
@@ -166,6 +177,7 @@ summary = {
     "tables_in_catalog": len(catalog), "tables_present": sum(1 for t in catalog if t.name in counts),
     "built": sum(1 for r in results if r[1] == "built"), "skipped": sum(1 for r in results if r[1] == "skipped"),
     "failed": failures[:20], "row_count_mismatches": mismatch[:20], "mismatch_count": len(mismatch),
+    "ct_db": int(query(CT_DB_SQL)[0]["n"]),
     "ct_tables": len(ct_tables & {t.name for t in catalog}), "rows_by_archetype": by_arch,
     "total_rows": sum(counts.get(t.name, 0) for t in catalog),
     "db_size_mb": float(query(ps.DB_SIZE_MB_SQL)[0]["size_mb"]),
