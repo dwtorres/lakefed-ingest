@@ -5,9 +5,9 @@ domain: lakefed-cursor
 summary: Dependency-ordered task list for the disposable Azure SQL Server test source, Terraform toggle, notebook widgets, live proof, baseline, teardown
 tags: [tasks, azure, sqlserver, terraform, devtest, live-proof, ntlm, entra-id, lakeflow-connect, teardown]
 related: [plan, spec, research, data-model, quickstart, contracts/terraform_toggle, ../001-cursor-only-engine/tasks, ../001-cursor-only-engine/quickstart, ../001-cursor-only-engine/contracts/secret_json, ../../docs/baseline, ../../.specify/memory/constitution]
-status: draft
+status: active
 discovered: 2026-10-31
-verified: false
+verified: true
 workspace: lakefed-cursor
 ---
 
@@ -253,10 +253,13 @@ workspace: lakefed-cursor
 
 WARNING: T056 to T060 delete the VM, its disk, the database, the table, the secrets, and the sink tables. Finish T034, T041, T051, and T052 first.
 
-- [ ] T053 [P] In `specs/001-cursor-only-engine/tasks.md` mark T012a (line 67), T093 (line 376), and T095 (line 378) as `[X]`. Append a link to the matching `docs/baseline.md` section (SC-005).
-- [ ] T054 [P] Check that the `docs/baseline.md` frontmatter follows MOP. Set `verified: true`. Add this feature to `related`.
+- [X] T053 [P] In `specs/001-cursor-only-engine/tasks.md` mark T012a (line 67), T093 (line 376), and T095 (line 378) as `[X]`. Append a link to the matching `docs/baseline.md` section (SC-005).
+  - Result 2026-10-31: marked with links to the three baseline sections.
+- [X] T054 [P] Check that the `docs/baseline.md` frontmatter follows MOP. Set `verified: true`. Add this feature to `related`.
+  - Result 2026-10-31: frontmatter has every MOP field, `verified: true`, feature 002 added to `related`.
   - Fields: `ontology`, `type`, `domain`, `summary`, `tags`, `related`, `status`, `discovered`, `verified`, `workspace`
-- [ ] T055 [P] Hand-check STE in the feature docs and the new `docs/baseline.md` sections. `tests/docs_test.py` does not scan `specs/`. Record the check in the task note. Set `status: active` and `verified: true` in each spec file's frontmatter.
+- [X] T055 [P] Hand-check STE in the feature docs and the new `docs/baseline.md` sections. `tests/docs_test.py` does not scan `specs/`. Record the check in the task note. Set `status: active` and `verified: true` in each spec file's frontmatter.
+  - Result 2026-10-31: scripted check on the four files: no banned word; one 35-word sentence in R-02 split. The other flags were frontmatter and list artifacts. Frontmatter set to `status: active`, `verified: true`.
   - Files: `specs/002-azure-sqlserver-test-source/quickstart.md`, `research.md`, `plan.md`, `tasks.md`
   - Rules: instructions 20 words or fewer, descriptions 25 words or fewer
   - Banned words: `utilize`, `ensure`, `facilitate`, `leverage`, `commence`, `terminate`

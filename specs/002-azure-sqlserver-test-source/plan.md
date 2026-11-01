@@ -5,9 +5,9 @@ domain: lakefed-cursor
 summary: Plan for the disposable Azure SQL Server test source, Terraform in the ding-dong-ditch project, proof runs, teardown
 tags: [plan, azure, sqlserver, terraform, devtest, live-proof, teardown]
 related: [spec, research, data-model, quickstart, contracts/terraform_toggle, ../001-cursor-only-engine/tasks, ../../.specify/memory/constitution]
-status: draft
+status: active
 discovered: 2026-10-31
-verified: false
+verified: true
 workspace: lakefed-cursor
 ---
 

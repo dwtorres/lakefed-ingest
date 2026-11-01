@@ -4,7 +4,7 @@ type: mop
 domain: lakefed-cursor
 summary: Lakeflow Connect query-based baseline per source engine, cost and lag, fixed decision call 13
 tags: [baseline, lakeflow-connect, oracle, sqlserver, devtest, cost, lag]
-related: [../specs/001-cursor-only-engine/quickstart, ../specs/001-cursor-only-engine/plan, ../specs/001-cursor-only-engine/tasks]
+related: [../specs/001-cursor-only-engine/quickstart, ../specs/001-cursor-only-engine/plan, ../specs/001-cursor-only-engine/tasks, ../specs/002-azure-sqlserver-test-source/spec, ../specs/002-azure-sqlserver-test-source/tasks]
 status: complete
 discovered: 2026-10-26
 verified: true

@@ -5,9 +5,9 @@ domain: lakefed-cursor
 summary: Runbook, build the Azure SQL Server test source, prove the cursor engine and the three auth modes, record the baseline, tear down
 tags: [quickstart, runbook, azure, sqlserver, terraform, devtest, teardown]
 related: [plan, research, data-model, contracts/terraform_toggle, ../001-cursor-only-engine/quickstart, ../../docs/baseline]
-status: draft
+status: active
 discovered: 2026-10-31
-verified: false
+verified: true
 workspace: lakefed-cursor
 ---
 

@@ -5,9 +5,9 @@ domain: lakefed-cursor
 summary: Decisions for the disposable Azure SQL Server test source, built with the ding-dong-ditch Terraform project
 tags: [research, azure, sqlserver, terraform, entra-id, ntlm, lakeflow-connect, budget]
 related: [spec, plan, data-model, quickstart, ../../docs/baseline, ../001-cursor-only-engine/contracts/secret_json]
-status: draft
+status: active
 discovered: 2026-10-31
-verified: false
+verified: true
 workspace: lakefed-cursor
 ---
 
@@ -34,9 +34,9 @@ Sources read on 2026-10-31:
 ## R-02 SQL Server platform
 
 - Decision: SQL Server 2022 Developer on Windows Server 2022, Azure Marketplace image
-  `MicrosoftSQLServer` / `sql2022-ws2022` / `sqldev-gen2`, size `Standard_D2ds_v4`, registered with
-  the SQL IaaS Agent extension through `azurerm_mssql_virtual_machine` (`sql_connectivity_type =
-  "PRIVATE"`, port 1433, `sql_license_type = "PAYG"`).
+  `MicrosoftSQLServer` / `sql2022-ws2022` / `sqldev-gen2`, size `Standard_D2ds_v4`. The VM is
+  registered with the SQL IaaS Agent extension through `azurerm_mssql_virtual_machine`
+  (`sql_connectivity_type = "PRIVATE"`, port 1433, `sql_license_type = "PAYG"`).
 - Size: the first apply on 2026-10-31 used `Standard_D2s_v5` and failed. The subscription has 0
   DSv5 cores in eastus and 10 DDSv4 cores, so the VM uses `Standard_D2ds_v4`.
 - Rationale: FR-001 needs a Windows (NTLM) login. Azure SQL Database has no Windows login. A SQL
