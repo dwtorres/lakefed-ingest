@@ -224,16 +224,23 @@ workspace: lakefed-cursor
 
 **Independent Test**: Create the pipeline, run it twice, read the lag and the cost, delete it. `databricks pipelines get <id>` returns not found.
 
-- [ ] T045 [US4] In `TF/terraform.tfvars` set `enable_private_network_gateway = true`. Run `terraform apply`. Follow `TF/docs/private-network-gateway-runbook.md` to attach the devtest workspace. Expected: the NSG from T002 now allows `local.png_gateway_cidr` on 1433 (R-06). Note the extra daily cost against the ceiling.
-- [ ] T046 [US4] Create a UC connection named `lakefed_sqlserver_test` with `databricks connections create --profile ding-dong-ditch`. Pipe the password from the `sqlserver_test_sql` secret.
+- [X] T045 [US4] In `TF/terraform.tfvars` set `enable_private_network_gateway = true`. Run `terraform apply`. Follow `TF/docs/private-network-gateway-runbook.md` to attach the devtest workspace. Expected: the NSG from T002 now allows `local.png_gateway_cidr` on 1433 (R-06). Note the extra daily cost against the ceiling.
+  - Result 2026-10-31: apply 21:54:30 to 21:57:44 EDT, 14 added 3 changed. Gateway `ESTABLISHED`, `ALL_TRAFFIC`, on `ding-dong-ditch-ncc`, the NCC the devtest workspace already binds to. No account console switch needed. NSG gained `allow-sql-2` for `10.0.16.0/28`.
+- [X] T046 [US4] Create a UC connection named `lakefed_sqlserver_test` with `databricks connections create --profile ding-dong-ditch`. Pipe the password from the `sqlserver_test_sql` secret.
+  - Result 2026-10-31: `lakefed_sqlserver_test`, SQLSERVER, `10.0.17.4:1433`, user `lakefed_sql`, password piped from Terraform output.
   - Type `SQLSERVER`, host `<sqlserver_test_host>`, port 1433, `trustServerCertificate` true, user `lakefed_sql`
-- [ ] T047 [US4] Create a query-based ingestion pipeline with `databricks pipelines create --json @<spec> --profile ding-dong-ditch`. Copy the spec shape from the Oracle section of `docs/baseline.md` (lines 23 to 39). Save the spec with no secret value at `specs/002-azure-sqlserver-test-source/contracts/lakeflow_pipeline.json`. Note the pipeline id.
+- [X] T047 [US4] Create a query-based ingestion pipeline with `databricks pipelines create --json @<spec> --profile ding-dong-ditch`. Copy the spec shape from the Oracle section of `docs/baseline.md` (lines 23 to 39). Save the spec with no secret value at `specs/002-azure-sqlserver-test-source/contracts/lakeflow_pipeline.json`. Note the pipeline id.
+  - Result 2026-10-31: pipeline id `e5303890-c006-4396-b01e-c3be376b3e67`. Spec saved in `contracts/lakeflow_pipeline.json` (no secret). Cursor `row_version`, `primary_keys [id]`, hard deletion scan at 60 s.
   - Serverless, triggered, one table object `dbo.doc_attachment_079`, cursor column `row_version`
   - Target `my_catalog.lakefed_cursor_devtest.sqlserver_baseline_doc_attachment_079`
-- [ ] T048 [US4] Seed run: `databricks pipelines start-update <id> --profile ding-dong-ditch`. Expected: target holds 10,058 rows (US4/AC1). Note the wall-clock duration and the lag to the Delta commit time.
-- [ ] T049 [US4] Run `change_generator.py` once more with the T030 widgets and a new `run_label`. Note the change time. Start the pipeline update. Expected: the target shows 10 inserts, 5 updates, 5 deletes (US4/AC2). Note the lag from the change time to the commit time.
-- [ ] T050 [US4] Delete the pipeline: `databricks pipelines delete <id> --profile ding-dong-ditch`. Check: `databricks pipelines get <id> --profile ding-dong-ditch` returns not found (FR-012, US4/AC4). Delete the UC connection `lakefed_sqlserver_test`.
-- [ ] T051 [US4] In `docs/baseline.md` fill section `## SQL Server (T012a)` (line 19). Record date, row counts, the two run durations, the two lags, the pipeline id, and the four FR-011 values. Leave the cost line as "pending billing" until T052.
+- [X] T048 [US4] Seed run: `databricks pipelines start-update <id> --profile ding-dong-ditch`. Expected: target holds 10,058 rows (US4/AC1). Note the wall-clock duration and the lag to the Delta commit time.
+  - Result 2026-10-31: update `f6a0ad5e` COMPLETED, 68 s wall clock, 10,063 rows (source count after US2), MERGE commit 51 s after `start-update`. Needed a DNS A record first: serverless refuses IPv4 literals through the gateway.
+- [X] T049 [US4] Run `change_generator.py` once more with the T030 widgets and a new `run_label`. Note the change time. Start the pipeline update. Expected: the target shows 10 inserts, 5 updates, 5 deletes (US4/AC2). Note the lag from the change time to the commit time.
+  - Result 2026-10-31: `chg-us4` at 22:22:22 EDT. Update COMPLETED in 84 s. Target 10,068: MERGE 10 inserted, MERGE 5 updated, DELETE. Reconcile by id and rowversion: 0 differences. Lag 1 min 41 s.
+- [X] T050 [US4] Delete the pipeline: `databricks pipelines delete <id> --profile ding-dong-ditch`. Check: `databricks pipelines get <id> --profile ding-dong-ditch` returns not found (FR-012, US4/AC4). Delete the UC connection `lakefed_sqlserver_test`.
+  - Result 2026-10-31: pipeline and connection deleted. `pipelines get` returns not found.
+- [X] T051 [US4] In `docs/baseline.md` fill section `## SQL Server (T012a)` (line 19). Record date, row counts, the two run durations, the two lags, the pipeline id, and the four FR-011 values. Leave the cost line as "pending billing" until T052.
+  - Result 2026-10-31: section written. Cost pending billing.
 - [ ] T052 [US4] The next day, query `system.billing.usage` with `usage_metadata.dlt_pipeline_id = '<id>'` and with the cursor engine job id from T034. Record cost per run for both engines side by side in `docs/baseline.md` (US4/AC3, SC-004). Sections: `## SQL Server (T012a)` and `## Devtest run (T093)`.
 
 **Checkpoint**: Source state `baselined`. SC-004 holds. T012a evidence is in `docs/baseline.md`.

@@ -93,6 +93,9 @@ Sources read on 2026-10-31:
   network gateway on, it also allows the gateway subnet. Every other inbound rule is denied.
 - Rationale: FR-003 (only the devtest workspace connects) and US1 scenario 3. The job cluster is
   classic compute in the VNet, so it reaches the private IP directly.
+- Live finding 2026-10-31: serverless reaches the VM through the gateway by host name only. An
+  IPv4 literal is refused (NAT64). `sqlserver_test.tf` adds the A record `sqlserver` in the gateway
+  private DNS zone when both toggles are on. The UC connection uses that name.
 - Lakeflow Connect (US4): the pipeline runs on serverless compute, which has no address in the VNet.
   The project's private network gateway (`enable_private_network_gateway = true`, `ALL_TRAFFIC`)
   sends serverless traffic into the VNet. US4 needs it on. Azure serverless has no stable public IP

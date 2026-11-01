@@ -18,7 +18,43 @@ Lakeflow Connect is not a dependency of the cursor engine.
 
 ## SQL Server (T012a)
 
-On hold, no source. No SQL Server database is reachable from the `devtest` workspace.
+Date: 2026-10-31. Workspace: profile `ding-dong-ditch` (Azure, `adb-7405613017070986`).
+Source: the feature 002 VM `lakefedsqltest` (`10.0.17.4`, private IP), reached from serverless
+through the private network gateway (`ALL_TRAFFIC`). Rows landed. The baseline is recorded.
+
+| Item | Value |
+|---|---|
+| Source connection | UC connection `lakefed_sqlserver_test`, type SQLSERVER, host `sqlserver.png-test.contoso.com:1433`, `trustServerCertificate true`, user `lakefed_sql` |
+| Connection check | `remote_query('lakefed_sqlserver_test', ...)` on warehouse `a7c0f6a74986874e` returned `n = 10063` |
+| Table | `lakefed_test.dbo.doc_attachment_079` (16 columns, `id` PK, `row_version rowversion`), 10,063 rows at seed |
+| Pipeline | `lakefed_baseline_sqlserver_t012a`, id `e5303890-c006-4396-b01e-c3be376b3e67`, query-based, serverless, triggered, cursor `row_version`, `primary_keys [id]`, hard deletion scan 60 s. Spec: `specs/002-azure-sqlserver-test-source/contracts/lakeflow_pipeline.json` |
+| Sink | `my_catalog.lakefed_cursor_devtest.sqlserver_baseline_doc_attachment_079`, streaming table |
+| Seed | Update `f6a0ad5e`, COMPLETED. 10,063 rows, one MERGE `numTargetRowsInserted 10063` |
+| Change | `change_generator.py` run_label `chg-us4` at 22:22:22 EDT: 10 inserts, 5 updates, 5 deletes, source 10,068 rows |
+| Increment | COMPLETED. MERGE 10 inserted, MERGE 5 updated, DELETE. Target 10,068 rows. Reconcile by `id` and `row_version` through the connection: 0 differences |
+
+| FR-011 value | Lakeflow Connect |
+|---|---|
+| Rows | source 10,068, sink 10,068 |
+| Run duration | seed 68 s from `start-update` (22:13:24 EDT) to COMPLETED (22:14:32); increment 84 s (22:23:14 to 22:24:38) |
+| Lag | seed: 51 s from `start-update` to the MERGE commit (22:14:15). Increment: 1 min 41 s from the last source change (22:22:22) to the MERGE commit (22:24:03), 49 s from `start-update` |
+| Cost per run | pending billing (`system.billing.usage`, `usage_metadata.dlt_pipeline_id = 'e5303890-c006-4396-b01e-c3be376b3e67'`) |
+
+### Facts established
+
+- Serverless reaches a VNet target through the gateway by host name only. An IPv4 literal is refused
+  (NAT64). A private DNS A record `sqlserver.png-test.contoso.com` in the gateway zone fixed it.
+  A one-off socket probe notebook on serverless showed the IP refused and the name OPEN.
+- The SQL Server query-based connector accepts a `rowversion` cursor column.
+- The connector applied the 5 updates as updates. The cursor engine saw 0 updates on the same
+  generator pattern in US2, because its `UPDATE TOP (5)` rows were deleted before the read. Both
+  engines reconciled to zero differences.
+
+### Cleanup
+
+Deleted: pipeline `lakefed_baseline_sqlserver_t012a` (`pipelines get` returns not found) and
+connection `lakefed_sqlserver_test`. Lakeflow Connect owns the sink, so `pipelines delete` dropped
+it. The gateway stays on until the feature teardown (T056).
 
 ## Oracle (T034a)
 
