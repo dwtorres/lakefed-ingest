@@ -38,7 +38,17 @@ through the private network gateway (`ALL_TRAFFIC`). Rows landed. The baseline i
 | Rows | source 10,068, sink 10,068 |
 | Run duration | seed 68 s from `start-update` (22:13:24 EDT) to COMPLETED (22:14:32); increment 84 s (22:23:14 to 22:24:38) |
 | Lag | seed: 51 s from `start-update` to the MERGE commit (22:14:15). Increment: 1 min 41 s from the last source change (22:22:22) to the MERGE commit (22:24:03), 49 s from `start-update` |
-| Cost per run | pending billing (`system.billing.usage`, `usage_metadata.dlt_pipeline_id = 'e5303890-c006-4396-b01e-c3be376b3e67'`) |
+| Cost per run | 0.17 DBU per update (0.339 DBU over the seed and the increment), SKU `LAKEFLOW_CONNECT_FREE_USAGE`, 0 USD at list price. Read 2026-11-01 07:00 EDT from `system.billing.usage` on `usage_metadata.dlt_pipeline_id` |
+
+### Cost side by side (SC-004)
+
+| Engine | DBU per run | USD per run (DBU only) | Wall clock per run |
+|---|---|---|---|
+| Lakeflow Connect, serverless | 0.17 | 0 (free SKU) | 68 s seed, 84 s increment |
+| Cursor engine, one `Standard_D4ds_v4` job cluster | 0.049 | 0.015 | about 4 min, almost all cluster start |
+
+The cursor engine's DBU count excludes the Azure VM charge of the job cluster. The Lakeflow run
+is billed on `LAKEFLOW_CONNECT_FREE_USAGE`, which has no list price in `system.billing.list_prices`.
 
 ### Facts established
 
@@ -177,7 +187,7 @@ same five rows, so the updated rows left the table before the read. The sink cou
 | Rows | source 10,063, sink 10,063 |
 | Run duration | seed 4 min 2 s wall clock (24 s in the engine); increment 4 min 24 s (34 s in the engine) |
 | Lag | 4 min 11 s from the last source change to the MERGE commit, almost all cluster start |
-| Cost per run | pending billing (`system.billing.usage`, job `1081189664090958`) |
+| Cost per run | 0.049 DBU per run (0.444 DBU over the 9 runs after 21:00Z), SKU `PREMIUM_JOBS_COMPUTE` at 0.30 USD per DBU, so 0.015 USD per run plus the VM minutes of the job cluster. Read 2026-11-01 07:00 EDT from `system.billing.usage` on `usage_metadata.job_id` |
 
 ### Bugs the live run found (all fixed, unit tests added)
 

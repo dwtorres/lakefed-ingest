@@ -241,7 +241,8 @@ workspace: lakefed-cursor
   - Result 2026-10-31: pipeline and connection deleted. `pipelines get` returns not found.
 - [X] T051 [US4] In `docs/baseline.md` fill section `## SQL Server (T012a)` (line 19). Record date, row counts, the two run durations, the two lags, the pipeline id, and the four FR-011 values. Leave the cost line as "pending billing" until T052.
   - Result 2026-10-31: section written. Cost pending billing.
-- [ ] T052 [US4] The next day, query `system.billing.usage` with `usage_metadata.dlt_pipeline_id = '<id>'` and with the cursor engine job id from T034. Record cost per run for both engines side by side in `docs/baseline.md` (US4/AC3, SC-004). Sections: `## SQL Server (T012a)` and `## Devtest run (T093)`.
+- [X] T052 [US4] The next day, query `system.billing.usage` with `usage_metadata.dlt_pipeline_id = '<id>'` and with the cursor engine job id from T034. Record cost per run for both engines side by side in `docs/baseline.md` (US4/AC3, SC-004). Sections: `## SQL Server (T012a)` and `## Devtest run (T093)`.
+  - Result 2026-11-01 07:00 EDT: Lakeflow 0.339 DBU over 2 updates on the free SKU (0 USD). Cursor job 0.444 DBU over 9 runs, 0.049 DBU per run, 0.015 USD. Both in `docs/baseline.md`.
 
 **Checkpoint**: Source state `baselined`. SC-004 holds. T012a evidence is in `docs/baseline.md`.
 
