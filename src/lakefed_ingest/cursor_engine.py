@@ -343,7 +343,8 @@ def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Option
     if row is None or row["hi"] is None:
         return None, False
     _refuse_nullable(cfg, row["nullable"])
-    return _capped(cfg, typ, str(row["hi"]), row.get("src_now") if hasattr(row, "get") else row["src_now"], skew_s)
+    src_now = row["src_now"] if _kind(cfg, typ) == "temporal" else None   # the query has no clock column otherwise
+    return _capped(cfg, typ, str(row["hi"]), src_now, skew_s)
 
 
 def _capped(cfg: dict, typ: str, hi: str, src_now, skew_s: int) -> Tuple[str, bool]:

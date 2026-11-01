@@ -438,6 +438,21 @@ def test_rows_below_cap_read_after_capped_hi(monkeypatch, cfg, typ):
     assert "late" in _in_window(rows, cur.read_where(cfg, typ, "2026-10-26T10:15:00", hi, lookback_s=0))
 
 
+class _SparkLikeRow(tuple):
+    """A pyspark Row stand-in: column access by name, no ``get``, a missing column raises."""
+    def __new__(cls, **kw):
+        self = super().__new__(cls, kw.values()); self._f = kw; return self
+    def __getitem__(self, k):
+        return self._f[k]
+
+
+def test_numeric_high_watermark_reads_no_clock_column(monkeypatch):
+    cfg = dict(CFG, src_type="sqlserver")
+    monkeypatch.setattr(cur.source_io, "server_version", lambda cfg, slots=None: None)
+    _source_rows(monkeypatch, [_SparkLikeRow(hi="42", nullable=0)])        # no src_now for rowversion
+    assert cur.high_watermark(cfg, "rowversion", skew_s=300) == ("42", False)
+
+
 @pytest.mark.parametrize("cfg", [pytest.param(dict(CFG, src_type="sqlserver"), id="sqlserver")])   # rowversion is SQL Server only
 def test_rowversion_hi_stays_below_min_active_rowversion_and_reads_exact(cfg):
     sql = cur.high_watermark_sql(cfg, "rowversion")
