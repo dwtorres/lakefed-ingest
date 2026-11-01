@@ -130,7 +130,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   source itself). Reviewed exception: `cursor_engine.changed_rows_sql` probes the staged window with a
   second one-row read, so a quiet temporal table makes no empty Delta commit.
 - No SQL warehouse dependency.
-- Live proof: SQL Server on hold (no source); Oracle pending the Phase 10 devtest run (`specs/001-cursor-only-engine/quickstart.md`).
+- Live proof (2026-10-31, sandbox workspace, synthetic sources): Oracle in `docs/baseline.md` "Devtest run 2026-10-31 (T089)"; SQL Server
+  seed, increment, reconcile and the `sql`, `ntlm`, `aad_sp` logins in "Devtest run (T093)" and "Auth modes (T095)"
+  (`specs/002-azure-sqlserver-test-source/tasks.md`). No live proof on Fabric.
 - Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE).
 - Every sink write must be client-scoped when `client_id` is set: tag rows (`sink_writer._tag`),
   write `write_columns(cfg)`, MERGE on `merge_keys(cfg)`, overwrite via

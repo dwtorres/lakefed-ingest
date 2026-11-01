@@ -152,9 +152,16 @@ job per collection, or trigger runs per collection with `run-now` and `job_param
 
 ## 5. Live proof
 
-The SQL Server live proof is on hold, because no SQL Server source is available. The Oracle live
-proof is pending the Phase 10 run of `specs/001-cursor-only-engine/quickstart.md`. Record the
-results in `tasks/todo.md`.
+The live proof ran on 2026-10-31 on a sandbox workspace against synthetic sources. File
+`docs/baseline.md` records the results:
+
+- Oracle: section "Devtest run 2026-10-31 (T089)". Seed, increment, reconcile and `pk_snapshot`
+  deletes passed.
+- SQL Server: section "Devtest run (T093)". Seed, increment, reconcile and a no-change run passed
+  on an Azure SQL Server VM. See `specs/002-azure-sqlserver-test-source/tasks.md`.
+- SQL Server logins: section "Auth modes (T095)". The `sql`, `ntlm` and `aad_sp` modes passed.
+
+No live proof exists on Microsoft Fabric. Record new results in `tasks/todo.md`.
 
 ## Schema changes
 

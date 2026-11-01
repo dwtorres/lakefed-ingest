@@ -385,8 +385,11 @@ collection. Trigger other collections with `run-now` and `job_parameters`.
 
 ## Live proof
 
-The SQL Server live proof is on hold, because no SQL Server source is available. The Oracle live proof
-runs in Phase 10 of `specs/001-cursor-only-engine/tasks.md`. Results go to `tasks/todo.md`.
+The live proof ran on 2026-10-31 on a sandbox workspace against synthetic sources. File `docs/baseline.md`
+records Oracle in section "Devtest run 2026-10-31 (T089)". It records SQL Server in "Devtest run (T093)"
+and the `sql`, `ntlm` and `aad_sp` logins in "Auth modes (T095)". See
+`specs/002-azure-sqlserver-test-source/tasks.md`. No live proof exists on Microsoft Fabric. Results go to
+`tasks/todo.md`.
 `docs/baseline.md` records the Lakeflow Connect comparison baseline.
 
 ## Tests
