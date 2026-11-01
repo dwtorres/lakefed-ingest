@@ -83,6 +83,14 @@ targets:
     default: true
     workspace:
       host: https://company-dev.cloud.databricks.com/
+    resources:
+      database_catalogs:
+        lakebase_catalog: &lakebase_catalog
+          # Registers the Lakebase database in Unity Catalog for DBSQL monitoring (docs/monitoring.md).
+          name: ${var.lakebase_catalog}
+          database_instance_name: ${resources.database_instances.lakebase.name}
+          database_name: ${var.lakebase_database}
+          create_database_if_not_exists: true
 
   devtest:
     # Live devtest workspace (quickstart.md, step 8). Same development mode as dev.
@@ -97,6 +105,8 @@ targets:
     # Single node: the subscription allows 10 DDSv4 cores, so driver plus worker does not fit
     # beside a probe cluster.
     resources:
+      database_catalogs:
+        lakebase_catalog: *lakebase_catalog
       jobs:
         lakefed_cursor:
           job_clusters:
@@ -115,3 +125,19 @@ targets:
       # Use fixed location to make sure we only have a single copy.
       # If this path results in an error, please make sure you have a recent version of the CLI installed.
       root_path: /Workspace/${bundle.name}
+    resources:
+      database_catalogs:
+        lakebase_catalog: *lakebase_catalog
+
+  shadow:
+    # edp devtest workspace: shadow ingestion beside edp source_to_bronze (runbook).
+    # No database_catalogs.lakebase_catalog here: the deployer has no CREATE CATALOG on the
+    # metastore. Query the Lakebase tables over Postgres instead of DBSQL.
+    mode: development
+    workspace:
+      host: https://adb-3049177421157142.2.azuredatabricks.net
+    variables:
+      node_type_id: Standard_D8ds_v5
+      driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound
+      num_workers: 2
+      max_queries_per_source: "16"            # edp Clarity budget: 2 lanes x 8

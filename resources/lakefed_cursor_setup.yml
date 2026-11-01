@@ -17,15 +17,8 @@ resources:
       # connects with a short-lived SDK-minted OAuth token (no stored password).
       enable_pg_native_login: true
 
-  database_catalogs:
-    lakebase_catalog:
-      # Registers the Lakebase database in Unity Catalog so control / telemetry tables are queryable
-      # from DBSQL (docs/monitoring.md). Named so it can't collide with the job_orchestration version's
-      # `lakefed_ingest` catalogs of the lakefed-ingest bundles.
-      name: ${var.lakebase_catalog}
-      database_instance_name: ${resources.database_instances.lakebase.name}
-      database_name: ${var.lakebase_database}
-      create_database_if_not_exists: true
+  # database_catalogs.lakebase_catalog is declared per target in databricks.yml: creating it needs
+  # CREATE CATALOG on the metastore, so a target without that grant (shadow) leaves it out.
 
   secret_scopes:
     secret_scope:
