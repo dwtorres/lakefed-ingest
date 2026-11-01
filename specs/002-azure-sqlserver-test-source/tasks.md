@@ -383,4 +383,4 @@ Task: "az consumption budget list -g rg-lakefed-sqlserver-test, expect one budge
 
 ## Phase 9: Convergence
 
-- [ ] T065 Update `tests/synthetic/README.md` line 9 so the `build_synth_db.py` row says Change Tracking is enabled only when `enable_change_tracking` is `true`. Run `.venv/bin/pytest tests/docs_test.py` per plan: tests/synthetic/README.md edit (partial)
+- [X] T065 Update `tests/synthetic/README.md` line 9 so the `build_synth_db.py` row says Change Tracking is enabled only when `enable_change_tracking` is `true`. Run `.venv/bin/pytest tests/docs_test.py` per plan: tests/synthetic/README.md edit (partial)

@@ -6,7 +6,7 @@ that the ingested Delta tables match the source.
 
 | File | What it does |
 |---|---|
-| `build_synth_db.py` (notebook) | Creates 1,800 tables, loads deterministic data, then enables CT on the database and every table |
+| `build_synth_db.py` (notebook) | Creates 1,800 tables, loads deterministic data, then enables CT on the database and every table when `enable_change_tracking` is `true` |
 | `change_generator.py` (notebook) | Inserts, updates and deletes rows in a seeded sample of the tables; writes a manifest of what it changed |
 | `reconcile.py` (notebook) | Compares source and sink for the manifest's tables (or all tables) and reports mismatches |
 | `synth_catalog.py` | The table catalog: names, columns, primary keys and row counts (pure Python) |
