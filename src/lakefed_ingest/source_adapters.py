@@ -44,7 +44,7 @@ _RESERVED_OPTIONS = {"url", "user", "password", "driver", "query", "dbtable"}
 # Secret JSON per source database (contracts/secret_json.md): required fields per ``auth_mode``, and
 # the fields whose value must never reach a log line, an error, or a telemetry row.
 AUTH_FIELDS = {"sql": ("user", "password"), "ntlm": ("user", "password", "domain"),
-               "aad_sp": ("client_id", "client_secret", "tenant_id")}
+               "aad_sp": ("client_id", "client_secret")}
 AUTH_MODES = tuple(AUTH_FIELDS)
 SECRET_FIELDS = ("password", "client_secret")
 
@@ -228,7 +228,7 @@ class SqlServerAdapter(SourceAdapter):
         if mode == "ntlm":
             return {"user": creds["user"], "password": creds["password"], "domain": creds["domain"],
                     "authenticationScheme": "NTLM", "integratedSecurity": "true"}
-        if mode == "aad_sp":   # shortcut: tenant_id unused; add it to user as <client_id>@<tenant_id> if the driver needs it (R-09)
+        if mode == "aad_sp":   # the driver resolves the tenant from the token endpoint; no tenant_id (devtest run 19)
             return {"authentication": "ActiveDirectoryServicePrincipal", "user": creds["client_id"],
                     "password": creds["client_secret"]}
         return super().auth_options(creds)

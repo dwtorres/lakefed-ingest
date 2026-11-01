@@ -288,7 +288,7 @@ def test_connect_error_text_is_redacted_before_log_and_event(deps, fakes, calls,
     plan = dict(PLANS["cursor"][0], cfg=dict(_cfg(), secret_key="k"))
     monkeypatch.setitem(source_io._creds_cache, source_io.secret_ref(plan["cfg"]),
                         {"auth_mode": "aad_sp", "client_id": "app", "client_secret": client_secret,
-                         "tenant_id": "t", "password": secret})
+                         "password": secret})
 
     def boom(cfg, typ, *a, **kw):
         raise RuntimeError(f"Login failed: user=app password={secret} secret={client_secret}")

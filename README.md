@@ -108,7 +108,7 @@ value is JSON. `auth_mode` selects the shape. A missing `auth_mode` means `sql`.
 |---|---|---|
 | `sql` | `user`, `password` | all |
 | `ntlm` | `user`, `password`, `domain` | `sqlserver` |
-| `aad_sp` | `client_id`, `client_secret`, `tenant_id` | `sqlserver` |
+| `aad_sp` | `client_id`, `client_secret` | `sqlserver` |
 
 A missing field fails the table before any connect attempt. The message names the field, never the
 value. `ntlm` or `aad_sp` on a source other than SQL Server fails at plan time. Log lines and

@@ -258,7 +258,7 @@ def test_sqlserver_auth_options_per_mode():
     assert ss.auth_options({"auth_mode": "sql", "user": "u", "password": "p"}) == {"user": "u", "password": "p"}
     assert ss.auth_options({"auth_mode": "ntlm", "user": "u", "password": "p", "domain": "CORP"}) == {
         "user": "u", "password": "p", "domain": "CORP", "authenticationScheme": "NTLM", "integratedSecurity": "true"}
-    assert ss.auth_options({"auth_mode": "aad_sp", "client_id": "app", "client_secret": "cs", "tenant_id": "t"}) == {
+    assert ss.auth_options({"auth_mode": "aad_sp", "client_id": "app", "client_secret": "cs"}) == {
         "authentication": "ActiveDirectoryServicePrincipal", "user": "app", "password": "cs"}
 
 
@@ -269,5 +269,5 @@ def test_other_adapters_accept_sql_only(src_type):
     for mode in ("ntlm", "aad_sp"):
         with pytest.raises(NotImplementedError, match=f"{src_type}.*{mode}") as e:
             a.auth_options({"auth_mode": mode, "user": "u", "password": "p", "domain": "d",
-                            "client_id": "c", "client_secret": "cs", "tenant_id": "t"})
+                            "client_id": "c", "client_secret": "cs"})
         assert "cs" not in str(e.value).replace("aad_sp", "")

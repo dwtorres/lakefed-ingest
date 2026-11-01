@@ -249,10 +249,10 @@ def test_extract_creds_ntlm_needs_domain():
     assert (creds["auth_mode"], creds["domain"]) == ("ntlm", "CORP")
 
 
-def test_extract_creds_aad_sp_needs_tenant_id():
-    with pytest.raises(ValueError, match="tenant_id") as e:
-        sio._extract_creds({"auth_mode": "aad_sp", "client_id": "app", "client_secret": CLIENT_SECRET_VALUE})
-    assert CLIENT_SECRET_VALUE not in str(e.value)
+def test_extract_creds_aad_sp_needs_no_tenant_id():
+    # The JDBC driver takes no tenant for ActiveDirectoryServicePrincipal (devtest run 19, 2026-10-31).
+    creds = sio._extract_creds({"auth_mode": "aad_sp", "client_id": "app", "client_secret": CLIENT_SECRET_VALUE})
+    assert (creds["auth_mode"], creds["client_id"]) == ("aad_sp", "app") and "tenant_id" not in creds
 
 
 def test_extract_creds_unknown_mode_lists_the_modes_and_hides_values():
@@ -264,7 +264,7 @@ def test_extract_creds_unknown_mode_lists_the_modes_and_hides_values():
 
 def test_redact_hides_every_secret_value():
     creds = {"auth_mode": "aad_sp", "client_id": "app", "client_secret": CLIENT_SECRET_VALUE,
-             "tenant_id": "t", "password": SECRET_VALUE}
+             "password": SECRET_VALUE}
     text = sio.redact(f"login failed for {SECRET_VALUE} / {CLIENT_SECRET_VALUE}", creds)
     assert SECRET_VALUE not in text and CLIENT_SECRET_VALUE not in text and "login failed" in text
     assert sio.redact("plain", None) == "plain"
