@@ -17,6 +17,9 @@ dbutils.widgets.text("ntlm_domain", "cnmc", "6. NTLM domain (login without DOMAI
 dbutils.widgets.text("engine_path", "", "7. folder of state_store.py (empty: from this notebook)")
 dbutils.widgets.text("db_instance", "lakefed-cursor", "8. Lakebase instance")
 dbutils.widgets.text("db_name", "databricks_postgres", "9. Lakebase database")
+dbutils.widgets.text("oracle_host", "", "11. Oracle host (empty: from key_url)")
+dbutils.widgets.text("oracle_port", "", "12. Oracle port (empty: from key_url)")
+dbutils.widgets.text("oracle_service", "", "13. Oracle service name (empty: from key_url)")
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "10. apply")
 
 # COMMAND ----------
@@ -44,19 +47,44 @@ SRC_TYPES = {
     "fabric_direct_watermark": "sqlserver",
 }
 ORACLE_URL = re.compile(
-    r"^jdbc:oracle:thin:@(?://)?(?P<host>[^:/]+):(?P<port>\d+)[/:](?P<service>[^?\s]+)$"
+    r"^jdbc:oracle:thin:@(?://)?(?P<host>[^:/@()]+):(?P<port>\d+)[/:](?P<service>[^?\s()]+)$"
 )
+TNS_KEY = re.compile(r"\(\s*(HOST|PORT|SERVICE_NAME|SID)\s*=\s*([^)\s]+)\s*\)", re.I)
+
+
+def describe_oracle_url(url: str) -> str:
+    """The shape of a URL without host, service or credential values."""
+    text = url.strip()
+    keys = [k.upper() for k, _ in TNS_KEY.findall(text)]
+    shape = "TNS descriptor" if "(" in text else "thin URL"
+    parts = [shape, f"{keys.count('HOST')} HOST"]
+    for key in ("SERVICE_NAME", "SID"):
+        if key in keys:
+            parts.append(key)
+    if re.search(r"PROTOCOL\s*=\s*TCPS", text, re.I):
+        parts.append("TCPS")
+    if re.match(r"^jdbc:oracle:thin:[^@]+@", text):
+        parts.append("credentials before @")
+    return ", ".join(parts)
 
 
 def parse_oracle_url(url: str) -> tuple:
-    """Split a thin URL into host, port and service. A TNS descriptor fails."""
-    match = ORACLE_URL.match(url.strip())
-    if not match:
-        raise ValueError(
-            "oracle key_url is not jdbc:oracle:thin:@//host:port/service; "
-            "set src_host, src_port and src_database by hand"
-        )
-    return match["host"], int(match["port"]), match["service"]
+    """Host, port and service from a thin URL or a one-address TNS descriptor."""
+    text = url.strip()
+    match = ORACLE_URL.match(text)
+    if match:
+        return match["host"], int(match["port"]), match["service"]
+    values = {}
+    for key, value in TNS_KEY.findall(text):
+        values.setdefault(key.upper(), []).append(value)
+    hosts, ports = values.get("HOST", []), values.get("PORT", [])
+    service = (values.get("SERVICE_NAME") or [None])[0]
+    if len(hosts) == 1 and len(ports) == 1 and service and "TCPS" not in text.upper():
+        return hosts[0], int(ports[0]), service
+    raise ValueError(
+        f"oracle key_url ({describe_oracle_url(text)}) has no single host, port "
+        "and SERVICE_NAME; set the oracle_host, oracle_port and oracle_service widgets"
+    )
 
 
 def split_ntlm_user(user: str, domain: str) -> tuple:
@@ -211,7 +239,14 @@ def _run_notebook():
 
     secret_key = f"lakefed-{source_name.replace('_', '-')}"
     if config["source_type"].startswith("oracle"):
-        host, port, service = parse_oracle_url(akv("key_url"))
+        if widget("oracle_host"):
+            host = widget("oracle_host")
+            port = int(widget("oracle_port") or 1521)
+            service = widget("oracle_service")
+            if not service:
+                raise ValueError("set oracle_service with oracle_host")
+        else:
+            host, port, service = parse_oracle_url(akv("key_url"))
         secret = {"user": akv("key_user"), "password": akv("key_pass")}
         connection = {"host": host, "port": port, "database": service}
     elif config["source_type"] == "mssql":
