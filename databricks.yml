@@ -136,6 +136,13 @@ targets:
     mode: development
     workspace:
       host: https://adb-3049177421157142.2.azuredatabricks.net
+    # The deployer cannot create clusters there. Jobs run as the edp devtest service principal,
+    # the same run_as as edp-data-engineering/bundles/data_engineering/databricks.yml.
+    permissions:
+      - service_principal_name: 8cd43abf-bdf6-4922-b19f-5a051e03c91a
+        level: CAN_MANAGE
+    run_as:
+      service_principal_name: 8cd43abf-bdf6-4922-b19f-5a051e03c91a
     variables:
       node_type_id: Standard_D8ds_v5
       driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound
