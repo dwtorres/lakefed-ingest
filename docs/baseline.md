@@ -114,3 +114,67 @@ database per run (SC-004).
 - `delete_min_interval_s 0` runs the PK snapshot every run. Use a real interval in production.
 - The stored secret `oracle_devtest` carries text around the JSON object. `source_io._extract_creds`
   tolerates it (`947eb26`); store bare JSON and drop that fallback.
+
+## Devtest run (T093)
+
+Date: 2026-10-31. Workspace: profile `ding-dong-ditch` (Azure, `adb-7405613017070986`). Job
+cluster: one `Standard_D4ds_v4`, single node. Source: SQL Server 2022 Developer on the VM
+`lakefedsqltest` (`10.0.17.4`, private IP, feature 002), database `lakefed_test`, table
+`dbo.doc_attachment_079` (16 columns, PK `id`, cursor `row_version rowversion`), 10,058 rows from
+`build_synth_db.py` at `scale_factor 0.01`, Change Tracking off. Control row: `load_type cursor`,
+`cursor_kind rowversion`, `delete_mode pk_snapshot`, `delete_min_interval_s 0`, secret
+`lakefed-cursor/sqlserver_test_sql`. Sink `my_catalog.lakefed_cursor_devtest.sqlserver_doc_attachment_079`.
+
+| Step | Run id (engine) | Result |
+|---|---|---|
+| Seed | 15 (13 and 14 failed, see below) | `seeded 1`, 10,058 rows, checkpoint `incremental`, position 12099 |
+| Change source | `change_generator.py`, run_label `chg-us2`, 17:41:25 EDT | 10 inserts, 5 updates, 5 deletes, source 10,063 rows |
+| Increment | 16 | `incremented 1`, one `capture` event, MERGE 10 inserted and 0 updated, snapshot DELETE 5, position 12109 |
+| Reconcile | `reconcile.py` | `tables_checked 1`, `matched 1`, `mismatched []` (SC-002) |
+| Increment, no change | 17 | `unchanged 1`, no MERGE version, one empty snapshot DELETE version |
+
+MERGE updated 0 rows because `UPDATE TOP (5)` and `DELETE TOP (5)` have no ORDER BY. They hit the
+same five rows, so the updated rows left the table before the read. The sink count is 10,063.
+
+| FR-011 value | Cursor engine |
+|---|---|
+| Rows | source 10,063, sink 10,063 |
+| Run duration | seed 4 min 2 s wall clock (24 s in the engine); increment 4 min 24 s (34 s in the engine) |
+| Lag | 4 min 11 s from the last source change to the MERGE commit, almost all cluster start |
+| Cost per run | pending billing (`system.billing.usage`, job `1081189664090958`) |
+
+### Bugs the live run found (all fixed, unit tests added)
+
+1. `select_list = '*'` fails at `ensure_sink` with `Invalid column name '*'`. The engine quotes
+   each name. The contract example in `specs/001-cursor-only-engine/contracts/control_row.md` now
+   lists columns.
+2. `cursor_engine.high_watermark` read `row["src_now"]` on a Spark `Row` for a numeric kind. The
+   query has no clock column for `rowversion`, so the seed failed with `KeyError: 'src_now'`. The
+   unit tests used dicts with `.get`, which hid it. Fix: read `src_now` only for a temporal kind.
+   Test: `test_numeric_high_watermark_reads_no_clock_column`.
+
+### Build notes
+
+- `terraform apply` failed twice before the VM existed: the subscription has 0 DSv5 cores in eastus
+  (the VM is `Standard_D2ds_v4`), and `Microsoft.SqlVirtualMachine` was not registered.
+- Source up in 19 minutes (US1/AC1), table loaded in 30 minutes (SC-001).
+
+## Auth modes (T095)
+
+Date: 2026-10-31. One control row, `secret_key` switched between three secrets in scope
+`lakefed-cursor`. The source table was quiet, so each run reports `unchanged 1`: the capture query
+and the PK snapshot ran over that login.
+
+| Mode | Secret | Engine run | Result | Wall clock |
+|---|---|---|---|---|
+| `sql` | `sqlserver_test_sql` | 15, 16, 17 | seed, increment, no change | 4 min each |
+| `ntlm` | `sqlserver_test_ntlm` (`domain lakefedsqltest`) | 18 | `ok 1`, `unchanged 1` | 4 min 3 s |
+| `aad_sp` | `sqlserver_test_aad_sp` with `tenant_id` | 19 | `ok 1`, `unchanged 1` | 9 min 20 s |
+| `aad_sp` | `sqlserver_test_aad_sp` without `tenant_id` | 20, 21 | 20 failed in the engine's secret check; 21 `ok 1` after the fix | 4 min |
+
+`tenant_id` answer: **not needed** (FR-009). `SQLServerAdapter.auth_options` never passed it to the
+driver, and run 19 connected. `AUTH_FIELDS` no longer requires it; `contracts/secret_json.md`,
+`README.md`, and `CLAUDE.md` match.
+
+US3/AC4: the ten job run logs and every `ingest_event.error` since run 13 hold no `password` or
+`client_secret` word and no literal secret value.
