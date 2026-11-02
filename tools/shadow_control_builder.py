@@ -211,8 +211,6 @@ def build_rows(source_name: str, body: dict, connection: dict,
     return rows, skipped
 
 
-# COMMAND ----------
-
 def _run_notebook():
     import sys
     from databricks.sdk import WorkspaceClient
