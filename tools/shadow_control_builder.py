@@ -295,15 +295,23 @@ def _run_notebook():
     WorkspaceClient().secrets.put_secret(
         scope="lakefed-cursor", key=secret_key, string_value=json.dumps(secret))
     store = StateStore.connect_lakebase(db_instance, db_name)
+    # Upsert on the sink key: an existing row keeps its id, so its checkpoint (keyed by
+    # control_id) survives a second apply and the table is not seeded again.
     columns = list(rows[0])
-    insert = (f"insert into lakefed_cursor.control ({', '.join(columns)}) "
-              f"values ({', '.join(['%s'] * len(columns))})")
+    sink_key = ("sink_catalog", "sink_schema", "sink_table")
+    updates = ", ".join(f"{c} = excluded.{c}" for c in columns if c not in sink_key)
+    upsert = (f"insert into lakefed_cursor.control ({', '.join(columns)}) "
+              f"values ({', '.join(['%s'] * len(columns))}) "
+              "on conflict (lower(sink_catalog), lower(sink_schema), lower(sink_table), coalesce(client_id, '')) "
+              f"do update set {updates}")
+    tables = [r["sink_table"] for r in rows]
     with store._conn.transaction():
         cursor = store._conn.cursor()
-        cursor.execute("delete from lakefed_cursor.control where task_collection = %s",
-                       (collection,))
-        cursor.executemany(insert, [tuple(r[c] for c in columns) for r in rows])
-    print(f"Wrote {len(rows)} control rows for {collection}.")
+        cursor.executemany(upsert, [tuple(r[c] for c in columns) for r in rows])
+        cursor.execute("delete from lakefed_cursor.control where task_collection = %s "
+                       "and not (sink_table = any(%s))", (collection, tables))
+    print(f"Upserted {len(rows)} control rows for {collection}; "
+          f"removed {cursor.rowcount} rows not in the metadata.")
 
 
 if "dbutils" in globals():
