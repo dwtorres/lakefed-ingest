@@ -28,14 +28,28 @@ and MUST follow the same rule.
 Rationale: the analysis shows that about 2,750 of 4,381 lines survive a cursor-only engine. A
 rewrite throws away tested reads, writes, seeds, locks, retries, and telemetry.
 
-### II. Cursor Only
+### II. Cursor Only, Over a Column or a Change View
 
-The engine supports one load strategy: the cursor. Change Tracking and CDC code paths MUST be
-deleted, not hidden behind flags. A `load_type` other than `cursor` or `full` MUST fail at plan
-time. No task adds a CT or CDC branch, placeholder, or control column.
+The engine supports three load strategies: `cursor`, `change_keys`, and `full`. A `load_type`
+other than these three MUST fail at plan time.
 
-Rationale: Change Tracking is not available on the target sources. Dead branches cost review time
-and hide bugs.
+- `cursor` reads a window of one cursor expression over the source table (Principle V).
+- `change_keys` reads a window of one cursor column over a source change view. The view holds one
+  row per change of a source key: the key columns, a change time, and an operation code. The engine
+  keeps the latest change per key, joins it to the source table on the key columns, and merges.
+  The window, the checkpoint, and the lookback follow the cursor rules. The engine MUST only read
+  the change view and the source table. It MUST NOT call a stored procedure or write any object on
+  the source.
+
+SQL Server Change Tracking (`CHANGETABLE`, `CHANGE_TRACKING_CURRENT_VERSION`) and CDC (`cdc.fn_*`,
+capture instances) stay out. Their code paths MUST stay deleted, not hidden behind flags. No task
+adds a SQL Server CT or CDC branch, placeholder, or control column.
+
+Rationale: SQL Server Change Tracking and CDC are not available on the target sources. Dead branches
+cost review time and hide bugs. Epic Clarity on Fabric has no usable cursor column, but it records
+changed keys in a change view (`EpicChangeTracking.CT_1_<TABLE>`). A window over that view's change
+time is a cursor, so it keeps the cursor model: one position, an advance after the Delta commit, and
+no source-side state.
 
 ### III. Everything Runs Inside Databricks
 
@@ -161,4 +175,4 @@ a new fixed decision, or materially expanded guidance. PATCH for wording and cla
 Compliance review: every pull request review MUST check the changed code against Principles I, II,
 IV, VI, VII, and IX. The `speckit-analyze` command treats a constitution conflict as CRITICAL.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-25 | **Last Amended**: 2026-10-25
+**Version**: 2.0.0 | **Ratified**: 2026-10-25 | **Last Amended**: 2026-11-02
