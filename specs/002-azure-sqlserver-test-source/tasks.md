@@ -278,8 +278,9 @@ WARNING: T056 to T060 delete the VM, its disk, the database, the table, the secr
   - `az group exists -n rg-lakefed-sqlserver-test`: expect `false`
   - `az network vnet subnet list -g rg-databricks-network --vnet-name ding-dong-ditch-vnet --query "[?contains(name,'sqlserver-test')]" -o tsv`: expect no line
   - `az ad app list --display-name sp-lakefed-sqlserver-test -o tsv`: expect no line
-- [ ] T061 Read the actual spend. Before T056, read the budget. After T056, read the subscription cost analysis filtered on tag `Feature=002-azure-sqlserver-test-source` the next day. Record total spend against the ceiling in `docs/baseline.md` (SC-006).
+- [X] T061 Read the actual spend. Before T056, read the budget. After T056, read the subscription cost analysis filtered on tag `Feature=002-azure-sqlserver-test-source` the next day. Record total spend against the ceiling in `docs/baseline.md` (SC-006).
   - Partial 2026-11-01: budget `currentSpend` read 0.0 USD before teardown (Azure cost lags a day). Cost Management by tag: read on 2026-11-02 and record in `docs/baseline.md`.
+  - Result 2026-11-02: 3.55 USD of the 50 USD ceiling, by tag through Cost Management. Recorded in `docs/baseline.md`.
 
 ---
 

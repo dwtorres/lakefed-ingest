@@ -11,7 +11,7 @@ Driver: one subagent per phase, sequential. Gate per phase: `pytest tests` green
 - [X] Phase 7 US6 Quiet tables
 - [X] Phase 8 US5 PK snapshot deletes
 - [X] Phase 9 US7 Auth modes
-- [ ] Phase 10 Polish + docs (devtest run tasks blocked)
+- [X] Phase 10 Polish + docs (devtest runs done 2026-10-31: T089, T093, T095)
 
 ## Checkpoints
 - Phase 1 done c3a4ca9: CT, CDC, append, pending paths deleted; ct_engine split into source_io + sink_writer; 324 tests, 0 skips; src 4381 -> 3106 lines
@@ -29,3 +29,4 @@ Driver: one subagent per phase, sequential. Gate per phase: `pytest tests` green
 - 2026-10-31 09:40 EDT: T089 done on ding-dong-ditch: Oracle seed 100 rows, 10/5/5 change, increment MERGE 10+5, reconcile 5 sink-only, pk_snapshot run deletes 5, reconcile 0 differences (SC-001), capture 1 query per source (SC-004). Five live bugs fixed (docs/baseline.md). Finding: quiet temporal table still writes an empty MERGE version per run. T090 gap: no Windows login or Entra service principal for a SQL Server source exists; ntlm/aad_sp untested live. Open: T012a (SQL Server on hold), T034a (Lakeflow Connect Oracle baseline).
 - 2026-10-31 10:1x EDT: secret re-stored as bare JSON; parsing fallback removed (0151dcd); increment run 10 green. T034a baseline running via lfc-oracle agent. Push/PR pending on the operator (classifier blocks push here).
 - 2026-10-31 11:4x EDT: option 1 done (f185e6e, cf303f7): changed-rows probe skips the MERGE on quiet tables; run 12 no-change added only the snapshot DELETE version. 477 tests. Remaining open: T012a (SQL Server, on hold); empty snapshot DELETE still records a version each interval.
+- 2026-11-01: feature 002 closed. T061 spend 3.55 USD of 50 USD (docs/baseline.md). edp devtest shadow (branch chore/edp-devtest-shadow): rl_solutions_shadow seeded 54/54 tables over ntlm, 682,944 rows; every key absent from edp devtest bronze is newer than its July copydown. millennium_gsr_shadow: 13 tables seeded; RC_F_REVENUE and RC_F_CASH proven append-only in prod (14 days) and moved from full to cursor with a partitioned seed (RC_F_REVENUE 113 partitions). RC_F_BALANCE_AR (about 1.2 TB) gets updates and UPDT_DT_TM has no Oracle index, so it needs a daily collection or an index. Builder fix 2751eb9: upsert keeps control ids, so a second apply no longer orphans checkpoints.
