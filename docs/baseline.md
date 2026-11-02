@@ -203,8 +203,10 @@ same five rows, so the updated rows left the table before the read. The sink cou
 
 - Teardown 2026-11-01 07:15 EDT: toggle off, 13 resources destroyed, service principal and secrets
   deleted, control row and sinks removed. SC-007 checks: 0 tagged resources, group gone, no subnet.
-- Total Azure spend (SC-006): pending, the budget read 0.0 USD before teardown. Read Cost Management
-  by tag `Feature=002-azure-sqlserver-test-source` on 2026-11-02.
+- Total Azure spend (SC-006): 3.55 USD against the 50 USD ceiling (7.1 percent). The budget never
+  alerted. Cost Management by tag `Feature=002-azure-sqlserver-test-source`, read 2026-11-02 01:30 UTC:
+  2026-10-31 VM 0.63 USD and disks 0.05 USD, 2026-11-01 VM 2.51 USD and disks 0.36 USD. Azure cost
+  data lags, so the 2026-11-01 values can still rise by a small amount.
 
 - `terraform apply` failed twice before the VM existed: the subscription has 0 DSv5 cores in eastus
   (the VM is `Standard_D2ds_v4`), and `Microsoft.SqlVirtualMachine` was not registered.
