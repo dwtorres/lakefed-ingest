@@ -206,10 +206,18 @@ def nullable_sql(cfg: dict) -> str:
     return f"(SELECT MAX({alias}) FROM ({column_type_sql(cfg)}) t)"
 
 
+def nullable_check_sql(cfg: dict) -> str:
+    """One row ``nullable``: the catalog check of ``nullable_sql`` on its own. Fabric Warehouse rejects
+    a statement that reads a catalog view and a user table together ("not supported in distributed
+    processing mode"), so it never shares a query with the table's ``MAX``."""
+    a = source_adapters.for_cfg(cfg)
+    return f"SELECT {nullable_sql(cfg)} AS {a.result_alias('nullable')}{a.scalar_from}"
+
+
 def high_watermark_sql(cfg: dict, typ: str, server_version=None) -> str:
-    """One row ``hi``, ``nullable`` (and ``src_now`` for a temporal kind): the expression's high
-    watermark as canonical source text (NULL on an empty table), its inputs' nullability, and the
-    source clock in the same rendering as ``hi`` (one query per run for all). The adapter renders the
+    """One row ``hi`` (and ``src_now`` for a temporal kind): the expression's high watermark as
+    canonical source text (NULL on an empty table) and the source clock in the same rendering as
+    ``hi``. The nullability check is a separate query (``nullable_check_sql``). The adapter renders the
     text (``max_text_sql``: ISO 8601 for temporal, decimal text otherwise; SQL Server caps a rowversion
     below MIN_ACTIVE_ROWVERSION() so open transactions are never skipped)."""
     a = source_adapters.for_cfg(cfg)
@@ -219,8 +227,8 @@ def high_watermark_sql(cfg: dict, typ: str, server_version=None) -> str:
     # Scalar subqueries, no aggregate in the outer select: Oracle rejects a subquery or a clock
     # beside MAX() with no GROUP BY (ORA-00937). Same shape as max_batch_sql.
     return (f"SELECT (SELECT {a.max_text_sql(_expr(cfg, typ, server_version), typ)} "
-            f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}) AS {a.result_alias('hi')}, "
-            f"{nullable_sql(cfg)} AS {a.result_alias('nullable')}{src_now}{a.scalar_from}")
+            f"FROM {a.table_ref(cfg['src_schema'], cfg['src_table'])}) AS {a.result_alias('hi')}"
+            f"{src_now}{a.scalar_from}")
 
 
 def literal(cfg: dict, value: str, typ: str) -> str:
@@ -340,9 +348,10 @@ def high_watermark(cfg: dict, typ: str, skew_s: int, slots=None) -> Tuple[Option
     version = source_io.server_version(cfg, slots)
     with source_io._unit(slots, cfg):
         row = source_io._read(source_io._spark(), cfg, high_watermark_sql(cfg, typ, version)).first()
-    if row is None or row["hi"] is None:
-        return None, False
-    _refuse_nullable(cfg, row["nullable"])
+        if row is None or row["hi"] is None:
+            return None, False
+        nullable = source_io._read(source_io._spark(), cfg, nullable_check_sql(cfg)).first()["nullable"]
+    _refuse_nullable(cfg, nullable)
     src_now = row["src_now"] if _kind(cfg, typ) == "temporal" else None   # the query has no clock column otherwise
     return _capped(cfg, typ, str(row["hi"]), src_now, skew_s)
 
