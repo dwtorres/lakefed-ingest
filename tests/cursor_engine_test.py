@@ -54,7 +54,7 @@ def test_type_lookup_sql_quotes_names():
 ])
 def test_high_watermark_sql(typ, expr, clock):
     # Scalar subqueries, no outer aggregate: Oracle rejects a subquery or clock beside MAX() (ORA-00937).
-    assert cur.high_watermark_sql(CFG, typ) == f"SELECT (SELECT {expr} FROM [dbo].[orders]) AS hi, {cur.nullable_sql(CFG)} AS nullable{clock}"
+    assert cur.high_watermark_sql(CFG, typ) == f"SELECT (SELECT {expr} FROM [dbo].[orders]) AS hi{clock}"
 
 
 @pytest.mark.parametrize("typ", ["timestamp", "rowversion"])
@@ -62,8 +62,7 @@ def test_rowversion_high_watermark_capped_below_min_active_rowversion(typ):
     # Never past the oldest open transaction: rows it commits later must not fall below the watermark.
     mx, mar = "CAST(MAX([updated_at]) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
     assert cur.high_watermark_sql(CFG, typ) == (
-        f"SELECT (SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) FROM [dbo].[orders]) AS hi, "
-        f"{cur.nullable_sql(CFG)} AS nullable")
+        f"SELECT (SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) FROM [dbo].[orders]) AS hi")
 
 
 @pytest.mark.parametrize("typ", ["float", "real", "nvarchar", "uniqueidentifier", "bit"])
@@ -129,7 +128,7 @@ def test_postgres_cursor_sql():
     hw = cur.high_watermark_sql(PG, "timestamp with time zone")
     assert hw.startswith("SELECT (SELECT to_char(MAX(\"updated_at\") AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' FROM \"public\".\"orders\") AS hi")
     assert hw.endswith(", to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' AS src_now")
-    assert cur.high_watermark_sql(PG, "bigint") == f'SELECT (SELECT MAX("updated_at")::text FROM "public"."orders") AS hi, {cur.nullable_sql(PG)} AS nullable'
+    assert cur.high_watermark_sql(PG, "bigint") == 'SELECT (SELECT MAX("updated_at")::text FROM "public"."orders") AS hi'
     assert cur.high_watermark_sql(PG, "timestamp without time zone").startswith(
         "SELECT (SELECT to_char(MAX(\"updated_at\"), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') FROM \"public\".\"orders\") AS hi")
     assert ", to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS src_now" in cur.high_watermark_sql(PG, "timestamp without time zone")
@@ -651,3 +650,17 @@ def test_delete_missing_reads_pk_snapshot_under_one_unit_and_drops_the_view(monk
     assert len(spark.statements) == 1 and spark.statements[0].startswith("DELETE FROM c.s.t AS tgt WHERE NOT EXISTS")
     assert "pk_snapshot_" in spark.statements[0] and spark.views == {}
     assert "updated_at" not in list(held and spark.statements[0]) and spark.statements[0].count("`id`") == 2
+
+
+def test_high_watermark_never_joins_a_catalog_view_to_the_table(monkeypatch):
+    # Fabric Warehouse rejects one statement that reads sys.columns and a user table ("not
+    # supported in distributed processing mode"). The nullability check runs as its own query.
+    import source_io
+    seen = []
+    monkeypatch.setattr(source_io, "_spark", lambda: None)
+    monkeypatch.setattr(source_io, "_read",
+                        lambda sp, cfg, q, **kw: seen.append(q) or _Rows([{"hi": "20", "nullable": 0}]))
+    assert cur.high_watermark(CFG, "int", 300) == ("20", False)
+    assert len(seen) == 2
+    assert all(not ("sys.columns" in q and "FROM [dbo].[orders]" in q) for q in seen)
+    assert "sys.columns" not in cur.high_watermark_sql(CFG, "datetime2")
